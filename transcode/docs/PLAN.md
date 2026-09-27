@@ -339,24 +339,39 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
            demuxer does not parse. Reproduced identically on a 20 MB and a 300 MB prefix of the same
            file (not a truncation artifact).
 
-           **This rules out a pure-ffmpeg two-process pipeline** (extract Annex-B, rewrite via bsf or
-           the crate, remux — both this session's design and the prior report's) **for this common
-           muxing.** `convert_annexb_to_dv81` (above) is still correct and useful for any Annex-B
-           stream that already carries its RPU in-band as NAL 62 (true of some encoders/muxings); the
-           missing piece is getting the bytes out of a Block-Addition-muxed MKV in the first place.
-           Candidates for the next session, untried: (a) a newer/different ffmpeg build that
-           understands this Block Addition Mapping Type; (b) a Matroska Block-Addition-aware reader
-           in Rust (the `matroska` crate or similar) to pull RPU bytes out band-by-band, independent
-           of what ffmpeg exposes for the video stream; (c) shelling to `mkvextract`/`dovi_tool` as a
-           helper binary (adds an image dependency, `deploy/Containerfile.agent`). Do **not** wire
-           `job.rs` to call `convert_annexb_to_dv81` until one of these is proven end-to-end against a
-           real profile-7 source in `tc-lab` with the built agent binary — an untested change to the
+           **A second-hop pipeline (proc1: `-bsf:v hevc_mp4toannexb -f hevc` to a raw elementary
+           stream; proc2: `-f hevc` input, `-bsf:v dovi_rpu=compression=0 -strict unofficial`) looks
+           like it fixes this — it reports `profile: 8, el flag: 0` — but it's a false positive, not a
+           real conversion. Re-tested 2026-09-27 (this superseded a task-tracker entry from an earlier
+           session that had taken the same recipe's output at face value): proc2 prints `[dovi_rpu] No
+           Dolby Vision configuration record found? Generating one, but results may be invalid` — the
+           bsf fabricates a synthetic placeholder DV8 record when the input has no real DV metadata,
+           which is exactly proc1's output here (its Annex-B stream has the same 0-RPU-NALs property
+           as (2) above; a raw elementary stream also drops the container-level side data that the
+           direct-copy case in (1) still had, so proc2 has nothing real to work from at all). The
+           "RPU bytes differ from source" a naive check would see is the fabricated record differing
+           from nothing, not a genuine rewrite. Anyone re-deriving this must check ffmpeg's stderr for
+           that exact warning line, not just the resulting profile number.
+
+           **Both approaches ruled out, same root cause.** A pure-ffmpeg pipeline — one process or two
+           — never sees this file's real per-frame RPU (above). `convert_annexb_to_dv81` (above) is
+           still correct and useful for any Annex-B stream that already carries its RPU in-band as NAL
+           62 (true of some encoders/muxings); the missing piece is getting real RPU bytes out of a
+           Block-Addition-muxed MKV in the first place. Candidates for the next session, untried: (a) a
+           newer/different ffmpeg build that understands this Block Addition Mapping Type; (b) a
+           Matroska Block-Addition-aware reader in Rust (the `matroska` crate or similar) to pull RPU
+           bytes out band-by-band, independent of what ffmpeg exposes for the video stream; (c)
+           shelling to `mkvextract`/`dovi_tool` as a helper binary (adds an image dependency,
+           `deploy/Containerfile.agent`). Do **not** wire `job.rs` to call `convert_annexb_to_dv81`,
+           and don't trust a "profile changed" result from any ffmpeg-bsf recipe without checking for
+           this warning, until one of the candidates above is proven end-to-end against a real
+           profile-7 source in `tc-lab` with the built agent binary — an untested change to the
            agent's single-process exec invariant is not something to ship blind to a pool that runs
            prod live.
-        3. Also unconfirmed (INHERITED, not measured this session): whether a real in-band RPU NAL
+        4. Also unconfirmed (INHERITED, not measured this session): whether a real in-band RPU NAL
            (once one is obtainable) carries `nuh_layer_id == 0` or `1`. `convert_annexb_to_dv81`
            currently converts the RPU NAL regardless of its layer id (so either case is handled), but
-           this hasn't been exercised against real in-band bytes — verify once (2) has a fix.
+           this hasn't been exercised against real in-band bytes — verify once (2)/(3) have a fix.
 
       Done when the Bravia shows the Dolby Vision badge on a DV7 title with Direct Stream (remux) and
       no extra disk use — still the target; the blocker above is what stands between here and there.
