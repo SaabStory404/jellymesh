@@ -1,0 +1,15 @@
+[package]
+name = "tcpool-proto"
+description = "gRPC protocol between the transcode-pool shim and agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prost = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }

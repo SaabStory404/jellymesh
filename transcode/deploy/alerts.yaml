@@ -1,0 +1,106 @@
+# tcpool alerting: a vmalert-style Prometheus rule group over the metrics exported by
+# tcpool-agent (crates/agent/src/metrics.rs, TC_METRICS_PORT, k8s port 9903) and tcpool-sync
+# (crates/sync/src/metrics.rs, TC_METRICS_PORT, k8s port 9904). See docs/transcode-pool-
+# production-plan.md §2 (Observability row) for the design this implements.
+#
+# Not applied to the live cluster by this change (out of scope: crates/agent, crates/sync, and
+# transcode/deploy/ only). Follow the same merge procedure documented in
+# arr-stack/k3s/90-media-alerts.yaml: this repo's vmalert (ns `monitoring`, deploy `vmalert`)
+# reads a SINGLE `rules.yml` key off the `vmalert-rules` ConfigMap, not a directory glob, so this
+# group has to be merged into that key (not applied as a standalone file) and vmalert restarted
+# to pick it up:
+#
+#   1. Pull the group below (everything under "groups:") into its own file.
+#   2. Fetch the CURRENT rules.yml out of the live CM (ground truth, may have drifted from git):
+#        kubectl -n monitoring get cm vmalert-rules -o jsonpath='{.data.rules\.yml}' > current.yml
+#   3. Append this group's rules under the existing `groups:` list (merge, don't replace the CM).
+#   4. kubectl -n monitoring create configmap vmalert-rules --from-file=rules.yml=merged.yml \
+#        --dry-run=client -o yaml | kubectl apply -f -
+#   5. vmalert does not hot-reload the mounted file: kubectl -n monitoring rollout restart
+#        deploy vmalert && kubectl -n monitoring rollout status deploy vmalert --timeout=60s
+#   6. Verify via the vmalert API (ClusterIP:8880): /api/v1/rules shows health "ok" for every
+#        rule in this group, zero parse errors.
+#
+# Scrape config (not shown here) needs a target per agent Service (port 9903) and the sync
+# Service (port 9904) added wherever this cluster's Prometheus/vmagent scrape config lives.
+#
+# --- Rule group ------------------------------------------------------------
+
+groups:
+  - name: tcpool
+    rules:
+      - alert: TranscodePoolNotSurvivable
+        # "Could the pool absorb losing its single biggest live card right now?" (tcpool_pool_
+        # survivable, computed in tcpool-sync: total live capacity minus the largest single live
+        # worker's capacity, compared to current total units used). 0 means a single card failure
+        # would currently overload the survivors.
+        expr: tcpool_pool_survivable == 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "transcode pool could not survive losing its biggest worker"
+          description: >-
+            tcpool_pool_survivable has been 0 for 10m: losing the largest live worker right now
+            would leave the remaining pool over its measured capacity. Check tcpool_pool_
+            capacity_units and tcpool_pool_worker_live per worker (is one down that shouldn't
+            be?) and tcpool_units_used per agent (is demand unusually high?).
+
+      - alert: TranscodeWorkerDown
+        # Per-worker liveness from tcpool-sync's last Hello round; a worker that's configured
+        # (in TC_WORKERS) but hasn't answered Hello in 5m is presumed down.
+        expr: tcpool_pool_worker_live == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "tcpool worker {{ $labels.worker }} configured but not live"
+          description: >-
+            tcpool-sync has not gotten a Hello reply from worker "{{ $labels.worker }}" in 5m.
+            It is still counted as configured (offers stay conservative -- see tcpool_pool_
+            common_output), so this only affects capacity, not correctness. Check the agent pod
+            for that worker's Deployment.
+
+      - alert: TranscodeJobsSlow
+        # Exported per active job (tcpool_job_speed{worker,kind,node,job}), parsed from ffmpeg's
+        # own speed= field. NOTE: speed= is cumulative since the encode started and Jellyfin's
+        # throttler pauses ffmpeg once ~60s ahead, so a healthy steady-state session settles near
+        # 1.0x -- the agent stops exporting a job's speed entirely while it's paused (see
+        # crates/agent/src/job.rs Ctl::note_stderr) specifically so this alert doesn't flap on
+        # normal throttling. A sustained value below 1.0x here means a genuinely falling-behind
+        # encode, not a paused one.
+        expr: tcpool_job_speed < 1.0
+        for: 60s
+        labels: { severity: warning }
+        annotations:
+          summary: "tcpool job {{ $labels.job }} on {{ $labels.worker }} running under realtime"
+          description: >-
+            tcpool_job_speed on worker "{{ $labels.worker }}" (job {{ $labels.job }}) has been
+            below 1.0x for 60s while actively encoding (not paused). The session will stall for
+            the viewer. Check that worker's tcpool_units_used/tcpool_capacity_units for
+            overcommit and its GPU/CPU utilization.
+
+      - alert: TranscodePolicyRefusals
+        # A refused_policy outcome means the IR validator rejected a job's argv shape -- either a
+        # bug in a Jellyfin upgrade changing its ffmpeg invocation, or someone/something sending
+        # non-Jellyfin traffic at an agent. Either way it's a security-relevant signal (the IR
+        # parser is documented as the security boundary), not routine.
+        expr: increase(tcpool_jobs_total{outcome="refused_policy"}[10m]) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "tcpool worker {{ $labels.worker }} refused a job on policy"
+          description: >-
+            tcpool_jobs_total{outcome="refused_policy"} increased on worker
+            "{{ $labels.worker }}" in the last 10m. Check that agent's logs for the "REFUSED a
+            job" line (crates/agent/src/main.rs) for the validator's rejection reason.
+
+      - alert: TranscodeSyncStale
+        expr: time() - tcpool_sync_last_success_timestamp_seconds > 5 * 60
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "tcpool-sync has not completed a sync cycle in over 5m"
+          description: >-
+            tcpool_sync_last_success_timestamp_seconds is stale (or the metric has never been
+            set, in which case this fires immediately by design). Jellyfin's codec offers may no
+            longer reflect the pool's real capabilities, and the transcode-dir marker keeper may
+            also be affected. Check the tcpool-sync pod's logs for "sync failed".

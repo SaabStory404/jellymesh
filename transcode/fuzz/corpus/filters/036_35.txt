@@ -1,0 +1,1 @@
+[0:3]scale,scale=-1:1080:fast_bilinear,crop,pad=max(1920\,iw):max(1080\,ih):(ow-iw)/2:(oh-ih)/2:black@0,crop=1920:1080[sub];[0:0]setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,scale=trunc(min(max(iw\,ih*a)\,1920)/2)*2:trunc(ow/a/2)*2,format=yuv420p[main];[main][sub]overlay=eof_action=pass:repeatlast=0

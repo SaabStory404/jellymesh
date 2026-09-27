@@ -1,0 +1,18 @@
+[package]
+name = "tcpool-shim"
+description = "Drop-in ffmpeg for Jellyfin: runs HLS transcodes on the pool, everything else locally"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tcpool-shim"
+path = "src/main.rs"
+
+[dependencies]
+tcpool-ir = { workspace = true }
+tcpool-proto = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+futures = { workspace = true }

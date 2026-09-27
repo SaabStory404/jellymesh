@@ -1,0 +1,95 @@
+---
+# Transcode pool (transcode/): lint, unit + parity + property tests, static musl build, and the
+# shim<->agent protocol suite against the native binaries.
+name: transcode
+
+on:
+  push:
+    branches: [main]
+    paths: ['transcode/**', '.github/workflows/transcode.yml']
+  pull_request:
+    paths: ['transcode/**', '.github/workflows/transcode.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Transcode pool native control plane (transcode): lint, unit + parity
+  # tests, static musl build, and the shim<->agent protocol suite run against
+  # the native binaries (transcode/spike/proto_test.sh, 14 cases).
+  tcpool:
+    name: tcpool
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: transcode
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          # ring (TLS) needs a musl C compiler for the static build
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup target add x86_64-unknown-linux-musl
+          rustc --version
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            transcode/target
+          key: tcpool-${{ runner.os }}-${{ hashFiles('transcode/Cargo.lock') }}
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test (incl. spike parity goldens)
+        run: cargo test --locked
+
+      - name: Static build (musl)
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Protocol suite on the native binaries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          bin="$PWD/target/x86_64-unknown-linux-musl/release"
+          out="$RUNNER_TEMP/proto.out"
+          AGENT="$bin/tcpool-agent" SHIM="$bin/tcpool-shim" TC_PROTO_DIR="$RUNNER_TEMP/proto" \
+            timeout 600 bash spike/proto_test.sh > "$out" 2>&1 || true
+          grep -E "^==|exit=|shim gone|ffmpeg (fenced|gone|STILL)" "$out"
+          # every case must report its expected outcome
+          test "$(grep -c '^exit=0' "$out")" -eq 7
+          grep -q 'shim gone after [5-8] s' "$out"
+          grep -q 'thawed ffmpeg gone' "$out"
+          grep -q 'ffmpeg fenced' "$out"
+          test "$(grep -c 'worker=transcode -> worker cpu2' "$out")" -eq 3
+          # native-only: progress watchdog, pause is not a stall, graceful drain
+          grep -q 'stalled: shim exit=247' "$out"
+          grep -q 'stalled ffmpeg gone' "$out"
+          grep -q 'paused: exit=0' "$out"
+          grep -q 'drained: shim exit=247 .* tmp_left=0' "$out"
+          # the allowlist: a job reading outside the roots is refused by the agent
+          grep -q 'refused: exit=0 agent_refusals=1' "$out"
+          # mTLS: with a pool client cert the job runs; without one it is refused
+          grep -q 'mtls: with-cert exit=0 ran_on_agent=1; without-cert fell_back=1' "$out"
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcpool-musl
+          path: |
+            transcode/target/x86_64-unknown-linux-musl/release/tcpool-agent
+            transcode/target/x86_64-unknown-linux-musl/release/tcpool-shim
+            transcode/target/x86_64-unknown-linux-musl/release/tcpool-sync

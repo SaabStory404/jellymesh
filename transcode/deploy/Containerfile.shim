@@ -1,0 +1,30 @@
+# ghcr.io/saabstory404/tcpool-shim - an ARTIFACT image, not a runnable one.
+#
+# It carries nothing but the two static binaries that belong inside a Jellyfin image:
+#   /tcpool-shim  installed as /usr/lib/jellyfin-ffmpeg/ffmpeg (hotio hard-codes that path), with
+#                 the real binary moved aside to ffmpeg.real
+#   /tcpool-sync  the sidecar that keeps Jellyfin's codec offers at the pool's lowest common
+#                 denominator
+#
+# JellyMesh's Jellyfin image consumes it without a network fetch at runtime:
+#
+#   FROM ghcr.io/saabstory404/tcpool-shim:<sha> AS tcpool
+#   FROM ghcr.io/hotio/jellyfin:release-12.1
+#   RUN mv /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/lib/jellyfin-ffmpeg/ffmpeg.real
+#   COPY --from=tcpool /tcpool-shim /usr/lib/jellyfin-ffmpeg/ffmpeg
+#   COPY --from=tcpool /tcpool-sync /usr/local/bin/tcpool-sync
+#
+# The alternative is an initContainer that copies the binaries in at pod start; both are supported
+# and CONTRACT.md documents the initContainer form, which needs no image rebuild.
+#
+# FROM scratch: the binaries are static-pie musl (MEASURED: `file` reports "static-pie linked"), so
+# there is no loader, libc or shell to ship. Nothing in here executes - there is no ENTRYPOINT on
+# purpose, and `podman run` on it will fail.
+FROM scratch
+
+LABEL org.opencontainers.image.title="tcpool-shim" \
+      org.opencontainers.image.description="Artifact image: static tcpool-shim and tcpool-sync for COPY --from" \
+      org.opencontainers.image.source="https://github.com/SaabStory404/homelab"
+
+COPY tcpool-shim /tcpool-shim
+COPY tcpool-sync /tcpool-sync
