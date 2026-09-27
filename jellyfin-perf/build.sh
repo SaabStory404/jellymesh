@@ -19,7 +19,7 @@ if [ "${BUGHUNT:-1}" != 0 ]; then
 fi
 dotnet build "$SRC/Jellyfin.Server/Jellyfin.Server.csproj" -c Release
 mkdir -p "$OUT"
-for a in Emby.Server.Implementations Jellyfin.Server.Implementations MediaBrowser.Controller MediaBrowser.MediaEncoding Jellyfin.Api jellyfin; do
+for a in Emby.Server.Implementations Jellyfin.Server.Implementations MediaBrowser.Controller MediaBrowser.MediaEncoding MediaBrowser.Model Jellyfin.Api jellyfin; do
   cp "$SRC/Jellyfin.Server/bin/Release/net10.0/$a.dll" "$OUT/"
 done
 echo "overlay in $OUT"

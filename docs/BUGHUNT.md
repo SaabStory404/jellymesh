@@ -20,21 +20,22 @@ touched assemblies into the overlay directory (`$JF_OVERLAY`, default
 
 **Overlay assemblies** (as of this series): `Emby.Server.Implementations`,
 `Jellyfin.Server.Implementations`, `MediaBrowser.Controller`, `MediaBrowser.MediaEncoding`,
-`Jellyfin.Api`, `jellyfin`. The last two (`Jellyfin.Api.dll`, `jellyfin.dll`) are new for this
-series — the query patch alone only touched the first four. Once patch `13` (DV profile 7→8.1,
-still a placeholder — see Known issue #5) lands with real code, `build.sh`'s copy loop will also
-need `MediaBrowser.Model.dll`, which it does not currently include.
+`MediaBrowser.Model`, `Jellyfin.Api`, `jellyfin`. The last three (`MediaBrowser.Model.dll`,
+`Jellyfin.Api.dll`, `jellyfin.dll`) are new for this series — the query patch alone only touched
+the first four. All public API changes are additive (no existing public signature changed or
+removed), so plugins built against stock 12.1 keep binding.
 
 **Deployment: nothing here has been built into an image or deployed.** Every number in this
 document comes from the build/test/measurement commands shown; the owning session builds and
 ships the image separately.
 
-**Integrated verification** (MEASURED on the integrated tree, all 13 patches applied together,
-Release build): 0 warnings / 0 errors. Tests: `Jellyfin.Api` 160/160, `MediaBrowser.Controller`
-209/209, `MediaBrowser.MediaEncoding` 113 passed / 1 skipped, `MediaBrowser.MediaEncoding.Hls`
-18/18, `MediaBrowser.Model` 748/748, `Jellyfin.Server.Implementations.Tests` 980 passed / 12
-skipped (4 consecutive clean runs), `Jellyfin.Server.Tests` 20/20, `Jellyfin.Providers.Tests`
-481/481 (this last count is before patch `13` lands).
+**Integrated verification** (MEASURED on the integrated tree, perf patch + all 14 patches
+`00`-`13`, Release build): 0 warnings / 0 errors. Tests, all passing: `Jellyfin.Api.Tests` 160,
+`Jellyfin.Controller.Tests` 218 (5 consecutive clean runs), `Jellyfin.MediaEncoding.Tests` 113
+(+1 skipped), `Jellyfin.MediaEncoding.Hls.Tests` 18, `Jellyfin.Model.Tests` 754,
+`Jellyfin.Server.Implementations.Tests` 980 (+12 skipped; 4 consecutive clean runs),
+`Jellyfin.Server.Tests` 20, `Jellyfin.Providers.Tests` 481. `build.sh` re-run end to end on a
+throwaway clone of the tree: all patches apply, build clean, 7 overlay assemblies produced.
 
 ## Evidence labels
 
@@ -60,7 +61,7 @@ skipped (4 consecutive clean runs), `Jellyfin.Server.Tests` 20/20, `Jellyfin.Pro
 | 10 | `10-displayprefs-retry.patch` | other | medium | MIXED | A concurrent first-write for the same display-preferences key retries instead of surfacing a 500 | New `DisplayPreferencesManager` retry test |
 | 11 | `11-trickplay-ctx-dispose.patch` | other | medium | MEASURED | `DeleteTrickplayDataAsync` disposes its `DbContext` promptly instead of via GC finalization | New disposal-tracking regression test |
 | 12 | `12-stale-web-client.patch` | Known issue #3 | low | MIXED | `serviceworker.js` gets `Cache-Control: no-cache`; a throttled warning log fires on a stale Jellyfin Web version | New version-comparison regression test |
-| 13 | `13-dv7-to-81-decision.patch` | Known issue #5 | — | — | placeholder only, see below | — |
+| 13 | `13-dv7-to-81-decision.patch` | Known issue #5 | medium | MIXED | Opt-in (`JELLYMESH_DOVI_P7_TO_81=1`): DV profile 7 to a DOVI-capable HLS client is copied with a pool conversion marker and advertised as DV 8.1 instead of stripped to HDR10; flag off = unchanged | `EncodingHelperDoviTests`, `StreamBuilderDoviP7ToP81Tests` |
 
 All 12 implemented fixes (00 and 13 are the build-compile fix and the placeholder, not counted)
 were independently re-reviewed by a second pass that re-ran the build and tests rather than
@@ -285,13 +286,81 @@ unrelated, pre-existing sort term.
 
 ## Known issue #5 — DV profile 7 not direct-playable
 
-<!-- DV section: filled in by the orchestrator -->
+**Reported:** 124 of ~331 movies are DV profile 7 BD remuxes (dual layer, BL + EL + RPU). The
+Android TV client on the Bravia can't direct-play them; today Jellyfin either strips DV to the
+HDR10 base layer or transcodes.
 
-Investigate-phase note for context: the current "always strip profile 7 to HDR10 on remux"
-behaviour was independently reviewed and judged correct/intentional as shipped (not a bug to fix);
-a related, narrower gap — the strip only matches clients declaring literal `HDR10`, not
-`DOVIWithHDR10` — is real but was not observed to trigger for any client in this fleet's actual
-traffic (see "Found, not fixed").
+**What 12.1 does (MEASURED against source + a prod ffmpeg command line):** `MediaStream`
+classifies profile 7 as `VideoRangeType.DOVIWithEL`. `EncodingHelper.ShouldRemoveDynamicHdrMetadata`
+then has two outcomes only: copy the untouched dual-layer stream (client declares `DOVIWithEL`) or
+strip to HDR10 (`hevc_metadata=remove_dovi=1` / `dovi_rpu=strip=1`). There is no path for a client
+that supports single-layer DV (`DOVI` / `DOVIWithHDR10`) but not the EL. The shipped
+jellyfin-ffmpeg cannot convert either: its `dovi_rpu` bitstream filter exposes only `strip` and
+`compression` (MEASURED, `ffmpeg -h bsf=dovi_rpu` in the jm4 image).
+
+**Split of the fix (decided by the project owner):** Jellyfin decides, the JellyMesh transcode
+pool converts (Rust, `dolby_vision` crate, between demux and mux: drop the EL, rewrite the RPU to
+profile 8.1). This patch is the decision half only; the pool half is separate work.
+
+**Fix (`13-dv7-to-81-decision.patch`, opt-in `JELLYMESH_DOVI_P7_TO_81=1`, default off =
+byte-identical to the baseline):**
+
+- `EncodingHelper`: a third plan, `ConvertDoviP7ToP81`, taken only when the flag is set AND the job is
+  HLS AND the source is `DOVIWithEL` AND the client's requested range types include `DOVI` or
+  `DOVIWithHDR10` but not `DOVIWithEL`. Video is stream-copied with no strip filter, tag `dvh1`, and the
+  pool marker (below). `DOVIWithELHDR10Plus` sources are never converted.
+- `DynamicHlsHelper`: the master playlist advertises the output as DV 8.1
+  (`SUPPLEMENTAL-CODECS="dvh1.08.<level>/db1p"`), not as a stripped stream.
+- `StreamBuilder`: for HLS transcoding-profile candidates only, a profile-7 source is checked
+  against the client's range condition as `DOVIWithHDR10`, per condition, and only where that
+  condition does not already declare `DOVIWithEL` (mirrors the `EncodingHelper` gate, so the decision
+  and the execution never disagree). HTTP/progressive candidates and direct play see the real
+  `DOVIWithEL` value, as before.
+- Also folds in `dovi-el-strip-misses-doviwithhdr10-fallback` for the flag-on case (see "Found, not fixed").
+
+**Pool marker (contract for the pool session):**
+
+1. Literal argv token pair `-metadata:s:v:0` `JELLYMESH_DOVI_P7_TO_81=1`, emitted by
+   `DynamicHlsController.GetVideoArguments` right after the `-tag:v:0 <tag>` group (and `-strict -2`
+   when the client declares literal `DOVI`), before `-bsf:v hevc_mp4toannexb`. Match the pair, not the
+   argv position. Meaning: convert DV profile 7 to 8.1 in-stream on output video stream 0. The
+   `hevc_mp4toannexb` filter is still present and must still be applied.
+2. Exactly one `-map 0:<N>` for video (`N` = the source video stream index); no extra map for the EL.
+   If the RPU rewrite needs the EL, read it from the original `-i` input. The layout of a real P7
+   remux (which stream index carries what) is INHERITED — check it with `ffprobe` on a real file
+   before building EL extraction around an assumed index.
+3. Harmless to stock ffmpeg (MEASURED, jellyfin-ffmpeg 8.1.2 via podman): accepted with exit 0 for
+   fMP4, MPEG-TS and MP4 muxers; the media payload is byte-identical (`cmp`) with and without the
+   marker; only the stream metadata tag differs. An invalid-bsf-option alternative was rejected
+   (exit 8).
+4. **Failure mode if the flag is set without the pool in the path:** stock ffmpeg copies the raw
+   profile-7 bitstream while the playlist advertises profile 8.1 — worse than today's strip. Only set
+   the flag where the pool is confirmed in the transcode path.
+
+**Before / after (flag on, HLS, Jellyfin Web-shaped client range list; MEASURED from the unit-test
+command lines):**
+
+```
+before: -codec:v:0 copy -tag:v:0 hvc1 -bsf:v hevc_mp4toannexb,hevc_metadata=remove_dovi=1 ...
+after:  -codec:v:0 copy -tag:v:0 dvh1 -strict -2 -metadata:s:v:0 JELLYMESH_DOVI_P7_TO_81=1 -bsf:v hevc_mp4toannexb ...
+```
+
+**Tests:** `EncodingHelperDoviTests` (Controller.Tests: marker present and strip absent only for
+the gated combination; unchanged with the flag off, for HDR10-only clients, for EL-declaring
+clients, for `DOVIWithELHDR10Plus`, and for progressive jobs) and `StreamBuilderDoviP7ToP81Tests`
+(Model.Tests: DOVI-capable vs HDR10-only profile, flag on/off, an HTTP candidate never wins on the
+strength of the substitution, and an EL-declaring condition still passes as in the baseline). Three
+review rounds: round 1 found HTTP candidates could win the ranking via the substitution; round 2
+found an EL-declaring condition regressed with the flag on; each was fixed with a test that
+fails before the fix (MEASURED) and passes after. Round 3 approved.
+
+**Not verified here (INHERITED):** that the Bravia/Android TV client plays the converted 8.1
+stream, and that FEL titles convert acceptably (the conversion drops the EL; MEL titles lose
+nothing, FEL titles lose the EL's extra detail). Both need the pool half and a real device. Known,
+non-regressing gaps from review: a device condition that lists only literal `DOVI` (not
+`DOVIWithHDR10`) does not win the ranking via the conversion (falls through exactly as with the flag
+off); the flag is an environment variable, so a future second profile-7 test fixture in the same
+test assembly would need a non-parallel collection.
 
 ## Known issue #6 — N+1 / slow queries beyond `jellyfin-perf`
 
@@ -432,10 +501,10 @@ independently verified.
   this can let a job's owner-node kill timer fire while the client is actually still being served by
   the other replica. Not fixed here (see Known issue #2) — needs either session-aware ping routing
   or moving kill-timer ownership off "which node last saw a ping."
-- **Test flake, pre-existing, unconfirmed:** `Jellyfin.Controller.Tests`'s
-  `PlaylistTests.IsVisible_PlaylistWithOneAllowedItem_StaysVisible` was observed failing once during
-  this work but passes standalone every time it's been re-run in isolation — logged here as a known
-  flake to watch for, not something this series introduced or fixed.
+- **Test flake, unconfirmed:** `Jellyfin.Controller.Tests`'s
+  `PlaylistTests.IsVisible_PlaylistWithOneAllowedItem_StaysVisible` failed in full-suite runs on the
+  patch-13 branch alone (which lacks `00-tests-fixup`), passes standalone, and did not reproduce in 5
+  full runs on the integrated tree. Not touched by any patch here; watch for it.
 
 ## Method
 
@@ -447,5 +516,8 @@ and a "fix" lens (is fixing it worth the risk, and is the proposed fix itself co
 completeness-critic pass added three more (`c0`-`c2`, not yet run through the same two-lens process).
 Twelve findings survived both lenses and were implemented; each fix was built on its own branch, with
 build and full test suite independently re-run by a second reviewer who did not simply trust the
-first pass's numbers — two items needed a fixup round before that reviewer approved. Every claim in
+first pass's numbers — four items needed a fixup round before that reviewer approved, and patch 13
+needed two. Patches were then merged in order onto one branch, rebuilt and re-tested together;
+integration found and fixed one cross-patch gap (03's shared-dir wait now uses 04's
+request-abort-linked token) and one test-isolation leak (in 08's new test class). Every claim in
 this document is labelled MEASURED, INHERITED, or MIXED per the definitions above.

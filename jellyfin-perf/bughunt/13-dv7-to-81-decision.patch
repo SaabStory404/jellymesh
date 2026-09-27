@@ -1,0 +1,873 @@
+diff --git a/Jellyfin.Api/Controllers/DynamicHlsController.cs b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+index 71838dda8..5f8193b32 100644
+--- a/Jellyfin.Api/Controllers/DynamicHlsController.cs
++++ b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+@@ -1919,6 +1919,15 @@ public class DynamicHlsController : BaseJellyfinApiController
+             }
+         }
+ 
++        // JELLYMESH_DOVI_P7_TO_81: independent of which codec tag branch above fired (a client
++        // declaring DOVIWithHDR10 but not the literal "DOVI" range lands in the hvc1-fallback
++        // branch, same as any other DOVIWithHDR10 source), append the marker the transcode pool
++        // looks for on video stream 0. Empty (no-op) unless this job is actually converting.
++        if (EncodingHelper.IsCopyCodec(codec))
++        {
++            args += _encodingHelper.GetDoviP7ToP81MarkerArgs(state);
++        }
++
+         // if  (state.EnableMpegtsM2TsMode)
+         // {
+         //     args += " -mpegts_m2ts_mode 1";
+diff --git a/Jellyfin.Api/Helpers/DynamicHlsHelper.cs b/Jellyfin.Api/Helpers/DynamicHlsHelper.cs
+index 4995d37f4..a7ae02bbf 100644
+--- a/Jellyfin.Api/Helpers/DynamicHlsHelper.cs
++++ b/Jellyfin.Api/Helpers/DynamicHlsHelper.cs
+@@ -549,9 +549,18 @@ public class DynamicHlsHelper
+ 
+         void AppendDvString()
+         {
+-            var dvProfile = state.VideoStream.DvProfile;
++            // JELLYMESH_DOVI_P7_TO_81: the transcode pool delivers a single-layer profile 8.1
++            // stream, not the source's own profile 7 dual-layer one, so this must describe the
++            // OUTPUT (profile 8, an HDR10-compatible-base-layer range type) rather than read the
++            // source's DvProfile/VideoRangeType fields directly. Always plain DOVIWithHDR10, never
++            // …HDR10Plus: IsDoviP7ToP81Converted is never true for a DOVIWithELHDR10Plus source
++            // (see EncodingHelper.ShouldRemoveDynamicHdrMetadata), so there is no HDR10+-coexisting
++            // case to describe here yet.
++            var isP7ToP81Converted = _encodingHelper.IsDoviP7ToP81Converted(state);
++            var dvProfile = isP7ToP81Converted ? 8 : state.VideoStream.DvProfile;
+             var dvLevel = state.VideoStream.DvLevel;
+-            var dvRangeString = state.VideoStream.VideoRangeType switch
++            var effectiveRangeType = isP7ToP81Converted ? VideoRangeType.DOVIWithHDR10 : state.VideoStream.VideoRangeType;
++            var dvRangeString = effectiveRangeType switch
+             {
+                 VideoRangeType.DOVIWithHDR10 => "db1p",
+                 VideoRangeType.DOVIWithHLG => "db4h",
+diff --git a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+index 0f92f2012..83e4557c1 100644
+--- a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
++++ b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+@@ -179,7 +179,21 @@ namespace MediaBrowser.Controller.MediaEncoding
+             None,
+             RemoveDovi,
+             RemoveHdr10Plus,
+-        }
++            ConvertDoviP7ToP81,
++        }
++
++        // JELLYMESH_DOVI_P7_TO_81=1: an HLS remux/Direct Stream of a Dolby Vision profile 7
++        // (dual-layer EL) source is served as profile 8.1 (single layer, HDR10-compatible base
++        // layer) instead of being stripped to plain HDR10, for a client whose device profile
++        // declares DOVI or DOVIWithHDR10 support but not DOVIWithEL. This requires the transcode
++        // pool (a separate process outside this repo) to be in the ffmpeg path: it detects the
++        // marker this emits (see GetDoviP7ToP81MarkerArgs) and rewrites the RPU / drops the EL
++        // between demux and mux. Stock jellyfin-ffmpeg cannot do this rewrite on its own (its
++        // dovi_rpu bitstream filter only strips or compresses), so this must stay opt-in: default
++        // off is byte-identical to the pre-existing strip-to-HDR10 / keep-full-DOVI behavior.
++        // Read as a property (not a cached static-readonly field, unlike JELLYFIN_SHARED_DB
++        // elsewhere in this fork) so tests can toggle it per-case.
++        private static bool DoviP7ToP81Enabled => Environment.GetEnvironmentVariable("JELLYMESH_DOVI_P7_TO_81") == "1";
+ 
+         /// <summary>
+         /// The codec validation regex.
+@@ -1437,9 +1451,45 @@ namespace MediaBrowser.Controller.MediaEncoding
+ 
+             var requestHasHDR10 = requestedRangeTypes.Contains(VideoRangeType.HDR10.ToString(), StringComparison.OrdinalIgnoreCase);
+             var requestHasDOVI = requestedRangeTypes.Contains(VideoRangeType.DOVI.ToString(), StringComparison.OrdinalIgnoreCase);
++            var requestHasDOVIwithHDR10 = requestedRangeTypes.Contains(VideoRangeType.DOVIWithHDR10.ToString(), StringComparison.OrdinalIgnoreCase);
+             var requestHasDOVIwithEL = requestedRangeTypes.Contains(VideoRangeType.DOVIWithEL.ToString(), StringComparison.OrdinalIgnoreCase);
+             var requestHasDOVIwithELHDR10plus = requestedRangeTypes.Contains(VideoRangeType.DOVIWithELHDR10Plus.ToString(), StringComparison.OrdinalIgnoreCase);
+ 
++            // JELLYMESH_DOVI_P7_TO_81: convert instead of strip for a client that can take some
++            // form of Dolby Vision (DOVI or DOVIWithHDR10) but not the dual-layer EL. Takes
++            // priority over Case 1/2 below: those treat every non-EL-declaring client identically
++            // (strip everything down to plain HDR10), because until now that was the only
++            // alternative to serving the untouched dual-layer stream. Scoped to HLS only
++            // (state.TranscodingType) because only DynamicHlsController's argument builder emits
++            // the marker this plan relies on; Progressive/Direct Stream keeps today's behavior
++            // exactly (see GetMasterHlsPlaylist / GetVideoArguments vs GetProgressiveVideoArguments).
++            //
++            // Deliberately scoped to plain DOVIWithEL only, NOT DOVIWithELHDR10Plus: the special
++            // case just below already strips HDR10+ from a *native* (non-EL) DOVIWithHDR10Plus
++            // source for a "DOVI" client, to avoid a DV player choking on RPU and HDR10+ SEI
++            // coexisting. A converted P7+HDR10+ source would reach that same client with both
++            // still present (IsHdr10PlusRemoved stays false for this plan), reproducing exactly
++            // the combination that rule exists to avoid. Fixing that would mean adding a
++            // remove_hdr10plus bsf onto the pool-bound bitstream too, which needs the same
++            // MEASURED verification this plan's own marker got; not done here. A DOVIWithELHDR10Plus
++            // source therefore falls through unchanged to Case 1/2 below regardless of this flag.
++            //
++            // This also folds in the narrower, independently-flagged gap where a client declaring
++            // only DOVIWithHDR10 (no HDR10, no DOVI) fell through Case 1 as an untouched, unstripped
++            // copy: such a client now qualifies here instead. A client that has neither DOVI nor
++            // DOVIWithHDR10 (e.g. HDR10-only, or nothing declared) is unaffected and keeps falling
++            // through to Case 1/2 below exactly as before -- deliberately NOT widening Case 1's own
++            // requestHasHDR10 check, since that would change bh-base behavior even with this feature
++            // off (see dv7-to-81-decision fix notes for the fix-items finding this replaces).
++            if (DoviP7ToP81Enabled
++                && state.TranscodingType == TranscodingJobType.Hls
++                && !requestHasDOVIwithEL
++                && (requestHasDOVI || requestHasDOVIwithHDR10)
++                && videoStream.VideoRangeType == VideoRangeType.DOVIWithEL)
++            {
++                return DynamicHdrMetadataRemovalPlan.ConvertDoviP7ToP81;
++            }
++
+             var shouldRemoveHdr10Plus = false;
+             // Case 1: Client supports HDR10, does not support DOVI with EL but EL presets
+             var shouldRemoveDovi = (!requestHasDOVIwithEL && requestHasHDR10) && videoStream.VideoRangeType == VideoRangeType.DOVIWithEL;
+@@ -1476,6 +1526,11 @@ namespace MediaBrowser.Controller.MediaEncoding
+                                                             || (IsAv1(videoStream) && _mediaEncoder.SupportsBitStreamFilterWithOption(BitStreamFilterOptionType.Av1MetadataRemoveDovi)),
+                 DynamicHdrMetadataRemovalPlan.RemoveHdr10Plus => (IsH265(videoStream) && _mediaEncoder.SupportsBitStreamFilterWithOption(BitStreamFilterOptionType.HevcMetadataRemoveHdr10Plus))
+                                                                  || (IsAv1(videoStream) && _mediaEncoder.SupportsBitStreamFilterWithOption(BitStreamFilterOptionType.Av1MetadataRemoveHdr10Plus)),
++                // Not an ffmpeg bitstream-filter transform -- the external transcode pool does the
++                // RPU rewrite between demux and mux, outside this encoder's own bsf chain. Nothing
++                // here needs to gate on encoder capability; DoviP7ToP81Enabled already gates on the
++                // pool being wired in for this deployment.
++                DynamicHdrMetadataRemovalPlan.ConvertDoviP7ToP81 => true,
+                 _ => true,
+             };
+         }
+@@ -1492,6 +1547,50 @@ namespace MediaBrowser.Controller.MediaEncoding
+                                                   && CanEncoderRemoveDynamicHdrMetadata(DynamicHdrMetadataRemovalPlan.RemoveHdr10Plus, state.VideoStream);
+         }
+ 
++        /// <summary>
++        /// JELLYMESH_DOVI_P7_TO_81: true when this job's Dolby Vision profile 7 (dual-layer EL,
++        /// MediaStream.VideoRangeType DOVIWithEL) source is being served as profile 8.1 by the
++        /// external transcode pool instead of being stripped to HDR10 or copied untouched. Every
++        /// client-visible description of the output (HLS playlist fields, codec tag) should treat
++        /// the stream as Dolby Vision (not removed) with an effective range type of DOVIWithHDR10
++        /// and DV profile 8, not the source's own profile-7 fields, when this is true.
++        ///
++        /// Never true for DOVIWithELHDR10Plus (profile 7 with coexisting HDR10+ metadata) -- see
++        /// the comment on the ConvertDoviP7ToP81 branch in ShouldRemoveDynamicHdrMetadata for why
++        /// that combination is deliberately left on today's strip-or-passthrough behavior.
++        /// </summary>
++        /// <param name="state">The encoding job.</param>
++        /// <returns>Whether the output is being converted from profile 7 to profile 8.1.</returns>
++        public bool IsDoviP7ToP81Converted(EncodingJobInfo state)
++        {
++            return state?.VideoStream is not null && ShouldRemoveDynamicHdrMetadata(state) == DynamicHdrMetadataRemovalPlan.ConvertDoviP7ToP81
++                                                   && CanEncoderRemoveDynamicHdrMetadata(DynamicHdrMetadataRemovalPlan.ConvertDoviP7ToP81, state.VideoStream);
++        }
++
++        /// <summary>
++        /// JELLYMESH_DOVI_P7_TO_81: the marker argument that tells the transcode pool to convert
++        /// profile 7 to profile 8.1 in-stream on output video stream 0, instead of the stock
++        /// ffmpeg binary literally copying the stream untouched. Empty when the conversion is not
++        /// active for this job.
++        ///
++        /// Chosen mechanism (evaluated against the alternatives below): a stream metadata tag,
++        /// <c>-metadata:s:v:0 JELLYMESH_DOVI_P7_TO_81=1</c>, not a bitstream-filter option. MEASURED
++        /// with the real jellyfin-ffmpeg image via podman on a synthetic 10-bit HEVC stream: this
++        /// argument is accepted (exit 0) by fMP4 (fragmented, the HLS remux case), mpegts, and
++        /// plain mp4 muxers, and the copied video essence is byte-identical to the same command
++        /// without it -- so a stock ffmpeg that never learns to look for this marker still produces
++        /// valid, unmodified output. It is deliberately not folded into GetBitStreamArgs's
++        /// -bsf:v chain: a custom option on a real bitstream filter that declares options (e.g.
++        /// hevc_metadata) is rejected by ffmpeg ("Option not found", exit 8) rather than ignored,
++        /// so piggy-backing the marker on one of those would not be harmless.
++        /// </summary>
++        /// <param name="state">The encoding job.</param>
++        /// <returns>The marker argument (with a leading space), or an empty string.</returns>
++        public string GetDoviP7ToP81MarkerArgs(EncodingJobInfo state)
++        {
++            return IsDoviP7ToP81Converted(state) ? " -metadata:s:v:0 JELLYMESH_DOVI_P7_TO_81=1" : string.Empty;
++        }
++
+         public string GetBitStreamArgs(EncodingJobInfo state, MediaStreamType streamType)
+         {
+             if (state is null)
+@@ -1538,6 +1637,11 @@ namespace MediaBrowser.Controller.MediaEncoding
+                     case DynamicHdrMetadataRemovalPlan.RemoveHdr10Plus:
+                         filter += ",hevc_metadata=remove_hdr10plus=1";
+                         break;
++                    case DynamicHdrMetadataRemovalPlan.ConvertDoviP7ToP81:
++                        // No bsf: the RPU/EL-bearing bitstream must reach the transcode pool
++                        // untouched (same shape as None) for it to convert profile 7 to 8.1.
++                        // The pool's own marker is a separate argument -- see GetDoviP7ToP81MarkerArgs.
++                        break;
+                 }
+ 
+                 return filter;
+diff --git a/MediaBrowser.Model/Dlna/StreamBuilder.cs b/MediaBrowser.Model/Dlna/StreamBuilder.cs
+index 4799ed541..5a500ece1 100644
+--- a/MediaBrowser.Model/Dlna/StreamBuilder.cs
++++ b/MediaBrowser.Model/Dlna/StreamBuilder.cs
+@@ -34,6 +34,31 @@ namespace MediaBrowser.Model.Dlna
+         private static readonly string[] _supportedHlsAudioCodecsTs = ["aac", "ac3", "eac3", "mp3"];
+         private static readonly string[] _supportedHlsAudioCodecsMp4 = ["aac", "ac3", "eac3", "mp3", "alac", "flac", "opus", "dts", "truehd"];
+ 
++        // JELLYMESH_DOVI_P7_TO_81=1: see MediaBrowser.Controller.MediaEncoding.EncodingHelper's
++        // field of the same name for the full rationale. Read independently here (this project
++        // cannot depend on EncodingHelper's assembly) so that GetVideoTranscodeProfile's
++        // transcoding-profile/CodecProfile range-type check treats a profile-7 DOVIWithEL source
++        // as if it were the profile-8.1-equivalent DOVIWithHDR10 range type for a client whose
++        // CodecProfile conditions accept DOVI or DOVIWithHDR10 but not DOVIWithEL -- so the
++        // constrained TranscodingProfile ranks video-copy-eligible (rank.Video==1) and wins the
++        // profile/container selection instead of an unconstrained fallback, matching what
++        // EncodingHelper will actually deliver for the same Hls job. NOTE: this changes which
++        // TranscodingProfile/container StreamInfo ends up with, NOT the PlayMethod enum value --
++        // BuildVideoItem sets playlistItem.PlayMethod = PlayMethod.Transcode unconditionally right
++        // after calling GetVideoTranscodeProfile regardless of rank.Video (see its call site);
++        // only ever gate this substitution per-candidate on that candidate's own
++        // TranscodingProfile.Protocol == MediaStreamProtocol.hls (see GetVideoTranscodeProfile
++        // below) -- an http/Progressive-protocol candidate must never win on the strength of a
++        // conversion EncodingHelper only performs for an Hls job. Deliberately NOT DOVIWithELHDR10Plus:
++        // EncodingHelper never converts that combination (see its ConvertDoviP7ToP81 comment), so
++        // substituting it here would rank a TranscodingProfile as video-copy-eligible for a source
++        // that server-side still strips to HDR10 -- a different profile/container chosen than
++        // bh-base for no benefit, since the strip happens either way.
++        // Deliberately NOT read as a cached static-readonly field (unlike JELLYFIN_SHARED_DB
++        // elsewhere in this fork): a property re-reads the environment every call, which is what
++        // lets tests toggle it per-case.
++        private static bool DoviP7ToP81Enabled => Environment.GetEnvironmentVariable("JELLYMESH_DOVI_P7_TO_81") == "1";
++
+         /// <summary>
+         /// Initializes a new instance of the <see cref="StreamBuilder"/> class.
+         /// </summary>
+@@ -882,7 +907,25 @@ namespace MediaBrowser.Model.Dlna
+                         && options.AllowVideoStreamCopy
+                         && ContainerHelper.ContainsContainer(transcodingProfile.VideoCodec, videoCodec))
+                     {
+-                        var failures = GetCompatibilityVideoCodec(options, mediaSource, container, videoStream);
++                        // allowDoviP7ToP81Substitution is gated on THIS CANDIDATE's own delivery
++                        // Protocol, not on an assumption about how GetVideoTranscodeProfile as a
++                        // whole is reached: it ranks TranscodingProfile candidates for both Hls
++                        // and http (Progressive) delivery in the same pass, and
++                        // SetStreamInfoOptionsFromTranscodingProfile (called by the caller right
++                        // after this method returns) applies whichever profile wins -- including
++                        // its Protocol -- to StreamInfo.SubProtocol/TranscodingSubProtocol, which
++                        // is what actually routes the client to DynamicHlsController (hls) vs
++                        // VideosController/GetProgressiveVideoArguments (http). EncodingHelper's
++                        // real P7->8.1 conversion is gated on TranscodingJobType.Hls and the pool
++                        // marker is wired only into DynamicHlsController, so an http-protocol
++                        // candidate must never be allowed to win this ranking on the strength of a
++                        // conversion that will not actually happen for Progressive delivery --
++                        // that would silently reintroduce the Progressive-exclusion gap this
++                        // feature depends on. rank.Video==1 otherwise just picks video-copy instead
++                        // of re-encode, matching what EncodingHelper decides server-side for the
++                        // same Hls job.
++                        var allowDoviP7ToP81Substitution = transcodingProfile.Protocol == MediaStreamProtocol.hls;
++                        var failures = GetCompatibilityVideoCodec(options, mediaSource, container, videoStream, allowDoviP7ToP81Substitution);
+                         rank.Video = failures == 0 ? 1 : 2;
+                     }
+ 
+@@ -2359,8 +2402,21 @@ namespace MediaBrowser.Model.Dlna
+         /// <param name="conditions">Profile conditions.</param>
+         /// <param name="mediaSource">Media source.</param>
+         /// <param name="videoStream">Video stream.</param>
++        /// <param name="allowDoviP7ToP81Substitution">JELLYMESH_DOVI_P7_TO_81: when true, a
++        /// DOVIWithEL <paramref name="videoStream"/> is checked as its profile-8.1-equivalent
++        /// range type (DOVIWithHDR10) instead of its own, for any condition in
++        /// <paramref name="conditions"/> that does not itself already declare DOVIWithEL support
++        /// (see <see cref="ConditionDeclaresDoviWithEL"/> -- mirrors EncodingHelper's own
++        /// "!requestHasDOVIwithEL" gate in ShouldRemoveDynamicHdrMetadata, so a condition that
++        /// already passes a real DOVIWithEL source on its own literal merits keeps doing so
++        /// unchanged, exactly like bh-base). Deliberately excludes DOVIWithELHDR10Plus, which
++        /// EncodingHelper never actually converts -- see DoviP7ToP81Enabled's declaration
++        /// comment. Only ever pass true for a check that gates HLS remux/transcode-profile
++        /// selection, never for one that gates Direct Play or a plain container-remux
++        /// DirectPlayProfile match -- those must keep failing for an unconverted profile-7
++        /// source.</param>
+         /// <returns>Failed profile conditions.</returns>
+-        private IEnumerable<ProfileCondition> CheckVideoConditions(ProfileCondition[] conditions, MediaSourceInfo mediaSource, MediaStream? videoStream)
++        private IEnumerable<ProfileCondition> CheckVideoConditions(ProfileCondition[] conditions, MediaSourceInfo mediaSource, MediaStream? videoStream, bool allowDoviP7ToP81Substitution = false)
+         {
+             int? width = videoStream?.Width;
+             int? height = videoStream?.Height;
+@@ -2369,6 +2425,21 @@ namespace MediaBrowser.Model.Dlna
+             double? videoLevel = videoStream?.Level;
+             string? videoProfile = videoStream?.Profile;
+             VideoRangeType? videoRangeType = videoStream?.VideoRangeType;
++
++            // JELLYMESH_DOVI_P7_TO_81: the substituted value to use INSTEAD of the real
++            // videoRangeType, for whichever conditions below qualify for it (decided
++            // per-condition in the .Where -- see ConditionDeclaresDoviWithEL). Computed once
++            // here since the flag/candidate/source-range checks are identical for every
++            // condition in this array; null means "never substitute for this call" (flag off,
++            // this candidate not eligible via allowDoviP7ToP81Substitution, or the source isn't
++            // DOVIWithEL in the first place). DOVIWithELHDR10Plus deliberately excluded --
++            // EncodingHelper never converts it (see DoviP7ToP81Enabled's declaration comment
++            // above), so substituting it here would rank a profile as video-copy-eligible for a
++            // source server-side still strips to HDR10.
++            VideoRangeType? doviP7ToP81SubstitutedRangeType = allowDoviP7ToP81Substitution && DoviP7ToP81Enabled && videoRangeType == VideoRangeType.DOVIWithEL
++                ? VideoRangeType.DOVIWithHDR10
++                : null;
++
+             float videoFramerate = videoStream is null ? 0 : videoStream.ReferenceFrameRate ?? 0;
+             bool? isAnamorphic = videoStream?.IsAnamorphic;
+             bool? isInterlaced = videoStream?.IsInterlaced;
+@@ -2384,7 +2455,75 @@ namespace MediaBrowser.Model.Dlna
+             int? numAudioStreams = mediaSource.GetStreamCount(MediaStreamType.Audio);
+             int? numVideoStreams = mediaSource.GetStreamCount(MediaStreamType.Video);
+ 
+-            return conditions.Where(applyCondition => !ConditionProcessor.IsVideoConditionSatisfied(applyCondition, width, height, bitDepth, videoBitrate, videoProfile, videoRangeType, videoLevel, videoFramerate, packetLength, timestamp, isAnamorphic, isInterlaced, refFrames, numStreams, numVideoStreams, numAudioStreams, videoCodecTag, isAvc, videoRotation));
++            return conditions.Where(applyCondition =>
++            {
++                // Per-condition, not once for the whole array (second-review fix): only use the
++                // substituted range type for THIS condition when it does not itself already
++                // declare DOVIWithEL support. Otherwise a CodecProfile condition that already
++                // lists DOVIWithEL (e.g. "SDR|HDR10|HLG|DOVIWithEL", which the real, unconverted
++                // source already satisfies, exactly as in bh-base) would have an already-passing
++                // match turned into a failure purely by the substitution -- the bug the second
++                // review found.
++                var effectiveVideoRangeType = doviP7ToP81SubstitutedRangeType is not null && !ConditionDeclaresDoviWithEL(applyCondition)
++                    ? doviP7ToP81SubstitutedRangeType
++                    : videoRangeType;
++
++                return !ConditionProcessor.IsVideoConditionSatisfied(applyCondition, width, height, bitDepth, videoBitrate, videoProfile, effectiveVideoRangeType, videoLevel, videoFramerate, packetLength, timestamp, isAnamorphic, isInterlaced, refFrames, numStreams, numVideoStreams, numAudioStreams, videoCodecTag, isAvc, videoRotation);
++            });
++        }
++
++        /// <summary>
++        /// Whether <paramref name="condition"/>, entirely on its own, declares support for
++        /// <see cref="VideoRangeType.DOVIWithEL"/> -- i.e. whether it would contribute
++        /// "DOVIWithEL" to the device profile's aggregated "rangetype" option that
++        /// ApplyTranscodingConditions builds from these same CodecProfile conditions, which is
++        /// what EncodingHelper.ShouldRemoveDynamicHdrMetadata's own requestHasDOVIwithEL check
++        /// (state.GetRequestedRangeTypes) ultimately reads. Used only to decide whether the
++        /// JELLYMESH_DOVI_P7_TO_81 substitution should be skipped for THIS condition; see
++        /// <see cref="CheckVideoConditions"/>.
++        /// </summary>
++        /// <remarks>
++        /// Only a <see cref="ProfileConditionValue.VideoRangeType"/> condition is considered --
++        /// any other property is unaffected by the substitution regardless, since
++        /// <see cref="ConditionProcessor.IsVideoConditionSatisfied"/> never reads the (possibly
++        /// substituted) range type for it. Handling by <see cref="ProfileConditionType"/>
++        /// mirrors ApplyTranscodingConditions's own VideoRangeType case exactly:
++        /// <list type="bullet">
++        /// <item>EqualsAny / Equals: that case sets "rangetype" directly from this condition's
++        /// own pipe-delimited value list, so "declares DOVIWithEL" means the list contains it
++        /// literally (e.g. "DOVI|DOVIWithHDR10" does not; "SDR|HDR10|HLG|DOVIWithEL"
++        /// does).</item>
++        /// <item>NotEquals: that case sets "rangetype" to ALL VideoRangeType values EXCEPT the
++        /// ones this condition lists (<c>Enum.GetNames&lt;VideoRangeType&gt;().Except(values)</c>)
++        /// -- the inverse of EqualsAny/Equals. So a NotEquals condition declares DOVIWithEL
++        /// support when its OWN value list does NOT list DOVIWithEL (DOVIWithEL is then excluded
++        /// from the exclusion set, i.e. included in the resulting supported set), and the
++        /// substitution is skipped for a NotEquals condition only when its value list DOES list
++        /// DOVIWithEL (that condition is then explicitly rejecting an unconverted DOVIWithEL
++        /// source, exactly as bh-base does).</item>
++        /// </list>
++        /// </remarks>
++        private static bool ConditionDeclaresDoviWithEL(ProfileCondition condition)
++        {
++            if (condition.Property != ProfileConditionValue.VideoRangeType)
++            {
++                return false;
++            }
++
++            var valueListContainsDoviWithEL = false;
++            foreach (var singleConditionString in condition.Value.AsSpan().Split('|'))
++            {
++                if (Enum.TryParse(singleConditionString, true, out VideoRangeType conditionValue)
++                    && conditionValue == VideoRangeType.DOVIWithEL)
++                {
++                    valueListContainsDoviWithEL = true;
++                    break;
++                }
++            }
++
++            return condition.Condition == ProfileConditionType.NotEquals
++                ? !valueListContainsDoviWithEL
++                : valueListContainsDoviWithEL;
+         }
+ 
+         /// <summary>
+@@ -2417,8 +2556,9 @@ namespace MediaBrowser.Model.Dlna
+         /// <param name="mediaSource">Media source.</param>
+         /// <param name="container">Container.</param>
+         /// <param name="videoStream">Video stream.</param>
++        /// <param name="allowDoviP7ToP81Substitution">See <see cref="CheckVideoConditions"/>.</param>
+         /// <returns>Transcode reasons if the video stream is not fully compatible.</returns>
+-        private TranscodeReason GetCompatibilityVideoCodec(MediaOptions options, MediaSourceInfo mediaSource, string container, MediaStream videoStream)
++        private TranscodeReason GetCompatibilityVideoCodec(MediaOptions options, MediaSourceInfo mediaSource, string container, MediaStream videoStream, bool allowDoviP7ToP81Substitution = false)
+         {
+             var profile = options.Profile;
+ 
+@@ -2431,8 +2571,8 @@ namespace MediaBrowser.Model.Dlna
+                 profile.CodecProfiles
+                     .Where(codecProfile => codecProfile.Type == CodecType.Video &&
+                         codecProfile.ContainsAnyCodec(videoCodec, container) &&
+-                        !CheckVideoConditions(codecProfile.ApplyConditions, mediaSource, videoStream).Any())
+-                    .SelectMany(codecProfile => CheckVideoConditions(codecProfile.Conditions, mediaSource, videoStream)));
++                        !CheckVideoConditions(codecProfile.ApplyConditions, mediaSource, videoStream, allowDoviP7ToP81Substitution).Any())
++                    .SelectMany(codecProfile => CheckVideoConditions(codecProfile.Conditions, mediaSource, videoStream, allowDoviP7ToP81Substitution)));
+ 
+             return failures;
+         }
+diff --git a/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs b/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs
+index 557035e2d..f9e81591a 100644
+--- a/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs
++++ b/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs
+@@ -115,7 +115,141 @@ public class EncodingHelperDoviTests
+         Assert.Equal("-bsf:v hevc_mp4toannexb", helper.GetBitStreamArgs(state, MediaStreamType.Video));
+     }
+ 
+-    private static EncodingJobInfo CreateState(string codec, string? transfer)
++    // JELLYMESH_DOVI_P7_TO_81 -----------------------------------------------------------------
++
++    [Theory]
++    [InlineData("DOVI")]
++    [InlineData("DOVIWithHDR10")]
++    [InlineData("SDR,HDR10,HDR10Plus,HLG,DOVI,DOVIWithHDR10,DOVIWithHLG,DOVIWithSDR,DOVIWithHDR10Plus")]
++    public void DoviP7ToP81_EnabledOnHlsForDoviCapableClient_ConvertsInsteadOfStripping(string requestedRanges)
++    {
++        using var env = new EnvVarScope("JELLYMESH_DOVI_P7_TO_81", "1");
++        var state = CreateValidDoviWithElState(hdr10Plus: false);
++        state.BaseRequest.VideoRangeType = requestedRanges;
++
++        // Encoder capability is irrelevant to this plan: the transcode pool does the rewrite, not
++        // an ffmpeg bitstream filter, so this must hold even when the encoder has none of the
++        // strip/compress bitstream filters that RemoveDovi would otherwise require.
++        foreach (var helper in new[] { CreateHelper(true), CreateHelper(false) })
++        {
++            Assert.True(helper.IsDoviP7ToP81Converted(state));
++            Assert.False(helper.IsDoviRemoved(state));
++            Assert.False(helper.IsHdr10PlusRemoved(state));
++            Assert.Equal("-bsf:v hevc_mp4toannexb", helper.GetBitStreamArgs(state, MediaStreamType.Video));
++            Assert.Equal(" -metadata:s:v:0 JELLYMESH_DOVI_P7_TO_81=1", helper.GetDoviP7ToP81MarkerArgs(state));
++            Assert.True(helper.CanStreamCopyVideo(state, state.VideoStream));
++        }
++    }
++
++    [Theory]
++    [InlineData("DOVI")]
++    [InlineData("DOVIWithHDR10")]
++    public void DoviP7ToP81_DisabledByDefault_MatchesBhBaseUnstrippedCopy(string requestedRanges)
++    {
++        // Force-unset (not just "not set by this test"): this is the byte-identical-to-bh-base
++        // proof, so it must not depend on the ambient shell/CI environment happening to not
++        // export JELLYMESH_DOVI_P7_TO_81. Includes the pre-existing, independently-flagged gap
++        // (dovi-el-strip-misses-doviwithhdr10-fallback) where a client that asks for
++        // DOVI/DOVIWithHDR10 but not DOVIWithEL, against a DOVIWithEL source, already got an
++        // unstripped copy today -- deliberately not widened here; JELLYMESH_DOVI_P7_TO_81
++        // supersedes it with a real conversion instead when turned on (see the theory above),
++        // rather than this fix touching Case 1's own HDR10-only trigger.
++        using var env = new EnvVarScope("JELLYMESH_DOVI_P7_TO_81", null);
++        var state = CreateValidDoviWithElState(hdr10Plus: false);
++        state.BaseRequest.VideoRangeType = requestedRanges;
++        var helper = CreateHelper(true);
++
++        Assert.False(helper.IsDoviP7ToP81Converted(state));
++        Assert.False(helper.IsDoviRemoved(state));
++        Assert.Equal(string.Empty, helper.GetDoviP7ToP81MarkerArgs(state));
++        Assert.Equal("-bsf:v hevc_mp4toannexb", helper.GetBitStreamArgs(state, MediaStreamType.Video));
++    }
++
++    [Fact]
++    public void DoviP7ToP81_EnabledButClientOnlyWantsHdr10_StillStripsUnchanged()
++    {
++        using var env = new EnvVarScope("JELLYMESH_DOVI_P7_TO_81", "1");
++        var state = CreateValidDoviWithElState(hdr10Plus: false);
++        state.BaseRequest.VideoRangeType = "HDR10";
++        var helper = CreateHelper(true);
++
++        Assert.False(helper.IsDoviP7ToP81Converted(state));
++        Assert.True(helper.IsDoviRemoved(state));
++        Assert.Equal(string.Empty, helper.GetDoviP7ToP81MarkerArgs(state));
++        Assert.Contains("hevc_metadata=remove_dovi=1", helper.GetBitStreamArgs(state, MediaStreamType.Video), StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void DoviP7ToP81_EnabledButClientDeclaresElSupport_KeepsFullPassthroughUnchanged()
++    {
++        using var env = new EnvVarScope("JELLYMESH_DOVI_P7_TO_81", "1");
++        var state = CreateValidDoviWithElState(hdr10Plus: false);
++        state.BaseRequest.VideoRangeType = "DOVIWithEL";
++        var helper = CreateHelper(true);
++
++        Assert.False(helper.IsDoviP7ToP81Converted(state));
++        Assert.False(helper.IsDoviRemoved(state));
++        Assert.Equal(string.Empty, helper.GetDoviP7ToP81MarkerArgs(state));
++        Assert.Equal("-bsf:v hevc_mp4toannexb", helper.GetBitStreamArgs(state, MediaStreamType.Video));
++    }
++
++    [Fact]
++    public void DoviP7ToP81_EnabledButProgressiveJob_NotConvertedEvenWhenClientEligible()
++    {
++        using var env = new EnvVarScope("JELLYMESH_DOVI_P7_TO_81", "1");
++        var state = CreateValidDoviWithElState(hdr10Plus: false, jobType: TranscodingJobType.Progressive);
++        state.BaseRequest.VideoRangeType = "DOVIWithHDR10";
++        var helper = CreateHelper(true);
++
++        // Only DynamicHlsController's argument builder emits/consumes the marker; a Progressive
++        // job must keep today's behavior (the same unstripped-copy gap as the disabled-by-default
++        // case) rather than silently serving unconverted profile-7 bytes as if they were 8.1.
++        Assert.False(helper.IsDoviP7ToP81Converted(state));
++        Assert.Equal(string.Empty, helper.GetDoviP7ToP81MarkerArgs(state));
++    }
++
++    [Fact]
++    public void DoviP7ToP81_DoviWithElHdr10Plus_ScopedOut_NotConvertedEvenWhenEnabled()
++    {
++        // Deliberately scoped out (see ShouldRemoveDynamicHdrMetadata's comment on the
++        // ConvertDoviP7ToP81 branch): converting would reach a DOVI client with RPU and HDR10+
++        // SEI both present, exactly the combination the pre-existing DOVIWithHDR10Plus/"DOVI"
++        // rule strips HDR10+ to avoid, and this plan never removes HDR10+. So a
++        // DOVIWithELHDR10Plus source keeps today's behavior (strip-to-HDR10 or full passthrough)
++        // regardless of the flag.
++        using var env = new EnvVarScope("JELLYMESH_DOVI_P7_TO_81", "1");
++        var state = CreateValidDoviWithElState(hdr10Plus: true);
++        state.BaseRequest.VideoRangeType = "DOVIWithHDR10";
++        var helper = CreateHelper(true);
++
++        Assert.Equal(VideoRangeType.DOVIWithELHDR10Plus, state.VideoStream.VideoRangeType);
++        Assert.False(helper.IsDoviP7ToP81Converted(state));
++        Assert.Equal(string.Empty, helper.GetDoviP7ToP81MarkerArgs(state));
++
++        // Unconverted DOVIWithELHDR10Plus + a request lacking "DOVIWithEL" always strips today
++        // (EncodingHelper's pre-existing, untouched special case), regardless of DOVIWithHDR10.
++        Assert.True(helper.IsDoviRemoved(state));
++    }
++
++    /// <summary>
++    /// Builds a state whose VideoStream is a valid (non-Invalid) DOVIWithEL profile-7 source --
++    /// same recipe as <see cref="GetBitStreamArgs_ValidDovi_PreservesMetadata"/> (bt2020nc/bt2020/
++    /// smpte2084 so MediaStream.GetVideoColorRange does not fall into the DOVIInvalid branch).
++    /// </summary>
++    private static EncodingJobInfo CreateValidDoviWithElState(bool hdr10Plus, TranscodingJobType jobType = TranscodingJobType.Hls)
++    {
++        var state = CreateState("hevc", "smpte2084", jobType);
++        state.VideoStream.ColorSpace = "bt2020nc";
++        state.VideoStream.ColorPrimaries = "bt2020";
++        if (hdr10Plus)
++        {
++            state.VideoStream.Hdr10PlusPresentFlag = true;
++        }
++
++        return state;
++    }
++
++    private static EncodingJobInfo CreateState(string codec, string? transfer, TranscodingJobType jobType = TranscodingJobType.Hls)
+     {
+         var stream = new MediaStream
+         {
+@@ -133,7 +267,7 @@ public class EncodingHelperDoviTests
+             ColorTransfer = transfer
+         };
+ 
+-        return new EncodingJobInfo(TranscodingJobType.Hls)
++        return new EncodingJobInfo(jobType)
+         {
+             VideoStream = stream,
+             MediaSource = new MediaSourceInfo { Container = "mkv", MediaStreams = [stream] },
+@@ -159,4 +293,23 @@ public class EncodingHelperDoviTests
+             Mock.Of<IConfigurationManager>(),
+             Mock.Of<IPathManager>());
+     }
++
++    /// <summary>
++    /// Sets an environment variable for the scope's lifetime and restores the prior value on
++    /// dispose, so JELLYMESH_DOVI_P7_TO_81 tests do not leak state to other tests.
++    /// </summary>
++    private sealed class EnvVarScope : IDisposable
++    {
++        private readonly string _name;
++        private readonly string? _original;
++
++        public EnvVarScope(string name, string? value)
++        {
++            _name = name;
++            _original = Environment.GetEnvironmentVariable(name);
++            Environment.SetEnvironmentVariable(name, value);
++        }
++
++        public void Dispose() => Environment.SetEnvironmentVariable(_name, _original);
++    }
+ }
+diff --git a/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Tests.cs b/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Tests.cs
+new file mode 100644
+index 000000000..bfdff72e3
+--- /dev/null
++++ b/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Tests.cs
+@@ -0,0 +1,287 @@
++using System;
++using System.Collections.Generic;
++using Jellyfin.Data.Enums;
++using MediaBrowser.Model.Dlna;
++using MediaBrowser.Model.Dto;
++using MediaBrowser.Model.Entities;
++using MediaBrowser.Model.MediaInfo;
++using MediaBrowser.Model.Session;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.Model.Tests.Dlna;
++
++/// <summary>
++/// JELLYMESH_DOVI_P7_TO_81: a Dolby Vision profile 7 (dual-layer EL) source, checked against a
++/// CodecProfile's VideoRangeType condition, must be treated as satisfying "DOVI" / "DOVIWithHDR10"
++/// (not just "DOVIWithEL") when the feature is enabled -- because EncodingHelper will actually
++/// deliver it as a converted profile 8.1 stream, not the untouched profile 7 one. This is
++/// observable through StreamBuilder.GetOptimalVideoStream only via which of two competing
++/// hevc-capable TranscodingProfiles wins the ranking in GetVideoTranscodeProfile (the profile
++/// with a matching CodecProfile condition ranks better than the fallback, unconstrained one) --
++/// see EncodingHelperDoviTests for the direct, ffmpeg-command-line-facing assertions. The
++/// substitution is decided per-condition, not once for the whole CodecProfile: a condition that
++/// already declares DOVIWithEL support in its own value list (second-review fix) keeps evaluating
++/// against the source's real, unconverted range type and must keep winning on that literal match
++/// alone, exactly like bh-base -- see GetOptimalVideoStream_ElDeclaringCodecProfile_Enabled_ConstrainedProfileStillWins.
++/// </summary>
++public class StreamBuilderDoviP7ToP81Tests
++{
++    [Fact]
++    public void GetOptimalVideoStream_DoviCapableProfile_Disabled_PrefersUnconstrainedFallback()
++    {
++        var streamInfo = BuildFor(doviCapable: true, enabled: false);
++
++        Assert.NotNull(streamInfo);
++        Assert.Equal(PlayMethod.Transcode, streamInfo.PlayMethod);
++
++        // bh-base: a profile-7 (DOVIWithEL) source fails the DOVI/DOVIWithHDR10 CodecProfile
++        // condition (it only satisfies literal "DOVIWithEL", which this device profile does not
++        // declare), so the constrained "mp4" TranscodingProfile ranks WORSE than the
++        // unconstrained "ts" fallback (rank.Video==2 vs 1: this is "ts" strictly outranking it,
++        // not an array-order tie-break like the "Enabled" case below).
++        Assert.Equal("ts", streamInfo.Container, StringComparer.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void GetOptimalVideoStream_DoviCapableProfile_Enabled_PrefersDoviConstrainedProfile()
++    {
++        var streamInfo = BuildFor(doviCapable: true, enabled: true);
++
++        Assert.NotNull(streamInfo);
++        Assert.Equal(PlayMethod.Transcode, streamInfo.PlayMethod);
++
++        // JELLYMESH_DOVI_P7_TO_81=1: the profile-7 source now satisfies the DOVI/DOVIWithHDR10
++        // condition too, so the "mp4" TranscodingProfile ties the fallback's video rank and wins
++        // on array order -- proving the P7 source passed this DOVI-capable profile's range
++        // condition instead of falling through to the unconstrained fallback.
++        Assert.Equal("mp4", streamInfo.Container, StringComparer.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void GetOptimalVideoStream_Hdr10OnlyProfile_Enabled_StillPrefersUnconstrainedFallback()
++    {
++        // A device that only ever declares HDR10 (never DOVI/DOVIWithHDR10) must not be affected
++        // by this feature at all: the substitution only ever maps DOVIWithEL to DOVIWithHDR10, so
++        // a condition that never lists either still fails, exactly as it does with the feature off.
++        var streamInfo = BuildFor(doviCapable: false, enabled: true);
++
++        Assert.NotNull(streamInfo);
++        Assert.Equal("ts", streamInfo.Container, StringComparer.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void GetOptimalVideoStream_DoviCapableProfile_Enabled_DoviWithElHdr10Plus_NotSubstituted()
++    {
++        // EncodingHelper never converts DOVIWithELHDR10Plus (scoped out -- see
++        // ShouldRemoveDynamicHdrMetadata's ConvertDoviP7ToP81 comment), so StreamBuilder must not
++        // substitute it either: ranking the constrained "mp4" profile as video-copy-eligible here
++        // would pick a different TranscodingProfile/container than bh-base for a source that
++        // EncodingHelper still strips to HDR10 server-side regardless. Fallback must keep winning.
++        var streamInfo = BuildFor(doviCapable: true, enabled: true, hdr10Plus: true);
++
++        Assert.NotNull(streamInfo);
++        Assert.Equal("ts", streamInfo.Container, StringComparer.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void GetOptimalVideoStream_DoviCapableProfile_Enabled_HttpProtocolCandidateNeverWins()
++    {
++        // Regression for the Protocol-blind substitution bug: an http/Progressive-protocol
++        // TranscodingProfile ("avi") constrained by the SAME DOVI/DOVIWithHDR10 CodecProfile
++        // condition as the hls "mp4" one must never win this ranking on the strength of the
++        // substitution -- EncodingHelper's real P7->8.1 conversion is gated on
++        // TranscodingJobType.Hls and the pool marker is wired only into DynamicHlsController, so
++        // an http-protocol pick here would route this client to Progressive delivery
++        // (VideosController/GetProgressiveVideoArguments) of a source EncodingHelper still
++        // strips/copies raw there, silently reintroducing the Progressive-exclusion gap.
++        // "avi" is listed FIRST in TranscodingProfiles (see BuildFor) so that, without the
++        // Protocol gate, it would tie "mp4" at rank.Video==1/rank.Audio==1 and win outright via
++        // stable-sort array order -- this proves the exclusion, not a coincidence of ordering.
++        var streamInfo = BuildFor(doviCapable: true, enabled: true, includeHttpProtocolCandidate: true);
++
++        Assert.NotNull(streamInfo);
++        Assert.Equal(PlayMethod.Transcode, streamInfo.PlayMethod);
++        Assert.NotEqual("avi", streamInfo.Container, StringComparer.OrdinalIgnoreCase);
++        Assert.NotEqual(MediaStreamProtocol.http, streamInfo.SubProtocol);
++
++        // The hls "mp4" profile is still the correct pick, exactly as in
++        // GetOptimalVideoStream_DoviCapableProfile_Enabled_PrefersDoviConstrainedProfile above.
++        Assert.Equal("mp4", streamInfo.Container, StringComparer.OrdinalIgnoreCase);
++        Assert.Equal(MediaStreamProtocol.hls, streamInfo.SubProtocol);
++    }
++
++    [Fact]
++    public void GetOptimalVideoStream_ElDeclaringCodecProfile_Enabled_ConstrainedProfileStillWins()
++    {
++        // Second-review regression: a CodecProfile condition whose OWN VideoRangeType value list
++        // already names "DOVIWithEL" literally (e.g. a hand-written Kodi/DLNA-style profile, as
++        // opposed to jellyfin-web which always bundles DOVIWithEL alongside DOVI/DOVIWithHDR10 in
++        // one list) must keep passing on that literal match even with the flag on. Substituting
++        // DOVIWithEL -> DOVIWithHDR10 before checking THIS condition would turn an
++        // already-satisfied condition into a failing one, because the substituted value is not in
++        // this profile's list -- that is the bug the second review found (StreamBuilder's
++        // substitution was applied per-array, not per-condition, so it never checked whether the
++        // very condition being evaluated already covered DOVIWithEL). Mirrors EncodingHelper's own
++        // "!requestHasDOVIwithEL" gate: a client that already declares DOVIWithEL support gets
++        // untouched passthrough server-side, unaffected by the flag, so the client-decision side
++        // must keep picking the same profile bh-base does.
++        var flagOff = BuildFor(doviCapable: true, enabled: false, conditionRangeTypeValues: "SDR|HDR10|HLG|DOVIWithEL");
++        var flagOn = BuildFor(doviCapable: true, enabled: true, conditionRangeTypeValues: "SDR|HDR10|HLG|DOVIWithEL");
++
++        Assert.NotNull(flagOff);
++        Assert.NotNull(flagOn);
++        Assert.Equal(PlayMethod.Transcode, flagOff.PlayMethod);
++        Assert.Equal(PlayMethod.Transcode, flagOn.PlayMethod);
++
++        // Same winner with the flag on as with it off: the source's real, unconverted DOVIWithEL
++        // range type satisfies this condition on its own literal merits (not via the
++        // substitution), ties the "ts" fallback's rank, and wins on array order -- exactly like
++        // Enabled_PrefersDoviConstrainedProfile above, just via the real value instead of the
++        // substituted one.
++        Assert.Equal("mp4", flagOff.Container, StringComparer.OrdinalIgnoreCase);
++        Assert.Equal("mp4", flagOn.Container, StringComparer.OrdinalIgnoreCase);
++        Assert.Equal(MediaStreamProtocol.hls, flagOn.SubProtocol);
++    }
++
++    private static StreamInfo? BuildFor(bool doviCapable, bool enabled, bool hdr10Plus = false, bool includeHttpProtocolCandidate = false, string? conditionRangeTypeValues = null)
++    {
++        Environment.SetEnvironmentVariable("JELLYMESH_DOVI_P7_TO_81", enabled ? "1" : null);
++        try
++        {
++            var videoStream = new MediaStream
++            {
++                Type = MediaStreamType.Video,
++                Index = 0,
++                Codec = "hevc",
++                Width = 1920,
++                Height = 1080,
++                BitDepth = 10,
++                DvProfile = 7,
++                DvBlSignalCompatibilityId = 6,
++                RpuPresentFlag = 1,
++                BlPresentFlag = 1,
++                ColorSpace = "bt2020nc",
++                ColorPrimaries = "bt2020",
++                ColorTransfer = "smpte2084",
++                Hdr10PlusPresentFlag = hdr10Plus ? true : null
++            };
++            Assert.Equal(hdr10Plus ? VideoRangeType.DOVIWithELHDR10Plus : VideoRangeType.DOVIWithEL, videoStream.VideoRangeType);
++
++            var mediaSource = new MediaSourceInfo
++            {
++                Id = "test-source",
++                Path = "/media/test.mkv",
++                Protocol = MediaProtocol.File,
++                Container = "mkv",
++                SupportsDirectPlay = false,
++                SupportsDirectStream = true,
++                SupportsTranscoding = true,
++                MediaStreams =
++                [
++                    videoStream,
++                    new MediaStream { Type = MediaStreamType.Audio, Index = 1, Codec = "aac", Channels = 2 }
++                ]
++            };
++
++            var rangeTypeValues = conditionRangeTypeValues ?? (doviCapable ? "SDR|HDR10|HLG|DOVI|DOVIWithHDR10" : "SDR|HDR10|HLG");
++
++            var codecProfiles = new List<CodecProfile>
++            {
++                new()
++                {
++                    Type = CodecType.Video,
++                    Codec = "hevc",
++                    Container = "mp4",
++                    Conditions = [new ProfileCondition(ProfileConditionType.EqualsAny, ProfileConditionValue.VideoRangeType, rangeTypeValues, false)]
++                }
++            };
++
++            var transcodingProfiles = new List<TranscodingProfile>();
++            if (includeHttpProtocolCandidate)
++            {
++                // An http/Progressive-protocol twin of the "mp4" profile below, gated by its OWN
++                // CodecProfile entry (container "avi") carrying the identical DOVI/DOVIWithHDR10
++                // condition -- CodecProfile.ContainsAnyCodec matches on container, so "avi" needs
++                // its own entry to be "constrained" at all; it does not inherit "mp4"'s. Added
++                // FIRST so a pre-fix (Protocol-blind) tie against "mp4" would be won by THIS one
++                // via stable-sort array order -- see
++                // GetOptimalVideoStream_DoviCapableProfile_Enabled_HttpProtocolCandidateNeverWins.
++                codecProfiles.Add(new CodecProfile
++                {
++                    Type = CodecType.Video,
++                    Codec = "hevc",
++                    Container = "avi",
++                    Conditions = [new ProfileCondition(ProfileConditionType.EqualsAny, ProfileConditionValue.VideoRangeType, rangeTypeValues, false)]
++                });
++                transcodingProfiles.Add(new TranscodingProfile
++                {
++                    Type = DlnaProfileType.Video,
++                    Context = EncodingContext.Streaming,
++                    Protocol = MediaStreamProtocol.http,
++                    Container = "avi",
++                    VideoCodec = "hevc",
++                    AudioCodec = "aac"
++                });
++            }
++
++            // Constrained: only ranks video-copy-eligible (rank.Video==1) when videoStream
++            // satisfies the CodecProfile above.
++            transcodingProfiles.Add(new TranscodingProfile
++            {
++                Type = DlnaProfileType.Video,
++                Context = EncodingContext.Streaming,
++                Protocol = MediaStreamProtocol.hls,
++                Container = "mp4",
++                VideoCodec = "hevc",
++                AudioCodec = "aac"
++            });
++
++            // Unconstrained fallback for the same codec: no CodecProfile targets "ts", so
++            // GetCompatibilityVideoCodec always returns 0 failures here (rank.Video==1
++            // unconditionally) -- this is what the "mp4" profile above must tie (and beat on array
++            // order) once the DOVIWithEL source is treated as DOVI-capable.
++            transcodingProfiles.Add(new TranscodingProfile
++            {
++                Type = DlnaProfileType.Video,
++                Context = EncodingContext.Streaming,
++                Protocol = MediaStreamProtocol.hls,
++                Container = "ts",
++                VideoCodec = "hevc",
++                AudioCodec = "aac"
++            });
++
++            var profile = new DeviceProfile
++            {
++                Name = "DoviP7ToP81 test client",
++                // No DirectPlayProfiles: forces GetVideoDirectPlayProfile to fail so BuildVideoItem
++                // falls through to GetVideoTranscodeProfile, the path this feature touches.
++                DirectPlayProfiles = [],
++                CodecProfiles = codecProfiles.ToArray(),
++                TranscodingProfiles = transcodingProfiles.ToArray()
++            };
++
++            var options = new MediaOptions
++            {
++                ItemId = new Guid("2B1C9C2E-6B90-4B7B-9C2E-8F6B90B4B7B9"),
++                MediaSourceId = mediaSource.Id,
++                MediaSources = [mediaSource],
++                DeviceId = "test-deviceId",
++                Profile = profile,
++                AllowAudioStreamCopy = true,
++                AllowVideoStreamCopy = true,
++                EnableDirectStream = false
++            };
++
++            var transcodeSupport = new Mock<ITranscoderSupport>();
++
++            return new StreamBuilder(transcodeSupport.Object, new NullLogger<StreamBuilderDoviP7ToP81Tests>())
++                .GetOptimalVideoStream(options);
++        }
++        finally
++        {
++            Environment.SetEnvironmentVariable("JELLYMESH_DOVI_P7_TO_81", null);
++        }
++    }
++}
