@@ -281,7 +281,8 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
       invariant every other fallback in this codebase relies on
 
 ### P5 Quality
-- [~] On-the-fly Dolby Vision 7 -> 8.1 (Brian 2026-09-27, re-scoped 2026-09-27 after lab measurement):
+- [~] On-the-fly Dolby Vision 7 -> 8.1 (Brian 2026-09-27; re-scoped after lab measurement; agent path
+      wired 2026-09-27 on branch `dv81-wire`):
       124 of 329 movies are DV profile 7 (dual-layer BD remuxes); TVs/streamers decode only
       single-layer DV (8.1/5), so Jellyfin strips them to HDR10 or transcodes. Offline conversion with
       dovi_tool is proven (two titles converted and verified 2026-09-27) but costs a second copy of
@@ -289,92 +290,94 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
       that supports DOVIWithHDR10) — owned by the jellyfin bug-hunt session, brief item 5; (b) the
       pool's execution (agent/IR) — this entry.
 
-      **Signal contract (shipped, `crates/ir/src/lib.rs` `wants_dv81`/`DV81_SIGNAL_FLAG`/
-      `DV81_SIGNAL_VALUE`):** Jellyfin's decision patch appends `-metadata:s:v:0 TC_DV81=1` once, on
-      the output video stream, only when it selects a DV7->8.1 remux. Chosen because it's a real,
-      harmless ffmpeg option: any fallback that execs ffmpeg with this argv unmodified (an older
-      agent's shape, or the shim's own `exec_real` when the pool is unreachable) still runs correctly,
-      it just tags the output with one inert extra metadata key. `validate()` needed no widening —
-      it was already opaque to this option/value pair (regression test:
-      `validate::tests::dv81_signal_is_already_opaque_to_the_allowlist`). Detection is wired
-      (`wants_dv81`, tested); **`render()` does not act on it yet** — see below for why, and note
-      this means the pool is a no-op for a signaled job today, same as for any other job, which is
-      the deliberately safe starting state, not a bug.
+      **Signal contract (`crates/ir/src/lib.rs` `wants_dv81`/`strip_dv81_signal`):** Jellyfin's
+      decision patch appends `-metadata:s:v:0 TC_DV81=1` once, on the output video stream. A real,
+      harmless ffmpeg option, so any path that execs the argv unmodified (older agent, the shim's
+      `exec_real`) still runs, just with one inert metadata key. `validate()` is opaque to it
+      (`validate::tests::dv81_signal_is_already_opaque_to_the_allowlist`). The agent strips it from
+      whatever argv it runs.
 
-      **Gate design (shipped, `crates/agent/src/probe.rs` `source_dovi_profile`):** the signal alone
-      is never enough to convert — it says what Jellyfin *wants*, not what the source *is*. The
-      agent-side gate (once wired into `job.rs`) must require BOTH `wants_dv81(&job.args)` AND
-      `probe::source_dovi_profile(...) == Some(7)` (an ffprobe side-data check against the real
-      file). A signal on a DV5/DV8/non-DV source (stale client state, a mismatched library scan, a
-      probe timeout) must fall through to the normal render path unchanged — `source_dovi_profile`
-      fails closed (`None`) on any timeout/parse error precisely so the caller's default is "don't
-      convert", never "convert anyway."
+      **Agent path (`crates/agent/src/job.rs` `run_dv81`, shipped on `dv81-wire`):** for a PLAYBACK job
+      carrying the marker:
+        1. Gate: video stream copy (`is_video_copy`) AND `probe::source_dovi` says DV profile 7
+           (ffprobe `stream_side_data`, fails closed) AND `dv81_plan::plan` accepts the argv shape
+           (exactly one `-i`, `-copyts` present — Jellyfin's remux shape; no `-itsoffset`/`-sseof`/
+           output `-ss`). Otherwise: plain remux, `fallback_not_p7` / `fallback_error`.
+        2. ffmpeg#1 (`dv81_plan`): Jellyfin's input options (same `-ss`/`-noaccurate_seek`/probe
+           limits) + `-map 0:v:0 -c:v copy -copyts -output_ts_offset 10 -muxdelay 0 -muxpreload 0
+           -f mpegts pipe:1`. TS, not raw `-f hevc`: it carries PTS/DTS, so B-frame order and the
+           source timestamps survive; a raw pipe makes ffmpeg#2 invent timestamps at a fixed rate.
+        3. The agent reads ffmpeg#1's TS (`dv81_ts::TsRewriter`): PES by PES, `dv81::convert_access_unit`
+           rewrites each RPU (NAL 62) with `ConversionMode::To81` and drops EL NALs (type 63
+           UNSPEC63 — the BD single-track EL encapsulation — and any `nuh_layer_id != 0`); the PMT
+           gets exactly one DOVI video stream descriptor (0xB0) saying profile 8 / BL compat 1 / no
+           EL, replacing any ffmpeg#1 wrote. **Decision on the first bytes:** if no RPU has been
+           seen within 32 MB (or 20 s, or ffmpeg#1's whole output) the source's RPU is out-of-band
+           (`hvcE`, below): kill ffmpeg#1, plain remux, `fallback_no_rpu`. Nothing has been written
+           to Jellyfin's output at that point.
+        4. ffmpeg#2: input 0 = the rewritten TS on **fd 3** (`pipe:3`, dup2 in `pre_exec`) — not
+           stdin, which stays Jellyfin's `p`/`u`/`q` key channel, so throttling and quit work
+           unchanged; input 1 = the source with Jellyfin's input options (audio/subs); Jellyfin's
+           output options with the `-map`s re-pointed, DV-strip bsfs removed, `-strict unofficial`
+           (the mp4 muxer only writes `dvcC`/`dvvC` at that level) and Jellyfin's `-tag:v` (hvc1 if
+           none; hvc1 and dvh1 both MEASURED to carry the record).
+        5. Timestamps: `-start_at_zero` subtracts each input's *own* start time, which differs
+           between the TS (seek point) and the MKV (~0). So ffmpeg#2 always runs `-copyts` without
+           `-start_at_zero` and applies the plain remux's shift explicitly as `-itsoffset` on both
+           inputs (−10 s more on the TS). And `-discard:v:0 none` on input 1: MEASURED, with the
+           source's video unused ffmpeg's matroska seek lands elsewhere (`-ss 1.5`: audio started at
+           1.003 s instead of the plain remux's 0.811 s).
+        6. Failure after ffmpeg#2 started: a conversion error mid-stream kills ffmpeg#2 (nonzero
+           exit, never a clean-looking truncated playlist); a nonzero exit before the first segment
+           re-runs the plain remux (`fallback_error`), mirroring the GPU-filter fallback.
+      Metric: `tcpool_dv81_total{outcome=converted|fallback_no_rpu|fallback_not_p7|fallback_error}`,
+      one per signaled job (`fallback_not_p7` added beyond the original three labels so a Jellyfin
+      signal on a non-DV7 source is visible separately from an agent error).
 
-      **RPU rewrite core (shipped, `crates/agent/src/dv81.rs` `convert_annexb_to_dv81`, unit-tested):**
-      Annex-B NAL splitting, enhancement-layer NAL removal (`nuh_layer_id != 0`, RPU NAL excepted),
-      and RPU profile rewriting via the `dolby_vision` crate (`ConversionMode::To81` — dovi_tool's own
-      DV7->8.1 conversion: MEL sources keep their luma/chroma mapping, FEL sources have it removed,
-      i.e. exactly "MEL loses nothing visible; FEL loses the enhancement detail"). Fails closed (no
-      RPU found, or any RPU fails to convert -> `Err`, never a partial conversion).
+      **MEASURED 2026-09-27 on ffmpeg 8.1.3 (Fedora, this workstation) with a synthetic DV7 fixture**
+      (x265 10-bit + AAC, a synthetic profile-7 MEL RPU from the `dolby_vision` crate plus a fake
+      type-63 EL NAL in every AU, MKV with a profile-7 DOVI record; built in-test, no binary asset —
+      `job::dv81_it`):
+        - init segment: `DOVI configuration record: version: 1.0, profile: 8, level: 6, rpu flag: 1,
+          el flag: 0, bl flag: 1, compatibility id: 1`; no "Generating one" warning (no bsf involved);
+        - dovi_tool 2.3.4 (official x86_64 musl release, sha256 `1844258e…32b3f` = the GitHub asset
+          digest) `info --summary`: input `Frames: 96, Profile: 7 (MEL)` → output `Frames: 96,
+          Profile: 8`; 96/96 EL NALs dropped;
+        - A/V vs the plain remux of the same argv: no seek — video 0.021 / audio −0.021333 on both;
+          `-ss 1.5 -noaccurate_seek` — video 0.939011 vs 0.939063 (52 µs, the ms→90 kHz rounding),
+          audio 0.810 vs 0.810; same frame count (96 / 75);
+        - a DV7 source without in-band RPU → `fallback_no_rpu`, plain remux output; a non-DV
+          source → `fallback_not_p7`.
+      The same probe finding changed the gate: `-show_entries stream=index:side_data=dv_profile` (the
+      earlier `source_dovi_profile`) also selects packet/frame side data and read all 96 packets of a
+      4 s clip — on a 70 GB remux it would time out and fail closed on every job; `source_dovi` uses
+      `stream_side_data`.
 
-      **BLOCKED on a real problem, not a TODO — MEASURED 2026-09-27 in `tc-lab` against a real DV
-      profile-7 source** (`tc-worker-cpu`, jellyfin-ffmpeg 8.1.2, a Blu-ray-remux MKV, profile 7,
-      `dv_bl_signal_compatibility_id` 6 — the common "\[DV HDR10\]" release-group muxing, the same
-      shape as a large fraction of the 124 titles this item is about):
-        1. The naive fix (`-bsf:v dovi_rpu=compression=0 -strict unofficial -tag:v hvc1` on a plain
-           `-c:v copy` remux, as an earlier session's report proposed) does **not** convert the
-           profile: re-probed output still reports `profile: 7, el flag: 1`. The `dovi_rpu` bsf in
-           this ffmpeg build only exposes `-strip` (delete DV metadata entirely, producing HDR10, not
-           DV8.1) and `-compression` (metadata compression level) — no profile-conversion option.
-           Actual profile rewriting needs the `dolby_vision` crate's `convert_with_mode` (now wired,
-           see above), not a bsf flag.
-        2. More fundamentally: `ffmpeg -i <file> -map 0:v:0 -c:v copy -bsf:v trace_headers -t 3 -f
-           null -` on this file traces 301 real NALs over 3 seconds and finds **zero** with
-           `nal_unit_type == 62` (RPU) and **zero** with `nuh_layer_id != 0` (enhancement layer).
-           `ffprobe` still reports `rpu_present_flag: 1, el_present_flag: 1` (a static per-track
-           descriptor from CodecPrivate), but the per-frame RPU/EL bitstream itself is not reachable
-           through a plain `-map`/stream-copy/bsf pipeline. ffmpeg logs why on open: `Invalid Block
-           Addition value 0x0 for unknown Block Addition Mapping type 68766345` — this MKV carries the
-           profile-7 enhancement layer + RPU as a Matroska Block Addition whose mapping type this
-           demuxer does not parse. Reproduced identically on a 20 MB and a 300 MB prefix of the same
-           file (not a truncation artifact).
+      **Two source muxings, one of them not handled yet — MEASURED 2026-09-27 by earlier sessions
+      (jellyfin-ffmpeg 8.1.2; not re-measured on `dv81-wire`):** (a) some DV7 MKVs (e.g. our offline-converted Romulus and
+      Spider-Verse sources) carry RPU in-band: `-c copy -bsf:v hevc_mp4toannexb -f hevc` output has
+      NAL 62s and dovi_tool extract-rpu/convert worked on it — the agent path above converts these.
+      (b) others carry EL+RPU in a Matroska Block Addition, mapping type `hvcE` (ffmpeg: `Invalid Block
+      Addition value 0x0 for unknown Block Addition Mapping type 68766345`); a stream copy of those has
+      zero NAL 62s (301 NALs traced over 3 s), and ffprobe still shows the static profile-7 record.
+      The agent detects (b) on the first bytes and runs the plain remux. Never trust a
+      `dovi_rpu`-bsf recipe on (b): on a stream with no config record it prints `No Dolby Vision
+      configuration record found? Generating one, but results may be invalid` and fabricates one.
 
-           **A second-hop pipeline (proc1: `-bsf:v hevc_mp4toannexb -f hevc` to a raw elementary
-           stream; proc2: `-f hevc` input, `-bsf:v dovi_rpu=compression=0 -strict unofficial`) looks
-           like it fixes this — it reports `profile: 8, el flag: 0` — but it's a false positive, not a
-           real conversion. Re-tested 2026-09-27 (this superseded a task-tracker entry from an earlier
-           session that had taken the same recipe's output at face value): proc2 prints `[dovi_rpu] No
-           Dolby Vision configuration record found? Generating one, but results may be invalid` — the
-           bsf fabricates a synthetic placeholder DV8 record when the input has no real DV metadata,
-           which is exactly proc1's output here (its Annex-B stream has the same 0-RPU-NALs property
-           as (2) above; a raw elementary stream also drops the container-level side data that the
-           direct-copy case in (1) still had, so proc2 has nothing real to work from at all). The
-           "RPU bytes differ from source" a naive check would see is the fabricated record differing
-           from nothing, not a genuine rewrite. Anyone re-deriving this must check ffmpeg's stderr for
-           that exact warning line, not just the resulting profile number.
-
-           **Both approaches ruled out, same root cause.** A pure-ffmpeg pipeline — one process or two
-           — never sees this file's real per-frame RPU (above). `convert_annexb_to_dv81` (above) is
-           still correct and useful for any Annex-B stream that already carries its RPU in-band as NAL
-           62 (true of some encoders/muxings); the missing piece is getting real RPU bytes out of a
-           Block-Addition-muxed MKV in the first place. Candidates for the next session, untried: (a) a
-           newer/different ffmpeg build that understands this Block Addition Mapping Type; (b) a
-           Matroska Block-Addition-aware reader in Rust (the `matroska` crate or similar) to pull RPU
-           bytes out band-by-band, independent of what ffmpeg exposes for the video stream; (c)
-           shelling to `mkvextract`/`dovi_tool` as a helper binary (adds an image dependency,
-           `deploy/Containerfile.agent`). Do **not** wire `job.rs` to call `convert_annexb_to_dv81`,
-           and don't trust a "profile changed" result from any ffmpeg-bsf recipe without checking for
-           this warning, until one of the candidates above is proven end-to-end against a real
-           profile-7 source in `tc-lab` with the built agent binary — an untested change to the
-           agent's single-process exec invariant is not something to ship blind to a pool that runs
-           prod live.
-        4. Also unconfirmed (INHERITED, not measured this session): whether a real in-band RPU NAL
-           (once one is obtainable) carries `nuh_layer_id == 0` or `1`. `convert_annexb_to_dv81`
-           currently converts the RPU NAL regardless of its layer id (so either case is handled), but
-           this hasn't been exercised against real in-band bytes — verify once (2)/(3) have a fix.
+      **Open:**
+        - Lab proof against a real in-band DV7 title with the built agent (or `examples/dv81_filter`
+          between the two ffmpegs) on jellyfin-ffmpeg 8.1.2 — blocked this session (cluster exec
+          denied by the session's permission classifier); the synthetic proof above is ffmpeg 8.1.3.
+          Also unverified on real bytes: EL as type 63 (INHERITED from dovi_tool's demux) and the
+          RPU's layer id (either is handled).
+        - Library census: how many of the 124 DV7 titles are (a) in-band vs (b) `hvcE` — decides
+          whether (b) is worth a reader.
+        - (b) reader: a Matroska Block-Addition-aware extractor (Rust, in the agent) that yields the
+          RPU per frame so the same rewrite applies.
+        - Jellyfin decision patch adopting the marker (bug-hunt session, brief item 5).
 
       Done when the Bravia shows the Dolby Vision badge on a DV7 title with Direct Stream (remux) and
-      no extra disk use — still the target; the blocker above is what stands between here and there.
+      no extra disk use.
 - [x] Baseline measured (P0, calibration/README.md): Arc delivers 16-22% of the cap, VMAF 87.1/87.5 @8M
       (h264/hevc); P4 94.8/93.2; Arc-vs-P4 gap 5.4-7.8 (a failover is visible). Calibrated settings
       measured Arc 93.5/97.6, P4 93.5/96.9, gap +0.04/+0.72

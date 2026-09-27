@@ -582,16 +582,31 @@ pub const DV81_SIGNAL_VALUE: &str = "TC_DV81=1";
 /// `true` when the Jellyfin-side decision patch asked for an on-the-fly DV7 -> 8.1 remux (see
 /// `DV81_SIGNAL_FLAG`).
 ///
-/// Detection only: `render()` does not act on this today, so the pool is a no-op for a signaled
-/// job exactly like any other job (P5 is not wired into the agent's exec path yet -- see
-/// `transcode/docs/PLAN.md` P5 for the measured blocker and what's needed before it can be). An
-/// agent that does wire it must still confirm the *source* really is DV profile 7 (an ffprobe
-/// check -- `probe::source_dovi_profile` -- not this signal alone) before doing anything
-/// different: the signal only says what Jellyfin *wants*, never what the source *is*, so a signal
-/// on a DV5/DV8/non-DV source must fall through unchanged rather than mislabel it.
+/// `render()` passes the signal through untouched; the agent (`job.rs`) acts on it, and must
+/// still confirm the *source* really is DV profile 7 (an ffprobe check -- `probe::source_dovi` --
+/// not this signal alone) before doing anything different: the signal only says what Jellyfin
+/// *wants*, never what the source *is*, so a signal on a DV5/DV8/non-DV source falls through to
+/// the plain remux rather than mislabel it.
 pub fn wants_dv81(args: &[String]) -> bool {
     args.windows(2)
         .any(|w| w[0] == DV81_SIGNAL_FLAG && w[1] == DV81_SIGNAL_VALUE)
+}
+
+/// `args` with every `DV81_SIGNAL_FLAG DV81_SIGNAL_VALUE` pair removed (other `-metadata:s:v:0`
+/// values are kept). The agent runs this argv whenever it does not convert, so the fallback is
+/// exactly Jellyfin's plain remux.
+pub fn strip_dv81_signal(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == DV81_SIGNAL_FLAG && args.get(i + 1).is_some_and(|v| v == DV81_SIGNAL_VALUE) {
+            i += 2;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -894,10 +909,38 @@ mod tests {
     }
 
     #[test]
-    fn render_does_not_yet_touch_the_dv81_signal() {
-        // P5 is detection-only so far (see `wants_dv81`'s docs): render() must pass the signal
-        // through byte-for-byte, same as any other unrecognised metadata option, until the agent
-        // side actually wires the conversion.
+    fn strip_dv81_signal_removes_only_the_exact_pair() {
+        let a = s(&[
+            "-i",
+            "x",
+            "-metadata:s:v:0",
+            "TC_DV81=1",
+            "-metadata:s:v:0",
+            "title=keep",
+            "-y",
+            "/t/a.m3u8",
+        ]);
+        let stripped = strip_dv81_signal(&a);
+        assert!(!wants_dv81(&stripped));
+        assert_eq!(
+            stripped,
+            s(&[
+                "-i",
+                "x",
+                "-metadata:s:v:0",
+                "title=keep",
+                "-y",
+                "/t/a.m3u8"
+            ])
+        );
+        let untouched = s(&["-i", "x", "-y", "/t/a.m3u8"]);
+        assert_eq!(strip_dv81_signal(&untouched), untouched);
+    }
+
+    #[test]
+    fn render_does_not_touch_the_dv81_signal() {
+        // render() passes the signal through byte-for-byte like any other metadata option; the
+        // agent decides (and strips it) in job.rs.
         let a = s(&[
             "-i",
             "x",

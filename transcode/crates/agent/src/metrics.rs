@@ -136,16 +136,53 @@ impl Histogram {
 /// job.rs; only the value that changed is written here.
 pub struct Metrics {
     jobs_total: [AtomicU64; Outcome::ALL.len()],
+    dv81_total: [AtomicU64; Dv81Outcome::ALL.len()],
     job_seconds: Histogram,
     /// job id -> last observed `speed=` factor, while the job is running and not paused.
     job_speed: Mutex<HashMap<u64, f64>>,
     next_job_id: AtomicU64,
 }
 
+/// How a job that carried the P5 DV7 -> 8.1 signal ended up (`tcpool_dv81_total`). Exactly one
+/// per signaled PLAYBACK job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dv81Outcome {
+    /// Output came from the converting pipeline.
+    Converted,
+    /// The source is DV7 but ffmpeg#1's first bytes carried no in-band RPU (e.g. the `hvcE`
+    /// Block Addition muxing); ran the plain remux.
+    FallbackNoRpu,
+    /// The source is not DV profile 7 (or ffprobe could not say): Jellyfin's signal did not
+    /// match the file; ran the plain remux.
+    FallbackNotP7,
+    /// Anything else before the first output (unsupported argv, spawn/convert error, ffmpeg#2
+    /// failing early); ran the plain remux.
+    FallbackError,
+}
+
+impl Dv81Outcome {
+    pub const ALL: [Dv81Outcome; 4] = [
+        Dv81Outcome::Converted,
+        Dv81Outcome::FallbackNoRpu,
+        Dv81Outcome::FallbackNotP7,
+        Dv81Outcome::FallbackError,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dv81Outcome::Converted => "converted",
+            Dv81Outcome::FallbackNoRpu => "fallback_no_rpu",
+            Dv81Outcome::FallbackNotP7 => "fallback_not_p7",
+            Dv81Outcome::FallbackError => "fallback_error",
+        }
+    }
+}
+
 impl Default for Metrics {
     fn default() -> Self {
         Metrics {
             jobs_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            dv81_total: std::array::from_fn(|_| AtomicU64::new(0)),
             job_seconds: Histogram::new(&DURATION_BUCKETS),
             job_speed: Mutex::new(HashMap::new()),
             next_job_id: AtomicU64::new(1),
@@ -156,6 +193,10 @@ impl Default for Metrics {
 impl Metrics {
     pub fn inc(&self, outcome: Outcome) {
         self.jobs_total[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_dv81(&self, outcome: Dv81Outcome) {
+        self.dv81_total[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn new_job_id(&self) -> u64 {
@@ -274,6 +315,16 @@ pub fn render(state: &State) -> String {
         let _ = writeln!(
             out,
             "tcpool_jobs_total{{{labels},outcome=\"{}\"}} {n}",
+            outcome.as_str()
+        );
+    }
+
+    let _ = writeln!(out, "# TYPE tcpool_dv81_total counter");
+    for outcome in Dv81Outcome::ALL {
+        let n = state.metrics.dv81_total[outcome as usize].load(Ordering::Relaxed);
+        let _ = writeln!(
+            out,
+            "tcpool_dv81_total{{{labels},outcome=\"{}\"}} {n}",
             outcome.as_str()
         );
     }

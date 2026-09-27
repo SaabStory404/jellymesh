@@ -1365,6 +1365,7 @@ version = "0.1.0"
 dependencies = [
  "dolby_vision",
  "futures",
+ "libc",
  "proptest",
  "serde_json",
  "tcpool-ir",

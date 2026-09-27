@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tcpool_ir::{
-    first_segment, input_path, is_video_copy, map_path, render, render_trickplay, Shape,
-    TranslateOpts,
+    first_segment, input_path, is_video_copy, map_path, render, render_trickplay,
+    strip_dv81_signal, wants_dv81, Shape, TranslateOpts,
 };
 use tcpool_proto::{
     client_msg, server_msg, Accepted, Busy, ClientMsg, Exit, Heartbeat, Job, ServerMsg,
@@ -467,19 +467,40 @@ pub async fn run_job(
         if let Some((size, dur)) = cfg.probe_clamp {
             tcpool_ir::clamp_probe(&mut r.args, size, dur);
         }
+        // P5: the DV7->8.1 marker is Jellyfin's request to this agent, never an ffmpeg option
+        // worth keeping; whatever runs below (plain remux, fallback, GPU/CPU re-run) runs
+        // without it.
+        if wants_dv81(&r.args) {
+            r.args = strip_dv81_signal(&r.args);
+        }
         r
     };
     let mut rendered = render_fn(&opts);
-    let mut code = run_ffmpeg(
-        cfg,
-        &rendered.args,
-        &cwd,
-        &tx,
-        &ctl,
-        kill_rx.clone(),
-        stdin_rx.clone(),
-    )
-    .await;
+    let mut code = if !batch && wants_dv81(&job.args) {
+        run_dv81(
+            cfg,
+            &state,
+            &rendered.args,
+            &cwd,
+            &tx,
+            &ctl,
+            kill_rx.clone(),
+            stdin_rx.clone(),
+        )
+        .await
+    } else {
+        run_ffmpeg(
+            cfg,
+            &rendered.args,
+            &cwd,
+            &tx,
+            &ctl,
+            kill_rx.clone(),
+            stdin_rx.clone(),
+            None,
+        )
+        .await
+    };
     if code != 0
         && rendered.gpu_filters
         && !ctl.fenced.load(Ordering::SeqCst)
@@ -499,7 +520,17 @@ pub async fn run_job(
             gpu_filters: false,
             ..opts.clone()
         });
-        code = run_ffmpeg(cfg, &rendered.args, &cwd, &tx, &ctl, kill_rx, stdin_rx).await;
+        code = run_ffmpeg(
+            cfg,
+            &rendered.args,
+            &cwd,
+            &tx,
+            &ctl,
+            kill_rx,
+            stdin_rx,
+            None,
+        )
+        .await;
     }
     ctl.done.store(true, Ordering::SeqCst);
     let fenced = ctl.fenced.load(Ordering::SeqCst);
@@ -563,7 +594,320 @@ async fn pump(mut from: impl tokio::io::AsyncRead + Unpin, tx: Tx, ctl: Arc<Ctl>
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// P5: DV profile 7 -> 8.1 remux (transcode/docs/PLAN.md). ffmpeg#1 demuxes the video to MPEG-TS,
+// this process rewrites it (dv81_ts + dv81), ffmpeg#2 muxes Jellyfin's HLS from it plus the
+// source's other streams. ffmpeg#2 reads the video on fd 3 (`pipe:3`), NOT stdin: stdin stays
+// Jellyfin's key channel (p/u/q throttling), exactly as on the plain path.
+// ---------------------------------------------------------------------------------------------
+
+/// The fd ffmpeg#2 reads the rewritten TS from.
+const DV81_FD: i32 = 3;
+/// How much of ffmpeg#1's TS output may pass without an in-band RPU before deciding the source's
+/// RPU is out-of-band (the `hvcE` Block Addition muxing) and running the plain remux. Every DV
+/// frame carries an RPU, so a real in-band source decides on its first frame; the limit only
+/// bounds how long a no-RPU source delays its first segment.
+const DV81_SCAN_BYTES: usize = 32 << 20;
+/// Upper bound on the decision itself (ffmpeg#1 start + the scan), same reasoning.
+const DV81_SCAN_TIMEOUT: Duration = Duration::from_secs(20);
+
+type Dv81Transform = fn(&[u8]) -> Result<crate::dv81_ts::TransformOut, String>;
+type Dv81Rewriter = crate::dv81_ts::TsRewriter<Dv81Transform>;
+
+fn dv81_transform(data: &[u8]) -> Result<crate::dv81_ts::TransformOut, String> {
+    let (out, st) = crate::dv81::convert_access_unit(data)?;
+    Ok((out, st.rpus, st.dropped_el))
+}
+
+/// ffmpeg#1, past the point where it has proven its output carries in-band RPUs.
+struct Dv81Feed {
+    demux: Child,
+    stdout: tokio::process::ChildStdout,
+    rewriter: Dv81Rewriter,
+    /// Rewritten bytes produced during the scan, not yet written to ffmpeg#2.
+    pending: Vec<u8>,
+    /// ffmpeg#1's output already ended during the scan (a short clip).
+    eof: bool,
+}
+
+enum Dv81Scan {
+    Ready(Box<Dv81Feed>),
+    Fallback(crate::metrics::Dv81Outcome, String),
+    Killed,
+}
+
+/// Why this signaled job cannot convert, before anything is spawned; `Ok` = go.
+async fn dv81_prepare(
+    cfg: &Config,
+    args: &[String],
+) -> Result<
+    (crate::dv81_plan::Plan, crate::dv81_ts::DoviDescriptor),
+    (crate::metrics::Dv81Outcome, String),
+> {
+    use crate::metrics::Dv81Outcome as O;
+    if !is_video_copy(args) {
+        return Err((O::FallbackError, "not a video stream copy".into()));
+    }
+    let input = input_path(args).ok_or((O::FallbackError, "no input".to_string()))?;
+    let Some(src) = crate::probe::source_dovi(cfg, input).await else {
+        return Err((O::FallbackNotP7, "ffprobe failed or timed out".into()));
+    };
+    if src.profile != Some(7) {
+        return Err((
+            O::FallbackNotP7,
+            format!("source DV profile is {:?}, not 7", src.profile),
+        ));
+    }
+    let plan = crate::dv81_plan::plan(
+        args,
+        &crate::dv81_plan::Source {
+            video_index: src.video_index,
+            start_time: src.start_time,
+        },
+        DV81_FD,
+    )
+    .map_err(|e| (O::FallbackError, e))?;
+    Ok((plan, crate::dv81_ts::DoviDescriptor::profile_81(src.level)))
+}
+
+/// Start ffmpeg#1 and read until its output proves (or disproves) in-band RPUs.
+async fn dv81_scan(
+    cfg: &Config,
+    demux_args: &[String],
+    cwd: &str,
+    desc: crate::dv81_ts::DoviDescriptor,
+    kill_rx: &mut watch::Receiver<bool>,
+) -> Dv81Scan {
+    use crate::metrics::Dv81Outcome as O;
+    crate::log(format_args!(
+        "dv81 demux: {} {}",
+        cfg.ffmpeg,
+        demux_args.join(" ")
+    ));
+    let mut cmd = Command::new(&cfg.ffmpeg);
+    cmd.args(demux_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if !cwd.is_empty() && std::path::Path::new(cwd).is_dir() {
+        cmd.current_dir(cwd);
+    }
+    let mut demux = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Dv81Scan::Fallback(O::FallbackError, format!("demux spawn: {e}")),
+    };
+    let Some(mut stdout) = demux.stdout.take() else {
+        return Dv81Scan::Fallback(O::FallbackError, "demux has no stdout".into());
+    };
+    // ffmpeg#1's stderr goes to the agent log, never to the shim (Jellyfin parses ffmpeg#2's).
+    if let Some(mut err) = demux.stderr.take() {
+        tokio::spawn(async move {
+            let mut text = Vec::new();
+            let _ = err.read_to_end(&mut text).await;
+            let text = String::from_utf8_lossy(&text);
+            let text = text.trim();
+            if !text.is_empty() {
+                let tail: String = text
+                    .chars()
+                    .rev()
+                    .take(2000)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                crate::log(format_args!("dv81 demux stderr: {tail}"));
+            }
+        });
+    }
+    let mut rewriter: Dv81Rewriter = crate::dv81_ts::TsRewriter::new(desc, dv81_transform);
+    let mut pending = Vec::new();
+    let mut read_total = 0usize;
+    let mut buf = vec![0u8; 256 << 10];
+    let deadline = tokio::time::Instant::now() + DV81_SCAN_TIMEOUT;
+    loop {
+        if rewriter.stats.rpus > 0 {
+            return Dv81Scan::Ready(Box::new(Dv81Feed {
+                demux,
+                stdout,
+                rewriter,
+                pending,
+                eof: false,
+            }));
+        }
+        if read_total >= DV81_SCAN_BYTES {
+            return Dv81Scan::Fallback(
+                O::FallbackNoRpu,
+                format!(
+                    "no in-band RPU (NAL 62) in the first {} MB ({} video frames)",
+                    DV81_SCAN_BYTES >> 20,
+                    rewriter.stats.video_pes
+                ),
+            );
+        }
+        let n = tokio::select! {
+            r = tokio::time::timeout_at(deadline, stdout.read(&mut buf)) => r,
+            changed = kill_rx.changed() => {
+                if changed.is_err() || *kill_rx.borrow() {
+                    return Dv81Scan::Killed;
+                }
+                continue;
+            }
+        };
+        match n {
+            Err(_) => {
+                return Dv81Scan::Fallback(
+                    O::FallbackError,
+                    format!("no decision within {}s", DV81_SCAN_TIMEOUT.as_secs()),
+                )
+            }
+            Ok(Err(e)) => return Dv81Scan::Fallback(O::FallbackError, format!("demux read: {e}")),
+            Ok(Ok(0)) => {
+                if let Err(e) = rewriter.finish(&mut pending) {
+                    return Dv81Scan::Fallback(O::FallbackError, format!("rewrite: {e}"));
+                }
+                let status = demux.wait().await;
+                if !status.as_ref().is_ok_and(|s| s.success()) {
+                    return Dv81Scan::Fallback(
+                        O::FallbackError,
+                        format!("demux exited {}", exit_code(status)),
+                    );
+                }
+                if rewriter.stats.rpus == 0 {
+                    return Dv81Scan::Fallback(
+                        O::FallbackNoRpu,
+                        format!(
+                            "no in-band RPU (NAL 62) in the whole output ({} video frames)",
+                            rewriter.stats.video_pes
+                        ),
+                    );
+                }
+                return Dv81Scan::Ready(Box::new(Dv81Feed {
+                    demux,
+                    stdout,
+                    rewriter,
+                    pending,
+                    eof: true,
+                }));
+            }
+            Ok(Ok(n)) => {
+                read_total += n;
+                if let Err(e) = rewriter.push(&buf[..n], &mut pending) {
+                    return Dv81Scan::Fallback(O::FallbackError, format!("rewrite: {e}"));
+                }
+            }
+        }
+    }
+}
+
+/// Pump ffmpeg#1 -> rewriter -> ffmpeg#2's fd 3 until ffmpeg#1 ends. `Err` = the conversion
+/// itself failed (bad RPU, ffmpeg#1 died): the caller kills ffmpeg#2 so a truncated stream can
+/// never look like a clean end. ffmpeg#2 going away (Jellyfin quit it) is `Ok`.
+async fn dv81_feed(
+    mut feed: Box<Dv81Feed>,
+    mut out: tokio::net::unix::pipe::Sender,
+) -> Result<crate::dv81_ts::TsStats, String> {
+    if out.write_all(&feed.pending).await.is_err() {
+        return Ok(feed.rewriter.stats);
+    }
+    feed.pending = Vec::new();
+    let mut buf = vec![0u8; 256 << 10];
+    let mut chunk = Vec::with_capacity(512 << 10);
+    while !feed.eof {
+        let n = feed
+            .stdout
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("demux read: {e}"))?;
+        chunk.clear();
+        if n == 0 {
+            feed.rewriter.finish(&mut chunk)?;
+            let status = feed.demux.wait().await;
+            if !status.as_ref().is_ok_and(|s| s.success()) {
+                return Err(format!("demux exited {}", exit_code(status)));
+            }
+            feed.eof = true;
+        } else {
+            feed.rewriter.push(&buf[..n], &mut chunk)?;
+        }
+        if out.write_all(&chunk).await.is_err() {
+            break; // ffmpeg#2 closed its end: it is exiting on its own
+        }
+    }
+    Ok(feed.rewriter.stats)
+}
+
+/// A signaled (DV7 -> 8.1) PLAYBACK job: convert if the gate passes, else run `args` (Jellyfin's
+/// plain remux, marker already stripped). Counts exactly one `tcpool_dv81_total` outcome.
+#[allow(clippy::too_many_arguments)]
+async fn run_dv81(
+    cfg: &Config,
+    state: &Arc<State>,
+    args: &[String],
+    cwd: &str,
+    tx: &Tx,
+    ctl: &Arc<Ctl>,
+    mut kill_rx: watch::Receiver<bool>,
+    stdin_rx: Arc<Mutex<mpsc::Receiver<Option<Vec<u8>>>>>,
+) -> i32 {
+    use crate::metrics::Dv81Outcome as O;
+    let fallback = |outcome: O, why: String| {
+        crate::log(format_args!(
+            "dv81: {}: {why}; running the plain remux",
+            outcome.as_str()
+        ));
+        state.metrics.inc_dv81(outcome);
+    };
+    let (plan, desc) = match dv81_prepare(cfg, args).await {
+        Ok(p) => p,
+        Err((o, why)) => {
+            fallback(o, why);
+            return run_ffmpeg(cfg, args, cwd, tx, ctl, kill_rx, stdin_rx, None).await;
+        }
+    };
+    let feed = match dv81_scan(cfg, &plan.demux, cwd, desc, &mut kill_rx).await {
+        Dv81Scan::Ready(f) => f,
+        Dv81Scan::Fallback(o, why) => {
+            fallback(o, why);
+            return run_ffmpeg(cfg, args, cwd, tx, ctl, kill_rx, stdin_rx, None).await;
+        }
+        Dv81Scan::Killed => return -libc::SIGKILL,
+    };
+    crate::log(format_args!(
+        "dv81: in-band RPU found; converting (level {})",
+        desc.level
+    ));
+    let code = run_ffmpeg(
+        cfg,
+        &plan.mux,
+        cwd,
+        tx,
+        ctl,
+        kill_rx.clone(),
+        stdin_rx.clone(),
+        Some(feed),
+    )
+    .await;
+    if code != 0
+        && !ctl.fenced.load(Ordering::SeqCst)
+        && ctl.ended().is_none()
+        && !*kill_rx.borrow()
+        && !first_segment(args).is_some_and(|p| std::path::Path::new(&p).exists())
+    {
+        fallback(
+            O::FallbackError,
+            format!("converting pipeline exited {code} before the first segment"),
+        );
+        return run_ffmpeg(cfg, args, cwd, tx, ctl, kill_rx, stdin_rx, None).await;
+    }
+    state.metrics.inc_dv81(O::Converted);
+    code
+}
+
 /// Run one ffmpeg to completion (or until fenced). Returns its exit code (-signal if killed).
+/// With `feed` (P5), the rewritten DV8.1 TS is piped to the child's fd `DV81_FD`; a conversion
+/// error kills the child.
+#[allow(clippy::too_many_arguments)]
 async fn run_ffmpeg(
     cfg: &Config,
     args: &[String],
@@ -572,6 +916,7 @@ async fn run_ffmpeg(
     ctl: &Arc<Ctl>,
     mut kill_rx: watch::Receiver<bool>,
     stdin_rx: Arc<Mutex<mpsc::Receiver<Option<Vec<u8>>>>>,
+    feed: Option<Box<Dv81Feed>>,
 ) -> i32 {
     crate::log(format_args!("start: {} {}", cfg.ffmpeg, args.join(" ")));
     let mut cmd = Command::new(&cfg.ffmpeg);
@@ -583,12 +928,49 @@ async fn run_ffmpeg(
     if !cwd.is_empty() && std::path::Path::new(cwd).is_dir() {
         cmd.current_dir(cwd);
     }
+    let mut pipe_tx = None;
+    let mut pipe_rx_fd = None;
+    if feed.is_some() {
+        match tokio::net::unix::pipe::pipe().and_then(|(tx, rx)| Ok((tx, rx.into_blocking_fd()?))) {
+            Ok((ptx, prx)) => {
+                use std::os::fd::AsRawFd;
+                let raw = prx.as_raw_fd();
+                // SAFETY: runs in the forked child before exec; dup2/fcntl are async-signal-safe
+                // and touch only this child's descriptor table.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        if raw == DV81_FD {
+                            // Already fd 3: just let it survive exec.
+                            if libc::fcntl(raw, libc::F_SETFD, 0) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        } else if libc::dup2(raw, DV81_FD) < 0 {
+                            // dup2 clears FD_CLOEXEC on the new descriptor.
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                pipe_tx = Some(ptx);
+                pipe_rx_fd = Some(prx);
+            }
+            Err(e) => {
+                crate::log(format_args!("dv81 pipe failed: {e}"));
+                return 127;
+            }
+        }
+    }
     let mut child: Child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             crate::log(format_args!("spawn failed: {e}"));
             return 127;
         }
+    };
+    drop(pipe_rx_fd); // the child has its copy; ours would only keep the pipe open
+    let mut feeder = match (feed, pipe_tx) {
+        (Some(f), Some(ptx)) => Some(tokio::spawn(dv81_feed(f, ptx))),
+        _ => None,
     };
     if *kill_rx.borrow() {
         let _ = child.start_kill();
@@ -625,8 +1007,30 @@ async fn run_ffmpeg(
                     break child.wait().await;
                 }
             }
+            fed = async { feeder.as_mut().expect("guarded").await }, if feeder.is_some() => {
+                feeder = None;
+                match fed {
+                    Ok(Ok(st)) => crate::log(format_args!(
+                        "dv81: demux finished: {} frames, {} RPUs rewritten, {} EL NALs dropped",
+                        st.video_pes, st.rpus, st.dropped_el
+                    )),
+                    Ok(Err(e)) => {
+                        crate::log(format_args!("dv81: conversion failed mid-stream: {e}; killing ffmpeg"));
+                        let _ = child.start_kill();
+                        break child.wait().await;
+                    }
+                    Err(e) => {
+                        crate::log(format_args!("dv81: feeder task died: {e}; killing ffmpeg"));
+                        let _ = child.start_kill();
+                        break child.wait().await;
+                    }
+                }
+            }
         }
     };
+    if let Some(f) = feeder {
+        f.abort(); // drops ffmpeg#1 (kill_on_drop)
+    }
     if let Some(w) = writer {
         w.abort();
     }
@@ -643,6 +1047,10 @@ fn exit_code(status: std::io::Result<std::process::ExitStatus>) -> i32 {
         Err(_) => 1,
     }
 }
+
+#[cfg(test)]
+#[path = "dv81_it.rs"]
+mod dv81_it;
 
 #[cfg(test)]
 mod tests {

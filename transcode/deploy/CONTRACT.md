@@ -146,7 +146,7 @@ Jellyfin waiting on a segment that already exists.
    true, and the racy marker re-create path — which returned HTTP 500 to two viewers starting at
    once, MEASURED twice — never fires.
 
-## Dolby Vision 7 -> 8.1 (P5, not applied yet)
+## Dolby Vision 7 -> 8.1 (P5, not deployed yet)
 
 For the Jellyfin-side decision patch (bug-hunt session, brief item 5): when your patch decides a
 DV profile-7 source should be remuxed as DV 8.1 for the requesting client, append this exactly
@@ -161,14 +161,17 @@ metadata), so nothing breaks if the pool is unreachable and the shim execs your 
 the output just carries one extra, inert metadata key. Do not gate on whether the pool is present;
 emit the marker whenever your decision says DV7->8.1, unconditionally.
 
-**Current pool-side behavior: none yet.** The pool detects the marker
-(`tcpool_ir::wants_dv81`, tested) but does not act on it — `render()` passes a signaled job through
-completely unchanged, so today a signaled job behaves exactly like an unsignaled one on the pool.
-The RPU-rewrite core exists and is unit-tested (`crates/agent/src/dv81.rs`), but wiring it into a
-live job is blocked on a real extraction problem (Matroska Block Addition parsing for dual-layer
-profile-7 MKVs — see `transcode/docs/PLAN.md` P5 for the measured details). Until that's resolved
-and wired, a signaled job is a no-op on the pool side: no crash, no corruption, just an inert tag on
-the output. Don't build client-side logic that assumes the badge will actually change yet.
+**Pool-side behavior (branch `dv81-wire`, not in an image yet).** An agent built from it acts on
+the marker for a video-copy (remux) PLAYBACK job: if ffprobe says the source is DV profile 7 and
+the source's video actually carries its RPU in-band (checked on the first bytes of the stream), it
+remuxes with the RPU rewritten to profile 8.1 and the enhancement layer dropped; the HLS init
+segment then carries a DOVI record `profile: 8 ... compatibility id: 1`. Every other case runs your
+argv unchanged minus the marker, i.e. exactly today's remux: a source that is not DV7, a DV7 MKV
+whose RPU sits in a Matroska Block Addition (`hvcE` — a common muxing, not converted yet), an argv
+without `-copyts` or with more than one `-i`, or any failure before the first segment. Output
+paths, segment naming, stdin keys and stderr progress are the same as the plain remux. Counted in
+`tcpool_dv81_total{outcome}`. So the badge changes only for in-band-RPU DV7 titles; details and
+measurements in `transcode/docs/PLAN.md` P5.
 
 ## Rollback
 

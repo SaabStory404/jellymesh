@@ -3,6 +3,8 @@
 
 mod config;
 mod dv81;
+mod dv81_plan;
+mod dv81_ts;
 mod job;
 mod metrics;
 mod probe;

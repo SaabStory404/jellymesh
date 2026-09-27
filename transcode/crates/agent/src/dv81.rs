@@ -1,54 +1,46 @@
 //! On-the-fly Dolby Vision profile 7 -> 8.1 conversion core (`transcode/docs/PLAN.md` P5).
 //!
-//! **Not wired into `job.rs`'s exec path yet.** This module is the real, unit-tested RPU-rewrite
-//! core -- Annex-B NAL splitting, enhancement-layer NAL removal, and RPU profile rewriting via the
-//! `dolby_vision` crate (the crate dovi_tool itself is built on, per PLAN.md P5's own wording).
-//! Wiring it into a live two-process pipeline is blocked on a real, MEASURED finding, not a TODO:
+//! The per-access-unit NAL rewrite: Annex-B NAL splitting, enhancement-layer removal, and RPU
+//! profile rewriting via the `dolby_vision` crate (the crate dovi_tool itself is built on). The
+//! transport around it (an MPEG-TS stream from ffmpeg#1, rewritten PES by PES) is `dv81_ts.rs`;
+//! the argv for the two ffmpegs is `dv81_plan.rs`; process wiring and fallback live in `job.rs`.
 //!
-//! On the one real DV profile-7 source available in `tc-lab` (a Blu-ray-remux MKV, profile 7,
-//! `dv_bl_signal_compatibility_id` 6 -- the common "\[DV HDR10\]" release-group muxing), jellyfin-
-//! ffmpeg 8.1.2's matroska demuxer logs `Invalid Block Addition value 0x0 for unknown Block
-//! Addition Mapping type 68766345` for the video track, and a `-map 0:v:0 -c:v copy` stream copy
-//! traced NAL-by-NAL (`-bsf:v trace_headers`, 301 NALs over 3 real seconds) contained **zero**
-//! `nal_unit_type == 62` (RPU) NALs and **zero** `nuh_layer_id != 0` NALs. `ffprobe` still reports
-//! `rpu_present_flag: 1, el_present_flag: 1` for the track (from the CodecPrivate DOVI
-//! configuration record, a static per-track descriptor), but the per-frame RPU/EL bitstream itself
-//! is carried in a Matroska Block Addition this ffmpeg build does not parse -- so a plain
-//! `-map`/stream-copy/bsf pipeline never sees it, for this muxing.
+//! **Which sources this can convert.** Only DV7 files whose per-frame RPU is carried *in-band*
+//! as HEVC NAL type 62 in the video track. MEASURED 2026-09-27 in `tc-lab` (jellyfin-ffmpeg
+//! 8.1.2): some profile-7 MKVs instead carry RPU + enhancement layer in a Matroska Block Addition
+//! (mapping type `hvcE`; ffmpeg logs `unknown Block Addition Mapping type 68766345`), and an
+//! ffmpeg stream copy of those contains zero type-62 NALs. `job.rs` detects that on the first
+//! bytes of ffmpeg#1's output (no RPU seen) and falls back to the plain remux; reading `hvcE`
+//! Block Additions is future work (PLAN.md P5).
 //!
-//! That rules out a pure-ffmpeg two-process pipeline (extract Annex-B, rewrite, remux) for this
-//! common case. It does NOT rule out this module: `convert_annexb_to_dv81` below is correct and
-//! useful for **any** Annex-B HEVC bitstream that already carries its RPU in-band as NAL type 62
-//! (true of some encoders/muxings, and of whatever extraction path eventually gets the bytes out
-//! of a Block-Addition-muxed MKV -- a Matroska Block-Addition-aware read, not an ffmpeg `-map`,
-//! is what's needed there; see the PLAN.md P5 entry for candidates). Do not wire this into
-//! `job.rs` until that extraction step exists and has been proven against a real profile-7 source
-//! in `tc-lab`.
+//! **Enhancement-layer shape.** In a single-track (BD-style) DV7 bitstream the EL NALs are
+//! encapsulated as `nal_unit_type` 63 (UNSPEC63) on layer 0 -- dovi_tool's `demux` treats 63 as
+//! EL (INHERITED from dovi_tool's behaviour, not yet traced on a real prod file). A multi-layer
+//! muxing would instead put EL NALs on `nuh_layer_id != 0`. Both are dropped; the RPU (type 62)
+//! is kept and rewritten whatever its layer id.
 //!
-//! Also NOT this module's job: deciding whether to convert at all. Once wired, that's `job.rs`'s
-//! call, gated on BOTH `tcpool_ir::wants_dv81` (Jellyfin asked) AND `probe::source_dovi_profile`
-//! returning `Some(7)` (the source really is DV profile 7) -- so a signal on a DV5/DV8/non-DV
-//! source is a safe no-op, never a corruption.
-
-// Not called from `job.rs` yet (see the module docs above for why); `cargo clippy -D
-// warnings` would otherwise fail the build on an unused public API in a binary crate.
-// Remove this once P5 is wired.
-#![allow(dead_code)]
+//! Deciding whether to convert at all is `job.rs`'s call, gated on BOTH `tcpool_ir::wants_dv81`
+//! (Jellyfin asked) AND `probe::source_dovi` reporting profile 7 (the source really is DV7), so a
+//! signal on a DV5/DV8/non-DV source is a safe no-op, never a corruption.
 
 use dolby_vision::rpu::dovi_rpu::DoviRpu;
 use dolby_vision::rpu::ConversionMode;
 
 /// HEVC's RPU NAL unit type (`nal_unit_type` 62, "UNSPEC62" in the spec): where Dolby Vision
 /// profile 7/8 metadata rides inside an HEVC bitstream.
-const RPU_NAL_UNIT_TYPE: u8 = 62;
+pub const RPU_NAL_UNIT_TYPE: u8 = 62;
+
+/// HEVC NAL type 63 (UNSPEC63): how a single-track DV profile-7 bitstream encapsulates its
+/// enhancement-layer NALs. Dropped on conversion.
+pub const EL_NAL_UNIT_TYPE: u8 = 63;
 
 /// One Annex-B NAL unit: its HEVC NAL unit type and layer id (from the 2-byte NAL header), and
 /// its bytes (header + payload, no start code, emulation-prevention bytes untouched).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Nal {
-    nal_unit_type: u8,
-    layer_id: u8,
-    data: Vec<u8>,
+pub struct Nal {
+    pub nal_unit_type: u8,
+    pub layer_id: u8,
+    pub data: Vec<u8>,
 }
 
 fn nal_unit_type(header0: u8) -> u8 {
@@ -60,10 +52,8 @@ fn nal_layer_id(header0: u8, header1: u8) -> u8 {
 }
 
 /// Split an Annex-B byte stream (`00 00 01` start codes, 3- or 4-byte) into its NAL units.
-/// Malformed input (a NAL shorter than its 2-byte header) drops that NAL rather than panicking;
-/// callers that need "did every byte round-trip" should compare `join_annexb`'s output length
-/// separately, not rely on this never dropping anything.
-fn split_annexb(data: &[u8]) -> Vec<Nal> {
+/// Malformed input (a NAL shorter than its 2-byte header) drops that NAL rather than panicking.
+pub fn split_annexb(data: &[u8]) -> Vec<Nal> {
     let mut starts = Vec::new();
     let mut i = 0usize;
     while i + 2 < data.len() {
@@ -77,12 +67,12 @@ fn split_annexb(data: &[u8]) -> Vec<Nal> {
     let mut nals = Vec::with_capacity(starts.len());
     for (n, &start) in starts.iter().enumerate() {
         let next_start_code = starts.get(n + 1).map(|&s| s - 3).unwrap_or(data.len());
-        // A 4-byte start code's leading zero belongs to the start code, not this NAL's payload.
-        let end = if next_start_code > start && data[next_start_code - 1] == 0 {
-            next_start_code - 1
-        } else {
-            next_start_code
-        };
+        // Trailing zero bytes (a 4-byte start code's leading zero, or trailing_zero_8bits)
+        // belong to the next start code, not this NAL's payload.
+        let mut end = next_start_code;
+        while end > start && data[end - 1] == 0 {
+            end -= 1;
+        }
         if end <= start || end - start < 2 {
             continue; // zero-length (trailing padding) or too short to have a NAL header
         }
@@ -98,7 +88,7 @@ fn split_annexb(data: &[u8]) -> Vec<Nal> {
 
 /// Re-serialize NALs back to Annex-B with 4-byte start codes (matches what `dolby_vision`'s own
 /// `write_hevc_unspec62_nalu` emits, so the RPU NAL and everything else use the same width).
-fn join_annexb(nals: &[Nal]) -> Vec<u8> {
+pub fn join_annexb(nals: &[Nal]) -> Vec<u8> {
     let mut out = Vec::with_capacity(nals.iter().map(|n| n.data.len() + 4).sum());
     for n in nals {
         out.extend_from_slice(&[0, 0, 0, 1]);
@@ -107,10 +97,9 @@ fn join_annexb(nals: &[Nal]) -> Vec<u8> {
     out
 }
 
-/// Rewrite one RPU NAL's payload from profile 5/7/8 to profile 8.1 (`ConversionMode::To81`:
-/// dovi_tool's own default DV7->8.1 conversion -- MEL sources keep their luma/chroma mapping, FEL
-/// sources have it removed, matching PLAN.md P5's "MEL loses nothing visible; FEL loses the
-/// enhancement detail").
+/// Rewrite one RPU NAL's payload to profile 8.1 (`ConversionMode::To81`: dovi_tool's own default
+/// DV7->8.1 conversion -- MEL sources keep their luma/chroma mapping, FEL sources have it removed,
+/// i.e. "MEL loses nothing visible; FEL loses the enhancement detail").
 fn rewrite_rpu_nal(nal: &Nal) -> Result<Nal, String> {
     debug_assert_eq!(nal.nal_unit_type, RPU_NAL_UNIT_TYPE);
     // `dolby_vision`'s NAL parser expects the payload without the 2-byte NAL header (it re-adds
@@ -127,53 +116,65 @@ fn rewrite_rpu_nal(nal: &Nal) -> Result<Nal, String> {
     })
 }
 
-/// Convert one Annex-B HEVC elementary stream from DV profile 7 to profile 8.1: keep every
-/// base-layer NAL (`nuh_layer_id == 0`) byte-for-byte except the RPU, which is rewritten in place;
-/// drop every true enhancement-layer NAL (`nuh_layer_id != 0` and not an RPU -- this *is*
-/// "dropping the enhancement layer", PLAN.md P5's own phrase for it). The RPU NAL itself is kept
-/// and rewritten regardless of which layer id it arrived on: some encoders carry it on the
-/// enhancement layer's NAL stream, not the base layer's (see the module docs -- this has not been
-/// confirmed against a real in-band sample this session; treat the layer-id-of-the-RPU assumption
-/// as INHERITED, not measured, until it has been).
-///
-/// Returns `Err` if the stream has no RPU NAL at all (not really DV profile 7/8, or the caller
-/// mis-gated -- `job.rs` must never call this without first confirming
-/// `probe::source_dovi_profile == Some(7)`) or any RPU NAL fails to convert. Never a partial or
-/// best-effort conversion: a stream with some frames at profile 8.1 and others still at profile 7
-/// is worse than failing the job outright, and the shim's contract for an agent failure is already
-/// "fall back and re-run" (see `shim::run_batch`'s `batch_pool_failure`), so failing closed here
-/// costs nothing extra.
-pub fn convert_annexb_to_dv81(data: &[u8]) -> Result<Vec<u8>, String> {
+/// What one access unit's conversion did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuStats {
+    /// RPU NALs found and rewritten to profile 8.1.
+    pub rpus: u64,
+    /// Enhancement-layer NALs dropped (type 63, or `nuh_layer_id != 0`).
+    pub dropped_el: u64,
+}
+
+/// Convert one Annex-B chunk (normally one access unit, i.e. one PES payload) from DV profile 7
+/// to 8.1: keep every base-layer NAL byte-for-byte, rewrite each RPU NAL to profile 8.1, drop
+/// enhancement-layer NALs (see the module docs for the two EL shapes). A chunk with no RPU is not
+/// an error here (the caller decides what "no RPU" means for a whole stream); an RPU that fails to
+/// parse or convert is, and fails the whole chunk -- never a partial conversion.
+pub fn convert_access_unit(data: &[u8]) -> Result<(Vec<u8>, AuStats), String> {
     let nals = split_annexb(data);
-    let mut rpu_count = 0usize;
+    let mut stats = AuStats::default();
     let mut out = Vec::with_capacity(nals.len());
     for nal in &nals {
         if nal.nal_unit_type == RPU_NAL_UNIT_TYPE {
-            rpu_count += 1;
+            stats.rpus += 1;
             out.push(rewrite_rpu_nal(nal)?);
-        } else if nal.layer_id == 0 {
+        } else if nal.nal_unit_type == EL_NAL_UNIT_TYPE || nal.layer_id != 0 {
+            stats.dropped_el += 1;
+        } else {
             out.push(nal.clone());
-        } // else: enhancement-layer NAL, dropped
+        }
     }
-    if rpu_count == 0 {
+    Ok((join_annexb(&out), stats))
+}
+
+/// Convert a whole Annex-B HEVC elementary stream from DV profile 7 to profile 8.1 (see
+/// `convert_access_unit`). `Err` if the stream has no RPU NAL at all (not DV profile 7/8, or the
+/// RPU is out-of-band -- the module docs' Block Addition finding) or any RPU fails to convert.
+/// The live path converts PES by PES (`dv81_ts`); this whole-stream form is for tests.
+#[cfg(test)]
+pub fn convert_annexb_to_dv81(data: &[u8]) -> Result<Vec<u8>, String> {
+    let (out, stats) = convert_access_unit(data)?;
+    if stats.rpus == 0 {
         return Err(
             "no RPU NAL found: not a Dolby Vision profile 7/8 bitstream, or the RPU is \
-                     out-of-band (see the module docs' Block Addition finding)"
+             out-of-band (see the module docs' Block Addition finding)"
                 .into(),
         );
     }
-    Ok(join_annexb(&out))
+    Ok(out)
 }
 
+/// Test-only helpers shared with `dv81_ts`'s and `job`'s tests: a synthetic, parseable
+/// profile-7 (MEL) RPU NAL and NAL builders. Nothing here is derived from a real source.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub mod testutil {
+    use dolby_vision::rpu::dovi_rpu::DoviRpu;
     use dolby_vision::rpu::generate::{GenerateConfig, GenerateProfile, VideoShot};
+    use dolby_vision::rpu::ConversionMode;
 
-    fn nal_bytes(nal_unit_type: u8, layer_id: u8, payload: &[u8]) -> Vec<u8> {
+    pub fn nal_bytes(nal_unit_type: u8, layer_id: u8, payload: &[u8]) -> Vec<u8> {
         // 2-byte HEVC NAL header: forbidden_zero_bit(1)=0, nal_unit_type(6), layer_id(6),
-        // temporal_id_plus1(3)=1. Only the bits this module reads are meaningful here (type,
-        // layer_id); the rest is fixed to valid-looking values, not derived from any real stream.
+        // temporal_id_plus1(3)=1.
         let b0 = (nal_unit_type << 1) | (layer_id >> 5);
         let b1 = ((layer_id & 0x1f) << 3) | 1;
         let mut v = vec![b0, b1];
@@ -181,7 +182,7 @@ mod tests {
         v
     }
 
-    fn annexb(nals: &[Vec<u8>]) -> Vec<u8> {
+    pub fn annexb(nals: &[Vec<u8>]) -> Vec<u8> {
         let mut out = Vec::new();
         for n in nals {
             out.extend_from_slice(&[0, 0, 0, 1]);
@@ -190,14 +191,14 @@ mod tests {
         out
     }
 
-    /// A synthetic (not derived from any real source), valid profile-5 RPU NAL payload -- the
-    /// `dolby_vision` crate's `generate` module only synthesizes profile 5/8.1/8.4, not 7 (profile
-    /// 7 is decode-only in real content), but `convert_with_mode(ConversionMode::To81)` runs the
-    /// same call path for profile 5 (`p5_to_p81`) as for profile 7/8, so this genuinely exercises
-    /// this module's NAL-splitting/rewriting/reassembly wiring end-to-end against the real crate.
-    fn synthetic_profile5_rpu_nal() -> Vec<u8> {
+    /// A synthetic profile-7 MEL RPU NAL (2-byte header included). The `dolby_vision` crate only
+    /// *generates* 5/8.1/8.4, so this generates an 8.1 RPU and runs the crate's own
+    /// `ConversionMode::ToMel` on it, which sets exactly the header bits that make
+    /// `get_dovi_profile()` report 7 (EL resampling on, residual enabled, 12-bit VDR) and attaches
+    /// a MEL (zero-residual) NLQ block. Asserted, not assumed.
+    pub fn synthetic_p7_rpu_nal() -> Vec<u8> {
         let cfg = GenerateConfig {
-            profile: GenerateProfile::Profile5,
+            profile: GenerateProfile::Profile81,
             length: 1,
             shots: vec![VideoShot {
                 start: 0,
@@ -206,12 +207,23 @@ mod tests {
             }],
             ..GenerateConfig::default()
         };
-        let rpus = cfg.generate_rpu_list().expect("generate a synthetic RPU");
-        // already includes the 2-byte unspec62 NAL header
-        rpus[0]
-            .write_hevc_unspec62_nalu()
-            .expect("serialize the synthetic RPU to a NAL")
+        let mut rpu = cfg.generate_rpu_list().expect("generate a synthetic RPU")[0].clone();
+        rpu.convert_with_mode(ConversionMode::ToMel)
+            .expect("8.1 -> MEL");
+        let nal = rpu.write_hevc_unspec62_nalu().expect("serialize");
+        let reparsed = DoviRpu::parse_unspec62_nalu(&nal[2..]).expect("reparse");
+        assert_eq!(
+            reparsed.dovi_profile, 7,
+            "the synthetic RPU must be profile 7"
+        );
+        nal
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::*;
+    use super::*;
 
     #[test]
     fn splits_and_rejoins_annexb_round_trip() {
@@ -229,6 +241,18 @@ mod tests {
     }
 
     #[test]
+    fn three_byte_start_codes_and_trailing_zeros_split_cleanly() {
+        let mut data = vec![0, 0, 1];
+        data.extend(nal_bytes(1, 0, b"ab"));
+        data.extend([0, 0, 0, 0, 1]); // trailing_zero_8bits then a 3-byte start code
+        data.extend(nal_bytes(1, 0, b"cd"));
+        let nals = split_annexb(&data);
+        assert_eq!(nals.len(), 2);
+        assert_eq!(nals[0].data, nal_bytes(1, 0, b"ab"));
+        assert_eq!(nals[1].data, nal_bytes(1, 0, b"cd"));
+    }
+
+    #[test]
     fn layer_id_decodes_from_the_nal_header() {
         let bl = nal_bytes(1, 0, &[]);
         let el = nal_bytes(1, 1, &[]);
@@ -237,59 +261,46 @@ mod tests {
     }
 
     #[test]
-    fn convert_drops_enhancement_layer_nals_and_keeps_base_layer_ones() {
+    fn convert_turns_a_profile7_rpu_into_81_and_drops_both_el_shapes() {
         let vps = nal_bytes(32, 0, b"vps");
         let bl_vcl = nal_bytes(1, 0, b"bl-frame");
-        let el_vcl = nal_bytes(1, 1, b"el-frame"); // must be dropped
-        let rpu = synthetic_profile5_rpu_nal();
-        let data = annexb(&[vps.clone(), bl_vcl.clone(), el_vcl, rpu]);
+        let el_layer1 = nal_bytes(1, 1, b"el-layer1"); // multi-layer EL shape
+        let el_unspec63 = nal_bytes(EL_NAL_UNIT_TYPE, 0, b"el-unspec63"); // BD single-track EL
+        let rpu = synthetic_p7_rpu_nal();
+        let data = annexb(&[vps.clone(), bl_vcl.clone(), el_layer1, el_unspec63, rpu]);
 
-        let out = convert_annexb_to_dv81(&data).expect("conversion should succeed");
-        let out_nals = split_annexb(&out);
-
-        assert!(
-            out_nals.iter().all(|n| n.layer_id == 0),
-            "no enhancement-layer NAL should survive: {out_nals:?}"
-        );
-        assert!(
-            out_nals.iter().any(|n| n.data == vps),
-            "unrelated base-layer NALs must pass through byte-for-byte"
-        );
-        assert!(
-            out_nals.iter().any(|n| n.data == bl_vcl),
-            "base-layer VCL NALs must pass through byte-for-byte"
-        );
-        assert!(
-            !out_nals.iter().any(|n| n.data.ends_with(b"el-frame")),
-            "the enhancement-layer VCL NAL must not survive in any form"
-        );
-        let rpu_out = out_nals
-            .iter()
-            .find(|n| n.nal_unit_type == RPU_NAL_UNIT_TYPE)
-            .expect("an RPU NAL must survive");
-        let converted = DoviRpu::parse_unspec62_nalu(&rpu_out.data[2..])
-            .expect("the rewritten RPU must still parse");
+        let (out, stats) = convert_access_unit(&data).expect("conversion should succeed");
         assert_eq!(
-            converted.dovi_profile, 8,
-            "the RPU must report profile 8(.1) after conversion, not 5"
+            stats,
+            AuStats {
+                rpus: 1,
+                dropped_el: 2
+            }
         );
+        let out_nals = split_annexb(&out);
+        assert_eq!(out_nals.len(), 3, "vps + bl frame + rpu: {out_nals:?}");
+        assert_eq!(out_nals[0].data, vps);
+        assert_eq!(out_nals[1].data, bl_vcl);
+        let converted = DoviRpu::parse_unspec62_nalu(&out_nals[2].data[2..])
+            .expect("the rewritten RPU must still parse");
+        assert_eq!(converted.dovi_profile, 8);
+        assert!(converted.el_type.is_none(), "no EL type after To81");
     }
 
     #[test]
-    fn convert_fails_closed_when_there_is_no_rpu() {
+    fn a_chunk_without_rpu_is_not_an_error_per_au_but_is_for_a_whole_stream() {
         let data = annexb(&[nal_bytes(32, 0, b"vps"), nal_bytes(1, 0, b"frame")]);
-        assert!(
-            convert_annexb_to_dv81(&data).is_err(),
-            "a stream with no RPU NAL must be rejected, not silently passed through as DV8.1"
-        );
+        let (out, stats) = convert_access_unit(&data).unwrap();
+        assert_eq!(stats.rpus, 0);
+        assert_eq!(out, data);
+        assert!(convert_annexb_to_dv81(&data).is_err());
     }
 
     #[test]
     fn convert_is_never_a_partial_result_on_a_malformed_rpu() {
-        // A type-62 NAL whose payload doesn't parse as a real RPU must fail the whole
-        // conversion, not silently drop just that one NAL and succeed with a broken stream.
         let bad_rpu = nal_bytes(RPU_NAL_UNIT_TYPE, 0, b"not a real rpu payload");
         let data = annexb(&[nal_bytes(32, 0, b"vps"), bad_rpu]);
+        assert!(convert_access_unit(&data).is_err());
         assert!(convert_annexb_to_dv81(&data).is_err());
     }
 }
