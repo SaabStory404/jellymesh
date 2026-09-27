@@ -1,0 +1,1 @@
+ffmpeg -i file:/media/x.mkv -xerror /tmp/leak.mkv -codec:v:0 libx264 -f hls -hls_segment_filename /transcodes/a%d.ts -y /transcodes/a.m3u8

@@ -1,0 +1,5 @@
+# Jellyfin with the transcode shim in place of ffmpeg (hotio hard-codes --ffmpeg=/usr/lib/jellyfin-ffmpeg/ffmpeg).
+FROM ghcr.io/hotio/jellyfin:release-12.1
+RUN mv /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/lib/jellyfin-ffmpeg/ffmpeg.real
+COPY shim.py /usr/lib/jellyfin-ffmpeg/ffmpeg
+RUN chmod 755 /usr/lib/jellyfin-ffmpeg/ffmpeg

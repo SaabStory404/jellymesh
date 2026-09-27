@@ -1,0 +1,130 @@
+---
+# Publish the two transcode-pool images to GHCR, tagged with the commit that produced them.
+#
+#   ghcr.io/saabstory404/tcpool-agent:<sha>  the pool worker (FROM the pinned jellyfin-ffmpeg base)
+#   ghcr.io/saabstory404/tcpool-shim:<sha>   an artifact image: just the static shim and sync
+#                                           binaries, for JellyMesh's Jellyfin image to COPY --from
+#
+# Only on push to main, and only when transcode changed: the images are deployment artifacts, so a
+# PR should not create tags nobody will deploy. Manifests reference an immutable <sha> tag, never
+# :latest: a mutable tag would make a deploy diff lie about what is actually running.
+#
+# Validation of the manifests and the Rust workspace lives in transcode.yml; this
+# workflow deliberately does not re-run it. It does rebuild the binaries rather than reaching for
+# transcode.yml's uploaded artifact, because artifacts do not cross workflow runs without extra API calls
+# and the build is ~90 s.
+name: tcpool images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'transcode/**'
+      - '.github/workflows/transcode-images.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # Lowercased on purpose: GHCR rejects an uppercase path component.
+  OWNER: saabstory404
+
+jobs:
+  images:
+    name: build and push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: transcode
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-unknown-linux-musl
+          rustc --version
+
+      # ring (rustls' crypto backend) compiles C, so the musl target needs a musl C compiler.
+      # Without musl-tools the build fails inside ring's build.rs, not at link time.
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+          musl-gcc --version | head -1
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            transcode/target
+          key: tcpool-images-${{ runner.os }}-${{ hashFiles('transcode/Cargo.lock') }}
+
+      - name: Static build (musl)
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Stage the build context
+        id: stage
+        run: |
+          set -euo pipefail
+          rel=target/x86_64-unknown-linux-musl/release
+          ctx="$RUNNER_TEMP/ctx"
+          mkdir -p "$ctx"
+          cp "$rel/tcpool-agent" "$rel/tcpool-shim" "$rel/tcpool-sync" deploy/tcpool-entry "$ctx/"
+          chmod 0755 "$ctx"/*
+          # A scratch image has no loader: a dynamically linked shim would be an unrunnable image
+          # that only fails at transcode time, inside Jellyfin, in prod.
+          for b in tcpool-agent tcpool-shim tcpool-sync; do
+            file -b "$ctx/$b"
+            file -b "$ctx/$b" | grep -Eq 'static-pie|statically linked'
+          done
+          echo "ctx=$ctx" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push tcpool-agent
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.stage.outputs.ctx }}
+          file: transcode/deploy/Containerfile.agent
+          push: true
+          provenance: false
+          tags: ${{ env.REGISTRY }}/${{ env.OWNER }}/tcpool-agent:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Build and push tcpool-shim
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.stage.outputs.ctx }}
+          file: transcode/deploy/Containerfile.shim
+          push: true
+          provenance: false
+          tags: ${{ env.REGISTRY }}/${{ env.OWNER }}/tcpool-shim:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### tcpool images"
+            echo
+            echo '```'
+            echo "${REGISTRY}/${OWNER}/tcpool-agent:${GITHUB_SHA}"
+            echo "${REGISTRY}/${OWNER}/tcpool-shim:${GITHUB_SHA}"
+            echo '```'
+            echo
+            echo "Set these image refs in the deployment manifests before applying them."
+          } >> "$GITHUB_STEP_SUMMARY"

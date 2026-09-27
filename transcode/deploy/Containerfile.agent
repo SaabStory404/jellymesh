@@ -1,0 +1,56 @@
+# ghcr.io/saabstory404/tcpool-agent - the transcode pool worker (one per device, DaemonSet).
+#
+# Base = the jellyfin-ffmpeg build Jellyfin itself runs, because the agent spawns that exact binary
+# rather than linking libav*: Jellyfin emits filter graphs specific to its own ffmpeg fork, so a
+# worker on a different build can be handed a command its ffmpeg refuses. Pinned by digest as well
+# as tag, so a hotio rebuild of :release-12.1 cannot change the worker's ffmpeg underneath us.
+#
+#   base     ghcr.io/hotio/jellyfin:release-12.1  (Ubuntu 24.04, s6-overlay)
+#   digest   sha256:e3a9ba58...  OCI index; MEASURED 2026-09-27 with
+#            `skopeo inspect docker://ghcr.io/hotio/jellyfin:release-12.1`
+#   ffmpeg   /usr/lib/jellyfin-ffmpeg/ffmpeg -> 8.1.2-Jellyfin (MEASURED in the image)
+#
+# VERSION SKEW, open: prod Jellyfin (arr-stack/k3s/30-media.yaml) still runs
+# ghcr.io/hotio/jellyfin:release-12.0. This pin matches the PLANNED JellyMesh image
+# ghcr.io/saabstory404/jellymesh-jellyfin:12.1-jm3, which is built FROM release-12.1 - bump the two
+# together. TODO: transcode/docs/PLAN.md §2 says the shim refuses a major ffmpeg
+# mismatch; the shim does not implement that check yet (rank() filters on outputs only), so for now
+# this digest pin is the only thing holding the versions together.
+#
+# Build context = a directory holding the static musl binaries plus tcpool-entry; see
+# deploy/build-images.sh. The binaries are built outside the image (deploy/build-musl.sh) because
+# this base has no Rust toolchain.
+FROM ghcr.io/hotio/jellyfin:release-12.1@sha256:e3a9ba58c32605279715e0104e20fa63289fef4fe8afcefa53dfe0b65e6d9b07
+
+LABEL org.opencontainers.image.title="tcpool-agent" \
+      org.opencontainers.image.description="Transcode pool worker: gRPC/mTLS in, jellyfin-ffmpeg out" \
+      org.opencontainers.image.source="https://github.com/SaabStory404/homelab" \
+      org.opencontainers.image.base.name="ghcr.io/hotio/jellyfin:release-12.1"
+
+COPY tcpool-agent /usr/local/bin/tcpool-agent
+COPY tcpool-entry /usr/local/bin/tcpool-entry
+RUN chmod 0755 /usr/local/bin/tcpool-agent /usr/local/bin/tcpool-entry
+
+# Defaults only; the DaemonSet sets the per-class values (TC_KIND, TC_CAPACITY, TC_WEIGHT_*, TLS).
+ENV TC_FFMPEG=/usr/lib/jellyfin-ffmpeg/ffmpeg \
+    TC_PORT=9901 \
+    TC_HEALTH_PORT=9902 \
+    TC_LOG=/dev/stdout \
+    TC_INPUT_ROOTS=/data/media \
+    TC_OUTPUT_ROOT=/transcodes \
+    CUDA_CACHE_PATH=/tmp/cuda-cache \
+    HOME=/tmp
+# The base sets LD_PRELOAD=/usr/lib/jellyfin/libjemalloc.so.2. It is inert for the static agent, but
+# it IS inherited by the ffmpeg the agent spawns - which is exactly the allocator prod Jellyfin's
+# own ffmpeg runs under. Left in place on purpose; do not "clean it up".
+
+# Non-root, and the same uid prod Jellyfin writes segments as, so the shared NFS scratch has one
+# owner. /dev/dri access comes from the pod's supplementalGroups (render GID 993), not from a
+# group in this image - it has no `render` group at all (MEASURED).
+USER 1000:1000
+
+EXPOSE 9901 9902
+
+# Not the agent directly: see the header of tcpool-entry for the PID-1 reasoning (freeze drills
+# need the agent signalable, drain needs SIGTERM relayed).
+ENTRYPOINT ["/usr/local/bin/tcpool-entry"]

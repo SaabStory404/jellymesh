@@ -1,0 +1,1 @@
+setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,scale=trunc(min(max(iw\,ih*a)\,1920)/2)*2:trunc(ow/a/2)*2,tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p,subtitles=f='/config/data/data/subtitles/3d/3dd10e62-dcf2-74bb-1800-e3a194ae582f/6.srt':fontsdir='/config/data/data/attachments/3d/3dd10e62-dcf2-74bb-1800-e3a194ae582f'

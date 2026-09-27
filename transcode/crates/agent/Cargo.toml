@@ -1,0 +1,22 @@
+[package]
+name = "tcpool-agent"
+description = "Transcode-pool worker agent: one per transcode device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tcpool-agent"
+path = "src/main.rs"
+
+[dependencies]
+tcpool-ir = { workspace = true }
+tcpool-proto = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tonic-health = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

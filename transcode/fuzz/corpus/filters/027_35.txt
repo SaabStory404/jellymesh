@@ -1,0 +1,1 @@
+setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,scale=trunc(min(max(iw\,ih*a)\,3840)/2)*2:trunc(ow/a/2)*2,format=yuv420p

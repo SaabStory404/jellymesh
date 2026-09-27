@@ -1,0 +1,88 @@
+// Transcode pool: shim (in each Jellyfin) <-> agent (one per transcode device).
+//
+// Semantics carried over unchanged from the spike, proven by its drills:
+//  - Hello answering proves the agent process is alive (a frozen process still completes TCP
+//    handshakes, so a TCP connect proves nothing).
+//  - Both sides heartbeat every second. The agent kills its ffmpeg ("fences") after 3 s without a
+//    client message; the shim declares the worker lost after 6 s without a server message. So a
+//    partitioned worker has stopped writing before its replacement starts.
+//  - A job lost or failed before its first segment exists is re-run elsewhere by the shim;
+//    Jellyfin never sees it (exiting non-zero then would wedge the session in Jellyfin 12).
+syntax = "proto3";
+
+package tcpool.v1;
+
+service Worker {
+  rpc Hello(HelloRequest) returns (Caps);
+  // First client message must be `job`. The server answers `accepted` or `busy` before anything
+  // else; after `accepted` it streams output and ends with `exit`.
+  rpc Run(stream ClientMsg) returns (stream ServerMsg);
+}
+
+message HelloRequest {}
+
+message Caps {
+  string name = 1;
+  string kind = 2;                 // qsv | nvenc | cpu
+  repeated string outputs = 3;     // verified by test encodes: h264 hevc hevc10 av1 av1-10
+  bool gpu_tonemap = 4;            // GPU scale+tonemap chain verified (and CUDA JIT warmed)
+  double capacity = 5;             // weighted units
+  double units_used = 6;
+  uint32 active_jobs = 7;
+  string ffmpeg_version = 8;
+  string agent_version = 9;
+  int64 probed_unix = 10;
+  string node = 11;
+}
+
+enum Priority {
+  PLAYBACK = 0;
+  BATCH = 1;
+}
+
+message Job {
+  repeated string args = 1;        // Jellyfin's software-mode ffmpeg arguments (argv[1..])
+  string cwd = 2;
+  Priority priority = 3;
+}
+
+message Heartbeat {}
+
+message ClientMsg {
+  oneof msg {
+    Job job = 1;
+    bytes stdin = 2;               // Jellyfin's q / p / u keys
+    bool stdin_close = 3;
+    Heartbeat heartbeat = 4;
+  }
+}
+
+message Accepted {
+  double units = 1;
+  double units_used = 2;
+  double capacity = 3;
+  string worker = 4;
+}
+
+message Busy {
+  string reason = 1;
+  double units_used = 2;
+  double capacity = 3;
+}
+
+message Exit {
+  int32 code = 1;
+  bool fenced = 2;
+  bool gpu_filters = 3;
+}
+
+message ServerMsg {
+  oneof msg {
+    Accepted accepted = 1;
+    Busy busy = 2;
+    bytes stderr = 3;
+    bytes stdout = 4;
+    Heartbeat heartbeat = 5;
+    Exit exit = 6;
+  }
+}

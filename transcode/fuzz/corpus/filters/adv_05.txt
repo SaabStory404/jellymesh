@@ -1,0 +1,1 @@
+SENDCMD=/etc/passwd

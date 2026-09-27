@@ -1,0 +1,18 @@
+[package]
+name = "tcpool-sync"
+description = "Keeps Jellyfin's codec offers at the lowest common denominator of every pool worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tcpool-sync"
+path = "src/main.rs"
+
+[dependencies]
+tcpool-proto = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { version = "3.4", default-features = false, features = ["json"] }

@@ -1,0 +1,1 @@
+amovie=/etc/passwd

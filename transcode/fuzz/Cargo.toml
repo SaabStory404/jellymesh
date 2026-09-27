@@ -1,0 +1,45 @@
+[package]
+name = "tcpool-ir-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# A separate, standalone workspace: cargo-fuzz needs a nightly-only crate-type and its own
+# lockfile, and we don't want it (or its dependency tree) pulled into `transcode`'s workspace
+# build/lint/test. Not listed in ../Cargo.toml's `members`.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+name = "tcpool_ir_fuzz"
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tcpool-ir = { path = "../crates/ir" }
+
+[[bin]]
+name = "validate"
+path = "fuzz_targets/validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "render"
+path = "fuzz_targets/render.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filters"
+path = "fuzz_targets/filters.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

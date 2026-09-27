@@ -11,6 +11,7 @@ the moment another server writes. JellyMesh fixes all three:
 |---|---|
 | [`jellyfin-perf/`](jellyfin-perf/) | A patch to Jellyfin 12.1: N+1 query fixes (people, lyrics, dedupe), a Resume sort key MySQL can plan, retried user-data writes, and **`JELLYFIN_SHARED_DB=1`** — user data and login sessions read from the database instead of per-node snapshots. Responses byte-identical to stock on SQLite and MySQL. |
 | [`galera/`](galera/) | A Jellyfin database provider plugin for MySQL 8.4 / Percona XtraDB Cluster (Galera), built on Pomelo (EF Core 10 PR + our fixes), plus `jellyfin-dbmigrate`: lossless SQLite ⇄ MySQL migration in either direction, with a row-by-row verifier. |
+| [`transcode/`](transcode/) | A GPU transcode pool shared by every Jellyfin server: a drop-in ffmpeg shim, one agent per GPU (Intel QSV, NVIDIA NVENC, CPU spill), gRPC with mTLS, a command allowlist, and failover that never interrupts a viewer. Rust. |
 | [`image/`](image/) | Containerfile: hotio's Jellyfin 12.1 (digest-pinned) + the patch + provider + migration tool. Published as `ghcr.io/saabstory404/jellymesh-jellyfin`. |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | Everything measured: single-client and concurrent load, failover, write conflicts, cross-node coherence. |
 

@@ -1,0 +1,42 @@
+#!/bin/sh
+# PID 1 for the tcpool-agent container. The agent deliberately does NOT run as PID 1.
+#
+# Why: the chaos drills freeze a worker with `kill -STOP -1` from inside the pod, and the kernel
+# drops signals with no handler sent to PID 1 of a PID namespace. An agent running as PID 1 could
+# not be frozen, so the freeze drill (the one that proves the shim's 6 s dead-after and the agent's
+# 3 s fence) would silently pass without testing anything. The lab got this by running
+# `sh -c '<agent> & wait $!'` (transcode/spike/k8s/render.py).
+#
+# Why not that one-liner here: a bare `wait` does not forward SIGTERM, so the shell would exit on
+# the kubelet's TERM and the container would die before the agent drained its running jobs. Drain
+# is the whole point of terminationGracePeriodSeconds, so PID 1 has to relay the signal.
+#
+# Why not tini: the base image (ghcr.io/hotio/jellyfin) ships no tini or dumb-init (MEASURED), so
+# `tini -g` would mean an extra apt layer and a network fetch at build time for ~15 lines of shell.
+# Reaping is not a concern either: ffmpeg is spawned by the agent, which waits on it, so orphans
+# reaching PID 1 are the exception rather than the rule — and the loop below reaps them.
+set -u
+
+AGENT=${TC_AGENT_BIN:-/usr/local/bin/tcpool-agent}
+child=''
+
+# shellcheck disable=SC2329  # invoked by the trap below, which shellcheck does not follow
+relay() {
+    # Forward, do not exit: the agent drains (stops admitting, lets each job finish its segment).
+    [ -n "$child" ] && kill -TERM "$child" 2>/dev/null
+    return 0
+}
+trap relay TERM INT
+
+"$AGENT" "$@" &
+child=$!
+
+wait "$child"
+code=$?
+# `wait` returns 128+n when a trap interrupted it rather than when the child exited. Re-wait, but
+# only while the child is genuinely still there, so an agent killed BY a signal cannot spin here.
+while [ "$code" -gt 128 ] && kill -0 "$child" 2>/dev/null; do
+    wait "$child"
+    code=$?
+done
+exit "$code"
