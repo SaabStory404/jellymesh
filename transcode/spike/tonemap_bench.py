@@ -20,7 +20,8 @@ import agent  # noqa: E402
 
 SECS = sys.argv[1] if len(sys.argv) > 1 else "20"
 START = sys.argv[2] if len(sys.argv) > 2 else "1200"
-SRC = glob.glob("/media/movies/sample-c/*.mkv")[0]
+# an HDR10 source; TC_BENCH_SRC overrides the glob
+SRC = os.environ.get("TC_BENCH_SRC") or glob.glob(os.environ.get("TC_BENCH_GLOB", "/media/movies/*HDR*/*.mkv"))[0]
 FF = agent.FFMPEG
 FP = os.path.join(os.path.dirname(FF), "ffprobe")
 VF = (r"setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,"
