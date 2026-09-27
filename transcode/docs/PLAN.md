@@ -312,7 +312,8 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
            UNSPEC63 — the BD single-track EL encapsulation — and any `nuh_layer_id != 0`); the PMT
            gets exactly one DOVI video stream descriptor (0xB0) saying profile 8 / BL compat 1 / no
            EL, replacing any ffmpeg#1 wrote. **Decision on the first bytes:** if no RPU has been
-           seen within 32 MB (or 20 s, or ffmpeg#1's whole output) the source's RPU is out-of-band
+           seen within 32 MB (or 10 s — kept inside the 45 s first-progress grace, which also covers
+           the ffprobe and whatever ffmpeg runs next — or ffmpeg#1's whole output) the source's RPU is out-of-band
            (`hvcE`, below): kill ffmpeg#1, plain remux, `fallback_no_rpu`. Nothing has been written
            to Jellyfin's output at that point.
         4. ffmpeg#2: input 0 = the rewritten TS on **fd 3** (`pipe:3`, dup2 in `pre_exec`) — not
@@ -375,6 +376,9 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
         - (b) reader: a Matroska Block-Addition-aware extractor (Rust, in the agent) that yields the
           RPU per frame so the same rewrite applies.
         - Jellyfin decision patch adopting the marker (bug-hunt session, brief item 5).
+        - Cost: a converting job reads the source twice (ffmpeg#1 for video, ffmpeg#2 for audio,
+          same file, same seek) — ~2x NFS read per DV81 session on a link P6 already flags as
+          saturating on remux probes. Not measured yet.
 
       Done when the Bravia shows the Dolby Vision badge on a DV7 title with Direct Stream (remux) and
       no extra disk use.

@@ -608,8 +608,12 @@ const DV81_FD: i32 = 3;
 /// frame carries an RPU, so a real in-band source decides on its first frame; the limit only
 /// bounds how long a no-RPU source delays its first segment.
 const DV81_SCAN_BYTES: usize = 32 << 20;
-/// Upper bound on the decision itself (ffmpeg#1 start + the scan), same reasoning.
-const DV81_SCAN_TIMEOUT: Duration = Duration::from_secs(20);
+/// Upper bound on the decision itself (ffmpeg#1 start + the scan), same reasoning. Kept well
+/// inside the playback first-progress grace (`TC_FIRST_PROGRESS_GRACE`, 45 s default): the
+/// grace timer starts before `source_dovi`'s ffprobe (up to 10 s) and this scan, and whatever
+/// ffmpeg runs next (converting or the plain-remux fallback) still has to print its first
+/// `time=` inside it, or the stall watchdog ends the job.
+const DV81_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Dv81Transform = fn(&[u8]) -> Result<crate::dv81_ts::TransformOut, String>;
 type Dv81Rewriter = crate::dv81_ts::TsRewriter<Dv81Transform>;
@@ -871,7 +875,13 @@ async fn run_dv81(
             fallback(o, why);
             return run_ffmpeg(cfg, args, cwd, tx, ctl, kill_rx, stdin_rx, None).await;
         }
-        Dv81Scan::Killed => return -libc::SIGKILL,
+        Dv81Scan::Killed => {
+            // Fenced/drained/stalled while deciding: nothing ran for Jellyfin, nothing to fall
+            // back to (the kill is job-wide). Still one outcome per signaled job.
+            crate::log(format_args!("dv81: job killed during the RPU scan"));
+            state.metrics.inc_dv81(O::FallbackError);
+            return -libc::SIGKILL;
+        }
     };
     crate::log(format_args!(
         "dv81: in-band RPU found; converting (level {})",
