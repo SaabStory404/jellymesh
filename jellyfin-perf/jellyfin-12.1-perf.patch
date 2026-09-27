@@ -1,0 +1,618 @@
+diff --git a/Emby.Server.Implementations/Dto/DtoService.cs b/Emby.Server.Implementations/Dto/DtoService.cs
+index e539508..87f3f11 100644
+--- a/Emby.Server.Implementations/Dto/DtoService.cs
++++ b/Emby.Server.Implementations/Dto/DtoService.cs
+@@ -20,6 +20,7 @@ using MediaBrowser.Controller.Entities.Audio;
+ using MediaBrowser.Controller.Library;
+ using MediaBrowser.Controller.LiveTv;
+ using MediaBrowser.Controller.Playlists;
++using MediaBrowser.Controller.Persistence;
+ using MediaBrowser.Controller.Providers;
+ using MediaBrowser.Controller.Trickplay;
+ using MediaBrowser.Model.Dto;
+@@ -127,6 +128,8 @@ namespace Emby.Server.Implementations.Dto
+         private readonly ITrickplayManager _trickplayManager;
+         private readonly IChapterManager _chapterManager;
+ 
++        private readonly IMediaStreamRepository _mediaStreamRepository;
++
+         public DtoService(
+             ILogger<DtoService> logger,
+             ILibraryManager libraryManager,
+@@ -138,8 +141,10 @@ namespace Emby.Server.Implementations.Dto
+             IMediaSourceManager mediaSourceManager,
+             Lazy<ILiveTvManager> livetvManagerFactory,
+             ITrickplayManager trickplayManager,
+-            IChapterManager chapterManager)
++            IChapterManager chapterManager,
++            IMediaStreamRepository mediaStreamRepository)
+         {
++            _mediaStreamRepository = mediaStreamRepository;
+             _logger = logger;
+             _libraryManager = libraryManager;
+             _userDataRepository = userDataRepository;
+@@ -269,6 +274,13 @@ namespace Emby.Server.Implementations.Dto
+                 }
+             }
+ 
++            // Batch-detect lyric streams: HasLyrics otherwise loads every stream of every Audio item
++            // on the page, one query each (200 statements for a 200-track album grid).
++            var audioIds = accessibleItems.OfType<Audio>().Select(i => i.Id).ToList();
++            var lyricItemIds = audioIds.Count > 0
++                ? _mediaStreamRepository.GetItemIdsWithStreamType(audioIds, MediaStreamType.Lyric)
++                : null;
++
+             for (int index = 0; index < accessibleItems.Count; index++)
+             {
+                 var item = accessibleItems[index];
+@@ -284,7 +296,8 @@ namespace Emby.Server.Implementations.Dto
+                     artistsBatch,
+                     resumeDataBatch?.GetValueOrDefault(item.Id),
+                     peopleBatch,
+-                    alternateVersionItemIds);
++                    alternateVersionItemIds,
++                    lyricItemIds);
+ 
+                 if (item is LiveTvChannel tvChannel)
+                 {
+@@ -348,7 +361,8 @@ namespace Emby.Server.Implementations.Dto
+             IReadOnlyDictionary<string, MusicArtist[]>? artistsBatch = null,
+             VersionResumeData? resumeData = null,
+             IReadOnlyDictionary<Guid, IReadOnlyList<PersonInfo>>? peopleBatch = null,
+-            IReadOnlySet<Guid>? alternateVersionItemIds = null)
++            IReadOnlySet<Guid>? alternateVersionItemIds = null,
++            IReadOnlySet<Guid>? lyricItemIds = null)
+         {
+             var dto = new BaseItemDto
+             {
+@@ -458,7 +472,8 @@ namespace Emby.Server.Implementations.Dto
+ 
+             if (item is Audio audio)
+             {
+-                dto.HasLyrics = audio.GetMediaStreams().Any(s => s.Type == MediaStreamType.Lyric);
++                dto.HasLyrics = lyricItemIds?.Contains(audio.Id)
++                    ?? audio.GetMediaStreams().Any(s => s.Type == MediaStreamType.Lyric);
+             }
+ 
+             return dto;
+@@ -936,22 +951,11 @@ namespace Emby.Server.Implementations.Dto
+ 
+             var list = new List<BaseItemPerson>();
+ 
+-            Dictionary<string, Person> dictionary = people.Select(p => p.Name)
+-                .Distinct(StringComparer.OrdinalIgnoreCase).Select(c =>
+-                {
+-                    try
+-                    {
+-                        return _libraryManager.GetPerson(c);
+-                    }
+-                    catch (Exception ex)
+-                    {
+-                        _logger.LogError(ex, "Error getting person {Name}", c);
+-                        return null;
+-                    }
+-                }).Where(i => i is not null)
+-                .Where(i => user is null || i!.IsVisible(user))
+-                .DistinctBy(x => x!.Name, StringComparer.OrdinalIgnoreCase)
+-                .ToDictionary(i => i!.Name, StringComparer.OrdinalIgnoreCase)!; // null values got filtered out
++            // One query for the whole cast instead of a full item load per person.
++            Dictionary<string, Person> dictionary = _libraryManager.GetPersons(people.Select(p => p.Name)).Values
++                .Where(i => user is null || i.IsVisible(user))
++                .DistinctBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
++                .ToDictionary(i => i.Name, StringComparer.OrdinalIgnoreCase);
+ 
+             for (var i = 0; i < people.Count; i++)
+             {
+diff --git a/Emby.Server.Implementations/Library/LibraryManager.cs b/Emby.Server.Implementations/Library/LibraryManager.cs
+index caba304..e2d007d 100644
+--- a/Emby.Server.Implementations/Library/LibraryManager.cs
++++ b/Emby.Server.Implementations/Library/LibraryManager.cs
+@@ -63,6 +63,17 @@ namespace Emby.Server.Implementations.Library
+     /// </summary>
+     public class LibraryManager : ILibraryManager
+     {
++        // JELLYFIN_SHARED_DB=1: see UserDataManager. Items are re-read instead of served from this
++        // node's cache, which another node's scan or edit would leave stale.
++        private static readonly bool _sharedDatabase = Environment.GetEnvironmentVariable("JELLYFIN_SHARED_DB") == "1";
++
++        // Shared mode keeps the item cache but only for a few seconds: item objects no longer carry
++        // user state there (user data is always read from the database), so the only thing that can
++        // be stale is metadata another node's scan or edit just changed, for at most this long.
++        // Without any item cache every request re-read folders and views (MEASURED: 105 -> 36 req/s).
++        private const long SharedCacheTtlMs = 5000;
++        private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, long> _cachedAt = new();
++
+         private const string ShortcutFileExtension = ".mblink";
+ 
+         private readonly ILogger<LibraryManager> _logger;
+@@ -342,6 +353,10 @@ namespace Emby.Server.Implementations.Library
+             }
+ 
+             _cache.AddOrUpdate(item.Id, item);
++            if (_sharedDatabase)
++            {
++                _cachedAt[item.Id] = Environment.TickCount64;
++            }
+         }
+ 
+         public void DeleteItem(BaseItem item, DeleteOptions options)
+@@ -1236,6 +1251,77 @@ namespace Emby.Server.Implementations.Library
+             return null;
+         }
+ 
++        /// <summary>
++        /// Gets the Person items for many names: cached ones from the item cache, the rest with one
++        /// query instead of one full item load per name. Names without a Person item are absent.
++        /// </summary>
++        /// <param name="names">Person names.</param>
++        /// <returns>Name (case-insensitive) to Person.</returns>
++        public Dictionary<string, Person> GetPersons(IEnumerable<string> names)
++        {
++            var result = new Dictionary<string, Person>(StringComparer.OrdinalIgnoreCase);
++            var byId = new Dictionary<Guid, string>();
++            foreach (var name in names)
++            {
++                if (string.IsNullOrEmpty(name) || result.ContainsKey(name))
++                {
++                    continue;
++                }
++
++                var id = GetItemByNameId<Person>(Person.GetPath(name));
++                if (!_sharedDatabase && _cache.TryGet(id, out var cached) && cached is Person cachedPerson)
++                {
++                    result[name] = cachedPerson;
++                }
++                else
++                {
++                    byId.TryAdd(id, name);
++                }
++            }
++
++            if (byId.Count == 0)
++            {
++                return result;
++            }
++
++            try
++            {
++                var loaded = _itemRepository.GetItemList(new InternalItemsQuery
++                {
++                    ItemIds = byId.Keys.ToArray(),
++                    IncludeItemTypes = [BaseItemKind.Person],
++                });
++                foreach (var item in loaded)
++                {
++                    if (item is Person person && byId.TryGetValue(person.Id, out var name))
++                    {
++                        result[name] = person;
++                    }
++                }
++            }
++            catch (Exception ex)
++            {
++                // One unreadable row must not lose the page: fall back to one load per name.
++                _logger.LogError(ex, "Batched person lookup failed, loading {Count} persons one by one", byId.Count);
++                foreach (var name in byId.Values)
++                {
++                    try
++                    {
++                        if (GetPerson(name) is { } person)
++                        {
++                            result[name] = person;
++                        }
++                    }
++                    catch (Exception inner)
++                    {
++                        _logger.LogError(inner, "error retrieving BaseItem for person: {0}", name);
++                    }
++                }
++            }
++
++            return result;
++        }
++
+         /// <inheritdoc />
+         public Person GetOrCreatePerson(string name)
+         {
+@@ -1694,7 +1780,8 @@ namespace Emby.Server.Implementations.Library
+                 throw new ArgumentException("Guid can't be empty", nameof(id));
+             }
+ 
+-            if (_cache.TryGet(id, out var item))
++            if (_cache.TryGet(id, out var item)
++                && (!_sharedDatabase || (_cachedAt.TryGetValue(id, out var at) && Environment.TickCount64 - at < SharedCacheTtlMs)))
+             {
+                 return item;
+             }
+@@ -3620,18 +3707,8 @@ namespace Emby.Server.Implementations.Library
+         public QueryResult<BaseItem> GetPeopleItems(InternalPeopleQuery query)
+         {
+             var queryResult = _peopleRepository.GetPeople(query);
+-            var baseItems = queryResult.Items.Select(i =>
+-                {
+-                    try
+-                    {
+-                        return GetPerson(i.Name);
+-                    }
+-                    catch (Exception ex)
+-                    {
+-                        _logger.LogError(ex, "error retrieving BaseItem for person: {0}", i.Name);
+-                        return null;
+-                    }
+-                })
++            var persons = GetPersons(queryResult.Items.Select(i => i.Name));
++            var baseItems = queryResult.Items.Select(i => persons.GetValueOrDefault(i.Name))
+                 .Where(i => i is not null)
+                 .Where(i => query.User is null || i!.IsVisible(query.User))
+                 .OfType<BaseItem>()
+diff --git a/Emby.Server.Implementations/Library/UserDataManager.cs b/Emby.Server.Implementations/Library/UserDataManager.cs
+index 0680046..e4557be 100644
+--- a/Emby.Server.Implementations/Library/UserDataManager.cs
++++ b/Emby.Server.Implementations/Library/UserDataManager.cs
+@@ -29,6 +29,11 @@ namespace Emby.Server.Implementations.Library
+         private readonly IDbContextFactory<JellyfinDbContext> _repository;
+         private readonly FastConcurrentLru<string, UserItemData> _cache;
+ 
++        // JELLYFIN_SHARED_DB=1: several Jellyfin nodes share one database. A per-node cache would serve
++        // this node's stale copy after another node's write (MEASURED: 65 s+), so every read goes to
++        // the database (one batched query per page).
++        private static readonly bool _sharedDatabase = Environment.GetEnvironmentVariable("JELLYFIN_SHARED_DB") == "1";
++
+         /// <summary>
+         /// Initializes a new instance of the <see cref="UserDataManager"/> class.
+         /// </summary>
+@@ -57,6 +62,48 @@ namespace Emby.Server.Implementations.Library
+ 
+             var keys = item.GetUserDataKeys();
+ 
++            // Check-then-insert is only atomic where write transactions are serialized (SQLite). On an
++            // MVCC database two first writes for the same row both see "absent" and one insert fails
++            // (MEASURED on MySQL: 7 of 200 concurrent progress reports -> HTTP 500), and a multi-primary
++            // cluster can abort a commit on certification. Both are safe to retry: the retry sees the
++            // winner's row and updates it.
++            // Providers without a retrying execution strategy report the latter wrapped in an
++            // InvalidOperationException ("likely due to a transient failure").
++            const int MaxAttempts = 6;
++            for (var attempt = 1; ; attempt++)
++            {
++                try
++                {
++                    WriteUserData(user, item, userData, keys);
++                    break;
++                }
++                catch (Exception ex) when (attempt < MaxAttempts && IsWriteConflict(ex))
++                {
++                    // Fresh context and transaction; jitter so racing writers stop colliding.
++                    Thread.Sleep(Random.Shared.Next(5, 20) * attempt);
++                }
++            }
++
++            var userId = user.InternalId;
++            var cacheKey = GetCacheKey(userId, item.Id);
++            _cache.AddOrUpdate(cacheKey, userData);
++
++            UserDataSaved?.Invoke(this, new UserDataSaveEventArgs
++            {
++                Keys = keys,
++                UserData = userData,
++                SaveReason = reason,
++                UserId = user.Id,
++                Item = item
++            });
++        }
++
++        private static bool IsWriteConflict(Exception ex)
++            => ex is DbUpdateException or System.Data.Common.DbException
++                || ex is InvalidOperationException { InnerException: DbUpdateException or System.Data.Common.DbException };
++
++        private void WriteUserData(User user, BaseItem item, UserItemData userData, List<string> keys)
++        {
+             using var dbContext = _repository.CreateDbContext();
+             using var transaction = dbContext.Database.BeginTransaction();
+ 
+@@ -76,20 +123,7 @@ namespace Emby.Server.Implementations.Library
+ 
+             dbContext.SaveChanges();
+             transaction.Commit();
+-
+-            var userId = user.InternalId;
+-            var cacheKey = GetCacheKey(userId, item.Id);
+-            _cache.AddOrUpdate(cacheKey, userData);
+             item.UserData = dbContext.UserData.Where(e => e.ItemId == item.Id).AsNoTracking().ToArray(); // rehydrate the cached userdata
+-
+-            UserDataSaved?.Invoke(this, new UserDataSaveEventArgs
+-            {
+-                Keys = keys,
+-                UserData = userData,
+-                SaveReason = reason,
+-                UserId = user.Id,
+-                Item = item
+-            });
+         }
+ 
+         /// <inheritdoc />
+@@ -186,7 +220,11 @@ namespace Emby.Server.Implementations.Library
+             foreach (var item in items)
+             {
+                 var cacheKey = GetCacheKey(user.InternalId, item.Id);
+-                if (_cache.TryGet(cacheKey, out var cachedData))
++                if (_sharedDatabase)
++                {
++                    itemsNeedingQuery.Add((item, item.GetUserDataKeys()));
++                }
++                else if (_cache.TryGet(cacheKey, out var cachedData))
+                 {
+                     result[item.Id] = cachedData;
+                 }
+@@ -353,6 +391,12 @@ namespace Emby.Server.Implementations.Library
+         public UserItemData? GetUserData(User user, BaseItem item)
+         {
+             ArgumentNullException.ThrowIfNull(user);
++            if (_sharedDatabase)
++            {
++                return GetUserDataBatch([item], user).GetValueOrDefault(item.Id)
++                    ?? new UserItemData { Key = item.GetUserDataKeys()[0] };
++            }
++
+             var row = ResolveUserDataRow(item, item.UserData?.Where(e => e.UserId.Equals(user.Id)));
+             return row is not null ? Map(row) : new UserItemData()
+             {
+diff --git a/Jellyfin.Server.Implementations/Devices/DeviceManager.cs b/Jellyfin.Server.Implementations/Devices/DeviceManager.cs
+index d0d52a2..11e6a9d 100644
+--- a/Jellyfin.Server.Implementations/Devices/DeviceManager.cs
++++ b/Jellyfin.Server.Implementations/Devices/DeviceManager.cs
+@@ -34,6 +34,12 @@ namespace Jellyfin.Server.Implementations.Devices
+         private readonly ConcurrentDictionary<int, Device> _devices;
+         private readonly ConcurrentDictionary<string, DeviceOptions> _deviceOptions;
+ 
++        // JELLYFIN_SHARED_DB=1 (several nodes, one database): devices are the login sessions, and this
++        // class snapshots them into memory at startup. A token issued on another node was then unknown
++        // here (401) and a logout elsewhere left the token valid here. In shared mode every lookup asks
++        // the database; the token lookup is one indexed query (IX Devices(AccessToken, DateLastActivity)).
++        private static readonly bool _sharedDatabase = Environment.GetEnvironmentVariable("JELLYFIN_SHARED_DB") == "1";
++
+         /// <summary>
+         /// Initializes a new instance of the <see cref="DeviceManager"/> class.
+         /// </summary>
+@@ -111,6 +117,13 @@ namespace Jellyfin.Server.Implementations.Devices
+         /// <inheritdoc />
+         public DeviceOptionsDto? GetDeviceOptions(string deviceId)
+         {
++            if (_sharedDatabase)
++            {
++                using var dbContext = _dbProvider.CreateDbContext();
++                var stored = dbContext.DeviceOptions.AsNoTracking().FirstOrDefault(o => o.DeviceId == deviceId);
++                return stored is null ? null : ToDeviceOptionsDto(stored);
++            }
++
+             if (_deviceOptions.TryGetValue(deviceId, out var deviceOptions))
+             {
+                 return ToDeviceOptionsDto(deviceOptions);
+@@ -135,8 +148,8 @@ namespace Jellyfin.Server.Implementations.Devices
+         /// <inheritdoc />
+         public DeviceInfoDto? GetDevice(string id)
+         {
+-            var device = _devices.Values.Where(d => d.DeviceId == id).OrderByDescending(d => d.DateLastActivity).FirstOrDefault();
+-            _deviceOptions.TryGetValue(id, out var deviceOption);
++            var device = CurrentDevices(null, id, null).OrderByDescending(d => d.DateLastActivity).FirstOrDefault();
++            var deviceOption = LookupOptions(id);
+ 
+             var deviceInfo = device is null ? null : ToDeviceInfo(device, deviceOption);
+             return deviceInfo is null ? null : ToDeviceInfoDto(deviceInfo);
+@@ -145,10 +158,7 @@ namespace Jellyfin.Server.Implementations.Devices
+         /// <inheritdoc />
+         public QueryResult<Device> GetDevices(DeviceQuery query)
+         {
+-            IEnumerable<Device> devices = _devices.Values
+-                .Where(device => !query.UserId.HasValue || device.UserId.Equals(query.UserId.Value))
+-                .Where(device => query.DeviceId is null || device.DeviceId == query.DeviceId)
+-                .Where(device => query.AccessToken is null || device.AccessToken == query.AccessToken)
++            IEnumerable<Device> devices = CurrentDevices(query.UserId, query.DeviceId, query.AccessToken)
+                 .OrderBy(d => d.Id)
+                 .ToList();
+             var count = devices.Count();
+@@ -180,7 +190,7 @@ namespace Jellyfin.Server.Implementations.Devices
+         /// <inheritdoc />
+         public QueryResult<DeviceInfoDto> GetDevicesForUser(Guid? userId)
+         {
+-            IEnumerable<Device> devices = _devices.Values
++            IEnumerable<Device> devices = CurrentDevices(null, null, null)
+                 .OrderByDescending(d => d.DateLastActivity)
+                 .ThenBy(d => d.DeviceId);
+ 
+@@ -197,7 +207,7 @@ namespace Jellyfin.Server.Implementations.Devices
+ 
+             var array = devices.Select(device =>
+                 {
+-                    _deviceOptions.TryGetValue(device.DeviceId, out var option);
++                    var option = LookupOptions(device.DeviceId);
+                     return ToDeviceInfo(device, option);
+                 })
+                 .Select(ToDeviceInfoDto)
+@@ -206,6 +216,51 @@ namespace Jellyfin.Server.Implementations.Devices
+             return new QueryResult<DeviceInfoDto>(array);
+         }
+ 
++        // Devices matching the filters: this node's snapshot, or the database in shared mode.
++        private List<Device> CurrentDevices(Guid? userId, string? deviceId, string? accessToken)
++        {
++            if (!_sharedDatabase)
++            {
++                return _devices.Values
++                    .Where(device => !userId.HasValue || device.UserId.Equals(userId.Value))
++                    .Where(device => deviceId is null || device.DeviceId == deviceId)
++                    .Where(device => accessToken is null || device.AccessToken == accessToken)
++                    .ToList();
++            }
++
++            using var dbContext = _dbProvider.CreateDbContext();
++            IQueryable<Device> q = dbContext.Devices.AsNoTracking();
++            if (userId.HasValue)
++            {
++                var u = userId.Value;
++                q = q.Where(d => d.UserId == u);
++            }
++
++            if (deviceId is not null)
++            {
++                q = q.Where(d => d.DeviceId == deviceId);
++            }
++
++            if (accessToken is not null)
++            {
++                q = q.Where(d => d.AccessToken == accessToken);
++            }
++
++            return q.ToList();
++        }
++
++        private DeviceOptions? LookupOptions(string deviceId)
++        {
++            if (!_sharedDatabase)
++            {
++                _deviceOptions.TryGetValue(deviceId, out var cached);
++                return cached;
++            }
++
++            using var dbContext = _dbProvider.CreateDbContext();
++            return dbContext.DeviceOptions.AsNoTracking().FirstOrDefault(o => o.DeviceId == deviceId);
++        }
++
+         /// <inheritdoc />
+         public async Task DeleteDevice(Device device)
+         {
+diff --git a/Jellyfin.Server.Implementations/Item/BaseItemRepository.QueryBuilding.cs b/Jellyfin.Server.Implementations/Item/BaseItemRepository.QueryBuilding.cs
+index 1a4c9da..dcbc75e 100644
+--- a/Jellyfin.Server.Implementations/Item/BaseItemRepository.QueryBuilding.cs
++++ b/Jellyfin.Server.Implementations/Item/BaseItemRepository.QueryBuilding.cs
+@@ -116,7 +116,10 @@ public sealed partial class BaseItemRepository
+         }
+         else
+         {
+-            dbQuery = dbQuery.Distinct();
++            // Dedupe on the key, not on every column: DISTINCT over whole rows (incl. the Data JSON)
++            // made MySQL hash multi-KB rows into temp tables (Audio grid COUNT 241 ms). Same rows.
++            var distinctIds = dbQuery.Select(e => e.Id);
++            dbQuery = context.BaseItems.AsNoTracking().Where(e => distinctIds.Contains(e.Id));
+         }
+ 
+         if (filter.CollapseBoxSetItems == true)
+diff --git a/Jellyfin.Server.Implementations/Item/MediaStreamRepository.cs b/Jellyfin.Server.Implementations/Item/MediaStreamRepository.cs
+index a256291..5d3be2b 100644
+--- a/Jellyfin.Server.Implementations/Item/MediaStreamRepository.cs
++++ b/Jellyfin.Server.Implementations/Item/MediaStreamRepository.cs
+@@ -66,6 +66,25 @@ public class MediaStreamRepository : IMediaStreamRepository
+             .ToArray();
+     }
+ 
++    /// <inheritdoc />
++    public IReadOnlySet<Guid> GetItemIdsWithStreamType(IReadOnlyList<Guid> itemIds, MediaStreamType mediaStreamType)
++    {
++        if (itemIds.Count == 0)
++        {
++            return new HashSet<Guid>();
++        }
++
++        using var context = _dbProvider.CreateDbContext();
++        var type = (MediaStreamTypeEntity)mediaStreamType;
++        return context.MediaStreamInfos
++            .AsNoTracking()
++            .WhereOneOrMany(itemIds, e => e.ItemId)
++            .Where(e => e.StreamType == type)
++            .Select(e => e.ItemId)
++            .Distinct()
++            .ToHashSet();
++    }
++
+     private string? GetPathToSave(string? path)
+     {
+         if (path is null)
+diff --git a/Jellyfin.Server.Implementations/Item/OrderMapper.cs b/Jellyfin.Server.Implementations/Item/OrderMapper.cs
+index 00b10e4..82904ec 100644
+--- a/Jellyfin.Server.Implementations/Item/OrderMapper.cs
++++ b/Jellyfin.Server.Implementations/Item/OrderMapper.cs
+@@ -39,13 +39,20 @@ public static class OrderMapper
+                 ? jellyfinDbContext.UserData
+                 : jellyfinDbContext.UserData.Where(w => w.UserId == query.User.Id);
+ 
+-            return e => userData
+-                .Where(w => w.ItemId == e.Id)
+-                .Select(w => w.LastPlayedDate)
+-                .Concat(userData
+-                    .Where(w => w.Item!.PrimaryVersionId == e.Id)
+-                    .Select(w => w.LastPlayedDate))
+-                .Max();
++            // The alternate-version side is written as a MAX over the item's alternates of a per-alternate
++            // lookup, so the database can only start from the PrimaryVersionId index. Joined the other way
++            // round (user data → item), MySQL drove from every row of the user's UserData for each sorted
++            // item (166,800 lookups for 400 rows: Resume 0.4-2.6 s once a few hundred items were in
++            // progress, SQLite 50 ms). The two sides are combined with a CASE; NULL on one side yields the
++            // other, as MAX over their union did.
++            return e => userData.Where(w => w.ItemId == e.Id).Max(w => w.LastPlayedDate) == null
++                ? jellyfinDbContext.BaseItems.Where(v => v.PrimaryVersionId == e.Id)
++                    .Max(v => userData.Where(w => w.ItemId == v.Id).Max(w => w.LastPlayedDate))
++                : jellyfinDbContext.BaseItems.Where(v => v.PrimaryVersionId == e.Id)
++                    .Max(v => userData.Where(w => w.ItemId == v.Id).Max(w => w.LastPlayedDate)) > userData.Where(w => w.ItemId == e.Id).Max(w => w.LastPlayedDate)
++                    ? jellyfinDbContext.BaseItems.Where(v => v.PrimaryVersionId == e.Id)
++                        .Max(v => userData.Where(w => w.ItemId == v.Id).Max(w => w.LastPlayedDate))
++                    : userData.Where(w => w.ItemId == e.Id).Max(w => w.LastPlayedDate);
+         }
+ 
+         return (sortBy, query.User) switch
+diff --git a/Jellyfin.Server.Implementations/Item/PeopleRepository.cs b/Jellyfin.Server.Implementations/Item/PeopleRepository.cs
+index fcddc09..dbb1546 100644
+--- a/Jellyfin.Server.Implementations/Item/PeopleRepository.cs
++++ b/Jellyfin.Server.Implementations/Item/PeopleRepository.cs
+@@ -50,9 +50,14 @@ public class PeopleRepository(IDbContextFactory<JellyfinDbContext> dbProvider, I
+             // appear multiple times (e.g. as Actor and GuestStar). Collapse to one row per
+             // name so /Persons doesn't return the same BaseItem id repeatedly, keeping the
+             // lowest id per lowercased name so case-only duplicates collapse together.
++            // One aggregate instead of a correlated NOT EXISTS per row: MySQL planned that as a
++            // range scan per candidate (339 ms on a 9.5k-person library vs 33 ms as a hash anti-join).
+             var candidates = dbQuery;
++            var keptIds = candidates
++                .GroupBy(p => p.Name.ToLower())
++                .Select(g => g.Min(p => p.Id));
+             dbQuery = candidates
+-                .Where(p => !candidates.Any(other => other.Name.ToLower() == p.Name.ToLower() && other.Id < p.Id))
++                .Where(p => keptIds.Contains(p.Id))
+                 .OrderBy(e => e.Name.ToLower());
+ 
+             if (filter.EnableTotalRecordCount)
+diff --git a/MediaBrowser.Controller/Library/ILibraryManager.cs b/MediaBrowser.Controller/Library/ILibraryManager.cs
+index 82de354..f5a06de 100644
+--- a/MediaBrowser.Controller/Library/ILibraryManager.cs
++++ b/MediaBrowser.Controller/Library/ILibraryManager.cs
+@@ -99,6 +99,13 @@ namespace MediaBrowser.Controller.Library
+             LibraryOptions libraryOptions,
+             CollectionType? collectionType = null);
+ 
++        /// <summary>
++        /// Gets the Person items for many names in one lookup.
++        /// </summary>
++        /// <param name="names">The person names.</param>
++        /// <returns>Name (case-insensitive) to Person; names without a Person item are absent.</returns>
++        Dictionary<string, Person> GetPersons(IEnumerable<string> names);
++
+         /// <summary>
+         /// Gets a Person.
+         /// </summary>
+diff --git a/MediaBrowser.Controller/Persistence/IMediaStreamRepository.cs b/MediaBrowser.Controller/Persistence/IMediaStreamRepository.cs
+index de04ff0..6d3aa40 100644
+--- a/MediaBrowser.Controller/Persistence/IMediaStreamRepository.cs
++++ b/MediaBrowser.Controller/Persistence/IMediaStreamRepository.cs
+@@ -28,6 +28,14 @@ public interface IMediaStreamRepository
+     /// <returns>IEnumerable{string}.</returns>
+     IReadOnlyList<string> GetMediaStreamLanguages(MediaStreamType mediaStreamType);
+ 
++    /// <summary>
++    /// Gets which of the given items have at least one stream of a type, in one query.
++    /// </summary>
++    /// <param name="itemIds">The item ids.</param>
++    /// <param name="mediaStreamType">The stream type.</param>
++    /// <returns>The ids among <paramref name="itemIds"/> that have such a stream.</returns>
++    IReadOnlySet<Guid> GetItemIdsWithStreamType(IReadOnlyList<Guid> itemIds, MediaStreamType mediaStreamType);
++
+     /// <summary>
+     /// Saves the media streams.
+     /// </summary>

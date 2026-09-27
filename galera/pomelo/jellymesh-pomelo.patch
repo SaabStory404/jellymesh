@@ -1,0 +1,292 @@
+diff --git a/src/EFCore.MySql/Query/ExpressionTranslators/Internal/MySqlJsonTableExpression.cs b/src/EFCore.MySql/Query/ExpressionTranslators/Internal/MySqlJsonTableExpression.cs
+index 05e4b94..07080bd 100644
+--- a/src/EFCore.MySql/Query/ExpressionTranslators/Internal/MySqlJsonTableExpression.cs
++++ b/src/EFCore.MySql/Query/ExpressionTranslators/Internal/MySqlJsonTableExpression.cs
+@@ -118,6 +118,26 @@ protected override Expression VisitChildren(ExpressionVisitor visitor)
+     public override TableValuedFunctionExpression Update(IReadOnlyList<SqlExpression> arguments)
+         => Update(arguments[0], Path, ColumnInfos);
+ 
++    // The base implementations return a plain TableValuedFunctionExpression, dropping Path and
++    // ColumnInfos: once alias uniquification renamed a JSON_TABLE (p1 -> p0) it printed as
++    // `JSON_TABLE(@p) AS p0`, a syntax error (MEASURED on Jellyfin 12.1 /Items).
++    public override TableValuedFunctionExpression WithAlias(string newAlias)
++        => new MySqlJsonTableExpression(newAlias, JsonExpression, Path, ColumnInfos);
++
++    protected override TableValuedFunctionExpression WithAnnotations(IReadOnlyDictionary<string, Microsoft.EntityFrameworkCore.Infrastructure.IAnnotation> annotations)
++        => this;
++
++    public override TableExpressionBase Clone(string alias, ExpressionVisitor cloningExpressionVisitor)
++        => new MySqlJsonTableExpression(
++            alias ?? Alias,
++            (SqlExpression)cloningExpressionVisitor.Visit(JsonExpression),
++            Path?.Select(
++                    s => s.ArrayIndex is null
++                        ? s
++                        : new PathSegment((SqlExpression)cloningExpressionVisitor.Visit(s.ArrayIndex)))
++                .ToArray(),
++            ColumnInfos);
++
+     /// <summary>
+     ///     This is an internal API that supports the Entity Framework Core infrastructure and not subject to
+     ///     the same compatibility standards as public APIs. It may be changed or removed without notice in
+diff --git a/src/EFCore.MySql/Query/ExpressionVisitors/Internal/MySqlQuerySqlGenerator.cs b/src/EFCore.MySql/Query/ExpressionVisitors/Internal/MySqlQuerySqlGenerator.cs
+index fb26ee6..6d4c0a8 100644
+--- a/src/EFCore.MySql/Query/ExpressionVisitors/Internal/MySqlQuerySqlGenerator.cs
++++ b/src/EFCore.MySql/Query/ExpressionVisitors/Internal/MySqlQuerySqlGenerator.cs
+@@ -14,6 +14,7 @@
+ using Microsoft.EntityFrameworkCore.Storage;
+ using Microsoft.EntityFrameworkCore.Utilities;
+ using Pomelo.EntityFrameworkCore.MySql.Infrastructure.Internal;
++using Pomelo.EntityFrameworkCore.MySql.Storage.Internal;
+ using Pomelo.EntityFrameworkCore.MySql.Query.Expressions.Internal;
+ using Pomelo.EntityFrameworkCore.MySql.Query.ExpressionTranslators.Internal;
+ 
+@@ -184,6 +185,75 @@ protected virtual Expression VisitJsonPathTraversal(MySqlJsonTraversalExpression
+             return expression;
+         }
+ 
++        /// <summary>
++        ///     AppContext data key: collation for string columns of JSON_TABLE() over parameter
++        ///     collections, so they compare with (and can use indexes of) columns in that collation.
++        /// </summary>
++        public const string JsonTableStringCollationKey = "Pomelo.EntityFrameworkCore.MySql.JsonTableStringCollation";
++
++        private int _inSubqueryCount;
++
++        /// <summary>
++        ///     Emits <c>x IN (SELECT * FROM (subquery) AS jm_inN)</c> for non-correlated IN subqueries.
++        /// </summary>
++        /// <remarks>
++        ///     MySQL cannot semijoin-materialize an IN subquery containing UNION (or nested IN subqueries
++        ///     around GROUP BY), so it falls back to IN-to-EXISTS and re-runs the subquery for every outer
++        ///     row. Wrapping it in a derived table forces one materialization. MEASURED on Jellyfin 12.1's
++        ///     movie grid COUNT over a 19k-item library: 286 ms (19,259 dependent executions) to 5.9 ms,
++        ///     same result. A derived table that the optimizer can merge (plain SELECT) is merged back, so
++        ///     simple subqueries keep their semijoin plans. Correlated subqueries are left alone.
++        /// </remarks>
++        protected override void GenerateIn(InExpression inExpression, bool negated)
++        {
++            if (inExpression.Subquery is null || IsCorrelated(inExpression.Subquery))
++            {
++                base.GenerateIn(inExpression, negated);
++                return;
++            }
++
++            Visit(inExpression.Item);
++            Sql.Append(negated ? " NOT IN (" : " IN (");
++            Sql.AppendLine("SELECT * FROM (");
++            using (Sql.Indent())
++            {
++                Visit(inExpression.Subquery);
++            }
++
++            Sql.AppendLine()
++                .Append(") AS ")
++                .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier("jm_in" + _inSubqueryCount++))
++                .Append(")");
++        }
++
++        private static bool IsCorrelated(SelectExpression subquery)
++        {
++            var scanner = new AliasScanner();
++            scanner.Visit(subquery);
++            return scanner.ReferencedAliases.Any(a => !scanner.DefinedAliases.Contains(a));
++        }
++
++        private sealed class AliasScanner : ExpressionVisitor
++        {
++            public HashSet<string> DefinedAliases { get; } = new();
++            public HashSet<string> ReferencedAliases { get; } = new();
++
++            protected override Expression VisitExtension(Expression node)
++            {
++                switch (node)
++                {
++                    case ColumnExpression column:
++                        ReferencedAliases.Add(column.TableAlias);
++                        return node;
++                    case TableExpressionBase table when table.Alias is not null:
++                        DefinedAliases.Add(table.Alias);
++                        break;
++                }
++
++                return base.VisitExtension(node);
++            }
++        }
++
+         protected override Expression VisitColumn(ColumnExpression columnExpression)
+         {
+             if (_removeTableAliasOld is not null &&
+@@ -932,6 +1002,20 @@ protected virtual Expression VisitJsonTableExpression(MySqlJsonTableExpression j
+ 
+             Sql.Append(")");
+ 
++            void AppendCharSetAndCollation(string collation, string charSet = null)
++            {
++                charSet = collation is not null ? collation[..collation.IndexOf('_')] : charSet;
++                if (charSet is not null)
++                {
++                    Sql.Append(" CHARACTER SET ").Append(charSet);
++                }
++
++                if (collation is not null)
++                {
++                    Sql.Append(" COLLATE ").Append(collation);
++                }
++            }
++
+             void GenerateColumnInfo(MySqlJsonTableExpression.ColumnInfo columnInfo)
+             {
+                 Sql
+@@ -939,6 +1023,22 @@ void GenerateColumnInfo(MySqlJsonTableExpression.ColumnInfo columnInfo)
+                     .Append(" ")
+                     .Append(columnInfo.TypeMapping.StoreType);
+ 
++                // Without a character set JSON_TABLE() character columns are latin1 (MEASURED on
++                // MySQL 8.4): a Guid list then cannot use the ascii char(36) primary key (Jellyfin's
++                // batched person load: index scan of every Person per id, 274 ms -> PK lookups), and
++                // non-latin1 string elements are mangled. Declare what the compared columns use.
++                switch (columnInfo.TypeMapping)
++                {
++                    case MySqlGuidTypeMapping { IsCharBasedStoreType: true }:
++                        AppendCharSetAndCollation(_options.DefaultGuidCollation);
++                        break;
++                    case MySqlStringTypeMapping:
++                        AppendCharSetAndCollation(
++                            AppContext.GetData(JsonTableStringCollationKey) as string,
++                            _options.DefaultCharSet?.Name);
++                        break;
++                }
++
+                 if (columnInfo.Path is not null)
+                 {
+                     Sql.Append(" PATH ");
+diff --git a/src/EFCore.MySql/Query/ExpressionVisitors/Internal/MySqlQueryTranslationPostprocessor.cs b/src/EFCore.MySql/Query/ExpressionVisitors/Internal/MySqlQueryTranslationPostprocessor.cs
+index cb0956c..df5147b 100644
+--- a/src/EFCore.MySql/Query/ExpressionVisitors/Internal/MySqlQueryTranslationPostprocessor.cs
++++ b/src/EFCore.MySql/Query/ExpressionVisitors/Internal/MySqlQueryTranslationPostprocessor.cs
+@@ -47,5 +47,8 @@ public override Expression Process(Expression query)
+ 
+             return query;
+         }
++
++        protected override Expression ProcessTypeMappings(Expression expression)
++            => new MySqlTypeMappingPostprocessor(Dependencies, RelationalDependencies, RelationalQueryCompilationContext).Process(expression);
+     }
+ }
+diff --git a/src/EFCore.MySql/Query/ExpressionVisitors/Internal/MySqlTypeMappingPostprocessor.cs b/src/EFCore.MySql/Query/ExpressionVisitors/Internal/MySqlTypeMappingPostprocessor.cs
+new file mode 100644
+index 0000000..c963757
+--- /dev/null
++++ b/src/EFCore.MySql/Query/ExpressionVisitors/Internal/MySqlTypeMappingPostprocessor.cs
+@@ -0,0 +1,64 @@
++// Copyright (c) Pomelo Foundation. All rights reserved.
++// Licensed under the MIT. See LICENSE in the project root for license information.
++
++using System;
++using System.Linq.Expressions;
++using Microsoft.EntityFrameworkCore.Query;
++using Microsoft.EntityFrameworkCore.Query.SqlExpressions;
++using Microsoft.EntityFrameworkCore.Storage;
++using Pomelo.EntityFrameworkCore.MySql.Query.ExpressionTranslators.Internal;
++
++namespace Pomelo.EntityFrameworkCore.MySql.Query.ExpressionVisitors.Internal
++{
++    /// <summary>
++    ///     Applies inferred type mappings to JSON_TABLE() over a parameter collection
++    ///     (e.g. <c>EF.Parameter(ids).Contains(x.Id)</c>): the parameter gets the JSON collection mapping
++    ///     (so its value is serialized as a JSON array) and JSON_TABLE() gets a COLUMNS clause with the
++    ///     element's store type. Takes the place of EF 8's ApplyInferredTypeMappings, which EF 9 replaced
++    ///     with RelationalTypeMappingPostprocessor (compare SqliteTypeMappingPostprocessor / json_each).
++    /// </summary>
++    public class MySqlTypeMappingPostprocessor : RelationalTypeMappingPostprocessor
++    {
++        private readonly IRelationalTypeMappingSource _typeMappingSource;
++        private readonly ISqlExpressionFactory _sqlExpressionFactory;
++
++        public MySqlTypeMappingPostprocessor(
++            QueryTranslationPostprocessorDependencies dependencies,
++            RelationalQueryTranslationPostprocessorDependencies relationalDependencies,
++            RelationalQueryCompilationContext queryCompilationContext)
++            : base(dependencies, relationalDependencies, queryCompilationContext)
++        {
++            _typeMappingSource = relationalDependencies.TypeMappingSource;
++            _sqlExpressionFactory = relationalDependencies.SqlExpressionFactory;
++        }
++
++        protected override Expression VisitExtension(Expression expression)
++        {
++
++            if (expression is MySqlJsonTableExpression { JsonExpression: SqlParameterExpression { TypeMapping: null } parameter } jsonTable
++                && TryGetInferredTypeMapping(jsonTable.Alias, "value", out var elementTypeMapping))
++            {
++                var parameterTypeMapping = _typeMappingSource.FindMapping(parameter.Type, QueryCompilationContext.Model, elementTypeMapping)
++                    ?? throw new InvalidOperationException(
++                        $"No JSON collection type mapping for parameter '{parameter.Name}' of type {parameter.Type.Name} with element store type '{elementTypeMapping.StoreType}'.");
++
++                // Same COLUMNS clause MySqlQueryableMethodTranslatingExpressionVisitor.TranslatePrimitiveCollection
++                // emits when the element mapping is known up front (collection columns).
++                return jsonTable.Update(
++                    parameter.ApplyTypeMapping(parameterTypeMapping),
++                    jsonTable.Path,
++                    jsonTable.ColumnInfos ?? new[]
++                    {
++                        new MySqlJsonTableExpression.ColumnInfo
++                        {
++                            Name = "value",
++                            TypeMapping = elementTypeMapping,
++                            Path = new[] { new PathSegment(_sqlExpressionFactory.Constant(0, _typeMappingSource.FindMapping(typeof(int)))) },
++                        }
++                    });
++            }
++
++            return base.VisitExtension(expression);
++        }
++    }
++}
+diff --git a/src/EFCore.MySql/Storage/Internal/MySqlDoubleTypeMapping.cs b/src/EFCore.MySql/Storage/Internal/MySqlDoubleTypeMapping.cs
+index 793cefd..e0dfd83 100644
+--- a/src/EFCore.MySql/Storage/Internal/MySqlDoubleTypeMapping.cs
++++ b/src/EFCore.MySql/Storage/Internal/MySqlDoubleTypeMapping.cs
+@@ -2,6 +2,7 @@
+ // Licensed under the MIT. See LICENSE in the project root for license information.
+ 
+ using System.Data;
++using System.Globalization;
+ using System.Data.Common;
+ using JetBrains.Annotations;
+ using Microsoft.EntityFrameworkCore.Storage;
+@@ -54,6 +55,13 @@ protected override RelationalTypeMapping Clone(RelationalTypeMappingParameters p
+         ///     any release. You should only use it directly in your code with extreme caution and knowing that
+         ///     doing so can result in application failures when updating to a new Entity Framework Core release.
+         /// </summary>
++        // "100.0" is a DECIMAL literal to MySQL; "100E0" is a DOUBLE (see MySqlFloatTypeMapping).
++        protected override string GenerateNonNullSqlLiteral(object value)
++        {
++            var literal = ((double)value).ToString("R", CultureInfo.InvariantCulture);
++            return literal.Contains('E') || literal.Contains('e') ? literal : literal + "E0";
++        }
++
+         protected override void ConfigureParameter(DbParameter parameter)
+         {
+             base.ConfigureParameter(parameter);
+diff --git a/src/EFCore.MySql/Storage/Internal/MySqlFloatTypeMapping.cs b/src/EFCore.MySql/Storage/Internal/MySqlFloatTypeMapping.cs
+index 83fad6a..834a239 100644
+--- a/src/EFCore.MySql/Storage/Internal/MySqlFloatTypeMapping.cs
++++ b/src/EFCore.MySql/Storage/Internal/MySqlFloatTypeMapping.cs
+@@ -48,7 +48,14 @@ protected override RelationalTypeMapping Clone(RelationalTypeMappingParameters p
+         ///     This API supports the Entity Framework Core infrastructure and is not intended to be used
+         ///     directly from your code. This API may change or be removed in future releases.
+         /// </summary>
+-        protected override string GenerateNonNullSqlLiteral(object value) => ((float)value).ToString("R", CultureInfo.InvariantCulture);
++        // Always carry an exponent: a bare "100" is an integer literal to MySQL, so e.g.
++        // CASE WHEN .. THEN 100 ELSE 50 END comes back as BIGINT and GetFloat() throws
++        // (MEASURED: Jellyfin 12.1 search scoring). "100E0" is a DOUBLE literal.
++        protected override string GenerateNonNullSqlLiteral(object value)
++        {
++            var literal = ((float)value).ToString("R", CultureInfo.InvariantCulture);
++            return literal.Contains('E') || literal.Contains('e') ? literal : literal + "E0";
++        }
+         //=> $"CAST({base.GenerateNonNullSqlLiteral(value)} AS {StoreType})";
+ 
+         /// <summary>

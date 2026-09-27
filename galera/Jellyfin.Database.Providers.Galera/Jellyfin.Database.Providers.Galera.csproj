@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Jellyfin database provider for MySQL 8 / Percona XtraDB Cluster (Galera). Loaded by Jellyfin
+       through database.xml DatabaseType=PLUGIN_PROVIDER. Jellyfin 12.1 ships EF Core 10.0.11. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <RootNamespace>Jellyfin.Database.Providers.Galera</RootNamespace>
+    <!-- Directory with the Pomelo build (dotnet build src/EFCore.MySql -c Release -p:NuGetAudit=false). -->
+    <PomeloBin Condition="'$(PomeloBin)' == ''">$(HOME)/.cache/jellymesh-vendor/pomelo</PomeloBin>
+  </PropertyGroup>
+
+  <!-- Normal build: assemblies the Jellyfin server already loads are not copied into the plugin.
+       JmDesign=true (env var) build: include them so `dotnet ef migrations add` can run. -->
+  <PropertyGroup>
+    <HostAssets Condition="'$(JmDesign)' != 'true'">runtime</HostAssets>
+    <HostAssets Condition="'$(JmDesign)' == 'true'">none</HostAssets>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Jellyfin.Database.Implementations" Version="12.1.0" ExcludeAssets="$(HostAssets)" />
+    <PackageReference Include="Jellyfin.Common" Version="12.1.0" ExcludeAssets="$(HostAssets)" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.11" ExcludeAssets="$(HostAssets)" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.11" ExcludeAssets="$(HostAssets)" />
+    <!-- Shipped with the plugin: Pomelo built from PR #2047 (EF Core 10 support, not yet released;
+         sufficit/Pomelo.EntityFrameworkCore.MySql@upgrade/10.0.0 14a6e28) on MySqlConnector.
+         Oracle's MySql.EntityFrameworkCore 10.0.9 was dropped: it truncated indexed strings,
+         ignored prefix lengths/collations, wrote List<long>.ToString() into KeyframeTicks and
+         could not translate/bind array Contains (MEASURED). -->
+    <Reference Include="Pomelo.EntityFrameworkCore.MySql">
+      <HintPath>$(PomeloBin)/Pomelo.EntityFrameworkCore.MySql.dll</HintPath>
+    </Reference>
+    <PackageReference Include="MySqlConnector" Version="2.5.0" />
+    <!-- Design time only (dotnet ef migrations). -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.11" PrivateAssets="all" ExcludeAssets="$(HostAssets)" />
+  </ItemGroup>
+
+</Project>
