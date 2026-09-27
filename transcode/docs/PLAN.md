@@ -281,6 +281,16 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
       invariant every other fallback in this codebase relies on
 
 ### P5 Quality
+- [ ] On-the-fly Dolby Vision 7 -> 8.1 (Brian 2026-09-27): 124 of 329 movies are DV profile 7 (dual-layer BD
+      remuxes); TVs/streamers decode only single-layer DV (8.1/5), so Jellyfin strips them to HDR10 or
+      transcodes. Offline conversion with dovi_tool is proven (two titles converted and verified 2026-09-27)
+      but costs a second copy of each file. Instead, during a remux for a client that plays DV 8.1: drop the
+      enhancement layer and rewrite the RPUs to profile 8.1 in-stream (the `dolby_vision` Rust crate that
+      dovi_tool is built on, inside the agent, between demux and mux), and mark the output DV 8.1.
+      Two halves: (a) Jellyfin's decision (core patch: P7 is servable as 8.1 to a client that supports
+      DOVIWithHDR10) — owned by the jellyfin bug-hunt session, brief item 5; (b) the pool's execution
+      (agent/IR). MEL sources lose nothing visible; FEL sources lose the enhancement detail. Done when the
+      Bravia shows the Dolby Vision badge on a DV7 title with Direct Stream (remux) and no extra disk use.
 - [x] Baseline measured (P0, calibration/README.md): Arc delivers 16-22% of the cap, VMAF 87.1/87.5 @8M
       (h264/hevc); P4 94.8/93.2; Arc-vs-P4 gap 5.4-7.8 (a failover is visible). Calibrated settings
       measured Arc 93.5/97.6, P4 93.5/96.9, gap +0.04/+0.72
