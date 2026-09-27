@@ -34,6 +34,15 @@ public sealed class GaleraDatabaseProvider : IJellyfinDatabaseProvider
     {
         var connectionString = databaseConfiguration.CustomProviderOptions?.ConnectionString
             ?? throw new InvalidOperationException("database.xml must set CustomProviderOptions/ConnectionString for Jellyfin-Galera");
+
+        // The password can come from the environment (a Kubernetes Secret) instead of database.xml,
+        // which lives in the config directory and so in every backup of it.
+        var password = Environment.GetEnvironmentVariable("JELLYMESH_DB_PASSWORD");
+        if (!string.IsNullOrEmpty(password))
+        {
+            connectionString = new MySqlConnector.MySqlConnectionStringBuilder(connectionString) { Password = password }.ConnectionString;
+        }
+
         _logger.LogInformation("Galera provider: {Server}", RedactPassword(connectionString));
         // String lists bound as JSON_TABLE() compare against utf8mb4_bin columns (GaleraModelConvention).
         AppContext.SetData("Pomelo.EntityFrameworkCore.MySql.JsonTableStringCollation", GaleraModelConvention.Collation);

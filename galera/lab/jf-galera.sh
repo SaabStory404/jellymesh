@@ -62,6 +62,11 @@ EOF
       podman unshare chown -R 1000:1000 "$mplug"
       mesh_env=(-e JELLYMESH_REDIS="${JG_REDIS:-gl-redis:6379}" -e JELLYMESH_SHARED_DB=1 -e JELLYMESH_RESPONSE_CACHE="${JG_RC:-0}")
     fi
+    # JG_PW_ENV=1: the password is given as JELLYMESH_DB_PASSWORD only (strip it from database.xml)
+    if [ "${JG_PW_ENV:-0}" = 1 ]; then
+      podman unshare sed -i 's/;Pwd=jellyfin//' "$dir/database.xml"
+      mesh_env+=(-e JELLYMESH_DB_PASSWORD=jellyfin)
+    fi
     # JG_SHARED=1: patched fork's JELLYFIN_SHARED_DB (no per-node caches; coherent without a plugin)
     [ "${JG_SHARED:-0}" = 1 ] && mesh_env+=(-e JELLYFIN_SHARED_DB=1)
     overlay=()
