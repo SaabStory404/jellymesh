@@ -417,7 +417,7 @@ failover), silently marking a barely-watched item played and wiping a real resum
 three-way rule — use the client's position if given; otherwise fall back to this node's own
 last-checked-in position only if its session actually has a record for this exact item; otherwise
 leave `UserData` untouched rather than guess. The historical assume-played behaviour is kept only
-for the one case where this node recorded the Start for this item but genuinely never got any
+for the one case where this node recorded the Start for this item but never got any
 position at all (the DLNA "transport state only" case), without the double-increment. A fixup round
 gated the fallback on an explicit item match (the first pass read it unconditionally, which could
 apply a stale position left over from a different item on the same session) and added a regression
