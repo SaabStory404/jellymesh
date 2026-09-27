@@ -37,6 +37,16 @@ ships the image separately.
 `Jellyfin.Server.Tests` 20, `Jellyfin.Providers.Tests` 481. `build.sh` re-run end to end on a
 throwaway clone of the tree: all patches apply, build clean, 7 overlay assemblies produced.
 
+**Response parity** (MEASURED, the README's method): two SQLite lab nodes on private copies of the
+prepared real-library database (`galera/lab/jf-galera.sh up`, `JG_SQLITE`), one with the perf-only
+overlay (`BUGHUNT=0`), one with perf + `00`-`13`; overlay checksums confirmed inside each container.
+`galera/tools/parity_ab.py`: 14/14 calls **identical**. Three extra calls (Movies page of 100 and a
+movie detail with `Fields=MediaSources,MediaStreams`, the path patch 08 batches; `POST
+/Items/{id}/PlaybackInfo`, patch 13 unset) with `PlaySessionId` treated as volatile: 3/3
+**identical**. Resume and NextUp were empty on this library, so those two calls carry no coverage.
+The patches' behaviour changes sit behind runtime conditions a static sweep doesn't trigger (paused
+kill timer, failover Stop, stale web client, the DV flag); those are covered by the unit tests.
+
 ## Evidence labels
 
 - **MEASURED** — a command was run and its output is quoted or summarized.
