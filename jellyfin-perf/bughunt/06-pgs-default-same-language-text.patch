@@ -1,0 +1,254 @@
+diff --git a/Emby.Server.Implementations/Library/MediaStreamSelector.cs b/Emby.Server.Implementations/Library/MediaStreamSelector.cs
+index 631179ffc..b51d081c4 100644
+--- a/Emby.Server.Implementations/Library/MediaStreamSelector.cs
++++ b/Emby.Server.Implementations/Library/MediaStreamSelector.cs
+@@ -52,10 +52,16 @@ namespace Emby.Server.Implementations.Library
+ 
+             MediaStream? stream = null;
+ 
++            // For Default and Smart mode, the eligibility predicate below is also used to scope the
++            // same-language text-vs-image tie-break applied after the initial pick (see
++            // PreferSameLanguageTextSubtitle). Always and OnlyForced are left untouched.
++            Func<MediaStream, bool>? eligiblePredicate = null;
++
+             if (mode == SubtitlePlaybackMode.Default)
+             {
+                 // Load subtitles according to external, default and forced flags.
+-                stream = sortedStreams.FirstOrDefault(x => x.IsExternal || x.IsDefault || x.IsForced);
++                eligiblePredicate = x => x.IsExternal || x.IsDefault || x.IsForced;
++                stream = sortedStreams.FirstOrDefault(eligiblePredicate);
+             }
+             else if (mode == SubtitlePlaybackMode.Smart)
+             {
+@@ -64,7 +70,8 @@ namespace Emby.Server.Implementations.Library
+                 // If the audio language is one of the user's preferred subtitle languages behave like OnlyForced.
+                 if (!preferredLanguages.Contains(audioTrackLanguage, StringComparison.OrdinalIgnoreCase))
+                 {
+-                    stream = sortedStreams.FirstOrDefault(x => MatchesPreferredLanguage(x.Language, preferredLanguages));
++                    eligiblePredicate = x => MatchesPreferredLanguage(x.Language, preferredLanguages);
++                    stream = sortedStreams.FirstOrDefault(eligiblePredicate);
+                 }
+                 else
+                 {
+@@ -83,9 +90,38 @@ namespace Emby.Server.Implementations.Library
+                 stream = BehaviorOnlyForced(sortedStreams, preferredLanguages).FirstOrDefault();
+             }
+ 
++            if (eligiblePredicate is not null)
++            {
++                stream = PreferSameLanguageTextSubtitle(stream, sortedStreams, eligiblePredicate);
++            }
++
+             return stream?.Index;
+         }
+ 
++        /// <summary>
++        /// Among candidates that already satisfy the playback mode's own eligibility predicate (e.g. the
++        /// Default mode's external/default/forced check), prefers a text-based subtitle over an
++        /// image-based one (e.g. PGS/VobSub) when it shares the same language and forced flag as the
++        /// initially selected stream. This avoids forcing a burn-in transcode when a same-language text
++        /// alternative to a disposition-flagged image subtitle exists, without letting a
++        /// different-language, differently-forced, or otherwise-ineligible text track outrank the
++        /// selection the mode's own rules already produced.
++        /// </summary>
++        private static MediaStream? PreferSameLanguageTextSubtitle(MediaStream? candidate, IEnumerable<MediaStream> sortedStreams, Func<MediaStream, bool> eligiblePredicate)
++        {
++            if (candidate is null || candidate.IsTextSubtitleStream)
++            {
++                return candidate;
++            }
++
++            return sortedStreams.FirstOrDefault(x =>
++                eligiblePredicate(x)
++                && x.IsTextSubtitleStream
++                && x.IsForced == candidate.IsForced
++                && string.Equals(x.Language, candidate.Language, StringComparison.OrdinalIgnoreCase))
++                ?? candidate;
++        }
++
+         private static IEnumerable<MediaStream> GetSortedStreams(IEnumerable<MediaStream> streams, MediaStreamType type, IReadOnlyList<string> languagePreferences)
+         {
+             // Give some preference to external text subs for better performance
+@@ -134,7 +170,11 @@ namespace Emby.Server.Implementations.Library
+             {
+                 // Always load (full/non-forced) subtitles of the user's preferred subtitle language if possible, otherwise OnlyForced behavior.
+                 filteredStreams = sortedStreams.Where(s => !s.IsForced && MatchesPreferredLanguage(s.Language, preferredLanguages))
+-                    .ToList() ?? BehaviorOnlyForced(sortedStreams, preferredLanguages);
++                    .ToList();
++                if (filteredStreams.Count == 0)
++                {
++                    filteredStreams = BehaviorOnlyForced(sortedStreams, preferredLanguages);
++                }
+             }
+             else if (mode == SubtitlePlaybackMode.OnlyForced)
+             {
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Library/MediaStreamSelectorTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Library/MediaStreamSelectorTests.cs
+index 07feae587..3dbb49195 100644
+--- a/tests/Jellyfin.Server.Implementations.Tests/Library/MediaStreamSelectorTests.cs
++++ b/tests/Jellyfin.Server.Implementations.Tests/Library/MediaStreamSelectorTests.cs
+@@ -1,5 +1,7 @@
+ using System;
++using System.Collections.Generic;
+ using Emby.Server.Implementations.Library;
++using Jellyfin.Database.Implementations.Enums;
+ using MediaBrowser.Model.Entities;
+ using Xunit;
+ 
+@@ -7,6 +9,157 @@ namespace Jellyfin.Server.Implementations.Tests.Library;
+ 
+ public class MediaStreamSelectorTests
+ {
++    private static MediaStream Subtitle(int index, string codec, string language, bool isDefault = false, bool isForced = false, bool isExternal = false)
++    {
++        return new MediaStream
++        {
++            Index = index,
++            Type = MediaStreamType.Subtitle,
++            Codec = codec,
++            Language = language,
++            IsDefault = isDefault,
++            IsForced = isForced,
++            IsExternal = isExternal
++        };
++    }
++
++    // Regression coverage for the PGS-vs-text default-subtitle tie-break: among embedded
++    // subtitle candidates that already satisfy the playback mode's own predicate and share a
++    // language, a text-based track (e.g. subrip) is preferred over an image-based one (e.g.
++    // pgssub) so the server doesn't force a burn-in transcode when a same-language text
++    // alternative is available. See MediaStreamSelector.PreferSameLanguageTextSubtitle.
++    [Fact]
++    public void GetDefaultSubtitleStreamIndex_Default_SameLanguageBothDefault_PrefersText()
++    {
++        var streams = new[]
++        {
++            Subtitle(0, "pgssub", "eng", isDefault: true),
++            Subtitle(1, "subrip", "eng", isDefault: true)
++        };
++
++        var result = MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, Array.Empty<string>(), SubtitlePlaybackMode.Default, "eng");
++
++        Assert.Equal(1, result);
++    }
++
++    // Negative: the task's Default-mode eligibility predicate is IsExternal || IsDefault || IsForced.
++    // A same-language text track that satisfies none of those is not an eligible candidate, so it must
++    // not be promoted over the disposition-flagged PGS default (this differs from a naive "always
++    // prefer text" fix, which would over-reach beyond the mode's own selection rules).
++    [Fact]
++    public void GetDefaultSubtitleStreamIndex_Default_NonEligibleSameLanguageText_KeepsPgsDefault()
++    {
++        var streams = new[]
++        {
++            Subtitle(0, "pgssub", "eng", isDefault: true),
++            Subtitle(1, "subrip", "eng", isDefault: false)
++        };
++
++        var result = MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, Array.Empty<string>(), SubtitlePlaybackMode.Default, "eng");
++
++        Assert.Equal(0, result);
++    }
++
++    // The companion case from the finder's test plan: under Smart mode with the audio language not
++    // among the user's preferred subtitle languages, a same-language non-default text track is still
++    // an eligible candidate (the Smart predicate only checks language, not IsDefault), so it wins the
++    // tie-break over the disposition-flagged PGS default.
++    [Fact]
++    public void GetDefaultSubtitleStreamIndex_Smart_SameLanguagePgsDefaultVsTextNonDefault_PrefersText()
++    {
++        var streams = new[]
++        {
++            Subtitle(0, "pgssub", "eng", isDefault: true),
++            Subtitle(1, "subrip", "eng", isDefault: false)
++        };
++
++        var result = MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, new[] { "eng" }, SubtitlePlaybackMode.Smart, "jpn");
++
++        Assert.Equal(1, result);
++    }
++
++    // Mandatory negative test: a text track in a different language than the PGS default must never
++    // outrank it, in either Default or Smart mode.
++    [Theory]
++    [InlineData(SubtitlePlaybackMode.Default)]
++    [InlineData(SubtitlePlaybackMode.Smart)]
++    public void GetDefaultSubtitleStreamIndex_DifferentLanguageText_DoesNotOutrankPgsDefault(SubtitlePlaybackMode mode)
++    {
++        var streams = new[]
++        {
++            Subtitle(0, "pgssub", "eng", isDefault: true),
++            Subtitle(1, "subrip", "fre", isDefault: true)
++        };
++
++        var result = MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, new[] { "eng" }, mode, "jpn");
++
++        Assert.Equal(0, result);
++    }
++
++    // A wildcard (empty) preferred-language list makes every candidate "match" for sorting purposes;
++    // the tie-break must still be scoped to the same language as the selected PGS stream rather than
++    // blindly promoting the first text stream it finds.
++    [Fact]
++    public void GetDefaultSubtitleStreamIndex_WildcardPreferredLanguages_DoesNotPromoteDifferentLanguageText()
++    {
++        var streams = new[]
++        {
++            Subtitle(0, "pgssub", "eng", isDefault: true),
++            Subtitle(1, "subrip", "fre", isDefault: true)
++        };
++
++        var result = MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, Array.Empty<string>(), SubtitlePlaybackMode.Default, "jpn");
++
++        Assert.Equal(0, result);
++    }
++
++    // A forced same-language text alternative must not be swapped in for a full (non-forced) PGS
++    // default: forced tracks are typically partial (foreign-dialogue-only) and are not a substitute
++    // for the full subtitle track the disposition flag selected.
++    [Fact]
++    public void GetDefaultSubtitleStreamIndex_ForcedSameLanguageText_DoesNotOutrankFullPgsDefault()
++    {
++        var streams = new[]
++        {
++            Subtitle(0, "pgssub", "eng", isDefault: true),
++            Subtitle(1, "subrip", "eng", isForced: true)
++        };
++
++        var result = MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, Array.Empty<string>(), SubtitlePlaybackMode.Default, "eng");
++
++        Assert.Equal(0, result);
++    }
++
++    // Single-candidate titles (the vast majority) must be unaffected by the tie-break.
++    [Fact]
++    public void GetDefaultSubtitleStreamIndex_SingleCandidate_Unchanged()
++    {
++        var streams = new[]
++        {
++            Subtitle(0, "pgssub", "eng", isDefault: true)
++        };
++
++        var result = MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, Array.Empty<string>(), SubtitlePlaybackMode.Default, "eng");
++
++        Assert.Equal(0, result);
++    }
++
++    // Regression test for the dead OnlyForced fallback in the Always branch of SetSubtitleStreamScores:
++    // `.ToList() ?? BehaviorOnlyForced(...)` can never take the fallback because ToList() never
++    // returns null, so a forced-only preferred-language stream was left with an unset Score.
++    [Fact]
++    public void SetSubtitleStreamScores_AlwaysMode_NoNonForcedPreferredLanguageStream_ScoresForcedFallback()
++    {
++        var streams = new List<MediaStream>
++        {
++            Subtitle(0, "subrip", "eng", isForced: true)
++        };
++
++        MediaStreamSelector.SetSubtitleStreamScores(streams, new[] { "eng" }, SubtitlePlaybackMode.Always, "jpn");
++
++        Assert.NotNull(streams[0].Score);
++    }
++
+     [Theory]
+     [InlineData(true)]
+     [InlineData(false)]

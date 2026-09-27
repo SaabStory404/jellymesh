@@ -1,0 +1,272 @@
+diff --git a/Jellyfin.Api/Controllers/DynamicHlsController.cs b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+index 034a9dea5..422ab73a6 100644
+--- a/Jellyfin.Api/Controllers/DynamicHlsController.cs
++++ b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+@@ -1501,6 +1501,36 @@ public class DynamicHlsController : BaseJellyfinApiController
+                     var currentJob = _transcodeManager.GetTranscodingJob(playlistPath, TranscodingJobType);
+                     await WaitForActiveTranscodingRequests(currentJob, cancellationToken).ConfigureAwait(false);
+ 
++                    // No job is tracked on this node for this playlist. In a deployment where
++                    // several nodes share one transcode directory (see JellyMesh's shared-mode
++                    // perf patch), that does not necessarily mean nobody is producing this
++                    // stream: it may be owned by another node, or by a job on this node that is
++                    // mid-teardown. GetCurrentTranscodingIndex cannot see that -- it only
++                    // consults the local job list -- so relying on it here would start a second
++                    // ffmpeg against the same shared output path as a still-live peer. A
++                    // recently-written segment file for this exact playlist is the only signal
++                    // that crosses the node boundary, so use it to tell "someone is actively
++                    // producing this" apart from "nothing is, so self-heal by starting fresh".
++                    if (currentJob is null)
++                    {
++                        var lastForeignFile = GetLastTranscodingFile(playlistPath, segmentExtension, _fileSystem);
++                        var lastForeignWriteUtc = lastForeignFile is null ? (DateTime?)null : _fileSystem.GetLastWriteTimeUtc(lastForeignFile);
++                        var writerFreshnessWindow = TimeSpan.FromSeconds(Math.Max(state.SegmentLength * 2, 10));
++
++                        if (ShouldWaitForOtherWriter(lastForeignWriteUtc, DateTime.UtcNow, writerFreshnessWindow))
++                        {
++                            var nextSegmentPath = GetSegmentPath(state, playlistPath, segmentId + 1);
++                            var waitForOtherWriterTimeout = TimeSpan.FromSeconds(Math.Max(state.SegmentLength * 3, 15));
++                            if (await WaitForSegmentFromOtherWriter(segmentPath, nextSegmentPath, waitForOtherWriterTimeout, cancellationToken).ConfigureAwait(false))
++                            {
++                                _logger.LogDebug("returning {0} [produced by an active transcode elsewhere on the shared output path]", segmentPath);
++                                return await GetSegmentResult(state, playlistPath, segmentPath, segmentExtension, segmentId, null, cancellationToken).ConfigureAwait(false);
++                            }
++
++                            _logger.LogDebug("No active writer found for {0} after waiting; starting a new transcode", playlistPath);
++                        }
++                    }
++
+                     await _transcodeManager.KillTranscodingJobs(streamingRequest.DeviceId, streamingRequest.PlaySessionId, p => false)
+                         .ConfigureAwait(false);
+ 
+@@ -1551,6 +1581,51 @@ public class DynamicHlsController : BaseJellyfinApiController
+         }
+     }
+ 
++    /// <summary>
++    /// Decides whether a request that found no transcoding job tracked on this node for a
++    /// playlist should wait for the requested segment instead of starting a brand new ffmpeg
++    /// process. A local job is authoritative when one exists; when it does not, the only
++    /// signal that can cross a node boundary in a deployment where several nodes share one
++    /// transcode directory is the directory itself. A segment file for this playlist written
++    /// very recently means some process -- possibly on another node -- is actively producing
++    /// this stream right now, so starting a second ffmpeg against the same output path would
++    /// race it. A stale file, or no file at all, means nothing is producing this stream, so
++    /// starting fresh is the correct and necessary recovery.
++    /// </summary>
++    /// <param name="lastSegmentWriteTimeUtc">The last-write time of the most recent segment file for this playlist, if any exists.</param>
++    /// <param name="utcNow">The current time.</param>
++    /// <param name="maxWriterAge">How recent that write must be to be treated as an active writer.</param>
++    /// <returns><c>true</c> if the request should wait for the segment instead of starting a new transcode.</returns>
++    internal static bool ShouldWaitForOtherWriter(DateTime? lastSegmentWriteTimeUtc, DateTime utcNow, TimeSpan maxWriterAge)
++    {
++        return lastSegmentWriteTimeUtc.HasValue && (utcNow - lastSegmentWriteTimeUtc.Value) <= maxWriterAge;
++    }
++
++    /// <summary>
++    /// Polls for a segment believed to be produced by a transcode this node is not tracking
++    /// (e.g. owned by another node sharing the same transcode directory). Mirrors the
++    /// readiness check <see cref="GetSegmentResult(StreamState, string, string, string, int, TranscodingJob?, CancellationToken)"/>
++    /// already uses when it does hold a job: a segment is only considered ready once the
++    /// *next* segment has also appeared, since some encoders write a segment's file in place
++    /// (no <c>temp_file</c> flag) and it can be visible as existing on disk before it is
++    /// complete.
++    /// </summary>
++    internal static async Task<bool> WaitForSegmentFromOtherWriter(string segmentPath, string nextSegmentPath, TimeSpan timeout, CancellationToken cancellationToken)
++    {
++        var deadline = DateTime.UtcNow + timeout;
++        while (!(System.IO.File.Exists(segmentPath) && System.IO.File.Exists(nextSegmentPath)))
++        {
++            if (DateTime.UtcNow >= deadline)
++            {
++                return false;
++            }
++
++            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
++        }
++
++        return true;
++    }
++
+     private static double[] GetSegmentLengths(StreamState state)
+         => GetSegmentLengthsInternal(state.RunTimeTicks ?? 0, state.SegmentLength);
+ 
+diff --git a/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerTests.cs b/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerTests.cs
+index 5f5f273f1..626e82c98 100644
+--- a/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerTests.cs
++++ b/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerTests.cs
+@@ -1,4 +1,5 @@
+ using System;
++using System.IO;
+ using System.Threading;
+ using System.Threading.Tasks;
+ using Jellyfin.Api.Controllers;
+@@ -117,5 +118,168 @@ namespace Jellyfin.Api.Tests.Controllers
+ 
+             Assert.Equal(0, job.ActiveRequestCount);
+         }
++
++        [Fact]
++        public void ShouldWaitForOtherWriter_NoFile_ReturnsFalse()
++        {
++            var utcNow = new DateTime(2026, 9, 27, 12, 0, 0, DateTimeKind.Utc);
++
++            Assert.False(DynamicHlsController.ShouldWaitForOtherWriter(null, utcNow, TimeSpan.FromSeconds(6)));
++        }
++
++        [Fact]
++        public void ShouldWaitForOtherWriter_RecentFile_ReturnsTrue()
++        {
++            var utcNow = new DateTime(2026, 9, 27, 12, 0, 0, DateTimeKind.Utc);
++            var lastWrite = utcNow - TimeSpan.FromSeconds(3);
++
++            Assert.True(DynamicHlsController.ShouldWaitForOtherWriter(lastWrite, utcNow, TimeSpan.FromSeconds(6)));
++        }
++
++        [Fact]
++        public void ShouldWaitForOtherWriter_StaleFile_ReturnsFalse()
++        {
++            var utcNow = new DateTime(2026, 9, 27, 12, 0, 0, DateTimeKind.Utc);
++            var lastWrite = utcNow - TimeSpan.FromSeconds(30);
++
++            Assert.False(DynamicHlsController.ShouldWaitForOtherWriter(lastWrite, utcNow, TimeSpan.FromSeconds(6)));
++        }
++
++        [Fact]
++        public void ShouldWaitForOtherWriter_ExactlyAtMaxAge_ReturnsTrue()
++        {
++            var utcNow = new DateTime(2026, 9, 27, 12, 0, 0, DateTimeKind.Utc);
++            var maxAge = TimeSpan.FromSeconds(6);
++            var lastWrite = utcNow - maxAge;
++
++            Assert.True(DynamicHlsController.ShouldWaitForOtherWriter(lastWrite, utcNow, maxAge));
++        }
++
++        [Fact]
++        public async Task WaitForSegmentFromOtherWriter_ReturnsTrueImmediately_WhenBothFilesAlreadyExist()
++        {
++            var dir = Directory.CreateTempSubdirectory(nameof(WaitForSegmentFromOtherWriter_ReturnsTrueImmediately_WhenBothFilesAlreadyExist));
++            try
++            {
++                var segmentPath = Path.Combine(dir.FullName, "seg5.ts");
++                var nextSegmentPath = Path.Combine(dir.FullName, "seg6.ts");
++                await File.WriteAllBytesAsync(segmentPath, Array.Empty<byte>(), TestContext.Current.CancellationToken);
++                await File.WriteAllBytesAsync(nextSegmentPath, Array.Empty<byte>(), TestContext.Current.CancellationToken);
++
++                var result = await DynamicHlsController.WaitForSegmentFromOtherWriter(
++                    segmentPath,
++                    nextSegmentPath,
++                    TimeSpan.FromSeconds(5),
++                    TestContext.Current.CancellationToken);
++
++                Assert.True(result);
++            }
++            finally
++            {
++                dir.Delete(true);
++            }
++        }
++
++        [Fact]
++        public async Task WaitForSegmentFromOtherWriter_ReturnsFalse_WhenFilesNeverAppear()
++        {
++            var dir = Directory.CreateTempSubdirectory(nameof(WaitForSegmentFromOtherWriter_ReturnsFalse_WhenFilesNeverAppear));
++            try
++            {
++                var segmentPath = Path.Combine(dir.FullName, "seg5.ts");
++                var nextSegmentPath = Path.Combine(dir.FullName, "seg6.ts");
++
++                var result = await DynamicHlsController.WaitForSegmentFromOtherWriter(
++                    segmentPath,
++                    nextSegmentPath,
++                    TimeSpan.FromMilliseconds(250),
++                    TestContext.Current.CancellationToken);
++
++                Assert.False(result);
++            }
++            finally
++            {
++                dir.Delete(true);
++            }
++        }
++
++        [Fact]
++        public async Task WaitForSegmentFromOtherWriter_ReturnsFalse_WhenOnlyNextSegmentIsMissing()
++        {
++            var dir = Directory.CreateTempSubdirectory(nameof(WaitForSegmentFromOtherWriter_ReturnsFalse_WhenOnlyNextSegmentIsMissing));
++            try
++            {
++                var segmentPath = Path.Combine(dir.FullName, "seg5.ts");
++                var nextSegmentPath = Path.Combine(dir.FullName, "seg6.ts");
++                await File.WriteAllBytesAsync(segmentPath, Array.Empty<byte>(), TestContext.Current.CancellationToken);
++
++                var result = await DynamicHlsController.WaitForSegmentFromOtherWriter(
++                    segmentPath,
++                    nextSegmentPath,
++                    TimeSpan.FromMilliseconds(250),
++                    TestContext.Current.CancellationToken);
++
++                Assert.False(result);
++            }
++            finally
++            {
++                dir.Delete(true);
++            }
++        }
++
++        [Fact]
++        public async Task WaitForSegmentFromOtherWriter_ReturnsTrue_WhenBothFilesAppearWhileWaiting()
++        {
++            var dir = Directory.CreateTempSubdirectory(nameof(WaitForSegmentFromOtherWriter_ReturnsTrue_WhenBothFilesAppearWhileWaiting));
++            try
++            {
++                var segmentPath = Path.Combine(dir.FullName, "seg5.ts");
++                var nextSegmentPath = Path.Combine(dir.FullName, "seg6.ts");
++
++                var waitTask = DynamicHlsController.WaitForSegmentFromOtherWriter(
++                    segmentPath,
++                    nextSegmentPath,
++                    TimeSpan.FromSeconds(5),
++                    TestContext.Current.CancellationToken);
++
++                await Task.Delay(150, TestContext.Current.CancellationToken);
++                Assert.False(waitTask.IsCompleted);
++
++                await File.WriteAllBytesAsync(segmentPath, Array.Empty<byte>(), TestContext.Current.CancellationToken);
++                await File.WriteAllBytesAsync(nextSegmentPath, Array.Empty<byte>(), TestContext.Current.CancellationToken);
++
++                var result = await waitTask;
++                Assert.True(result);
++            }
++            finally
++            {
++                dir.Delete(true);
++            }
++        }
++
++        [Fact]
++        public async Task WaitForSegmentFromOtherWriter_ObservesCancellation()
++        {
++            var dir = Directory.CreateTempSubdirectory(nameof(WaitForSegmentFromOtherWriter_ObservesCancellation));
++            try
++            {
++                var segmentPath = Path.Combine(dir.FullName, "seg5.ts");
++                var nextSegmentPath = Path.Combine(dir.FullName, "seg6.ts");
++                using var cancellationTokenSource = new CancellationTokenSource();
++
++                var waitTask = DynamicHlsController.WaitForSegmentFromOtherWriter(
++                    segmentPath,
++                    nextSegmentPath,
++                    TimeSpan.FromSeconds(5),
++                    cancellationTokenSource.Token);
++                await cancellationTokenSource.CancelAsync();
++
++                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waitTask);
++            }
++            finally
++            {
++                dir.Delete(true);
++            }
++        }
+     }
+ }

@@ -1,0 +1,352 @@
+diff --git a/Emby.Server.Implementations/Session/SessionManager.cs b/Emby.Server.Implementations/Session/SessionManager.cs
+index bf0061ef0..15b88aef5 100644
+--- a/Emby.Server.Implementations/Session/SessionManager.cs
++++ b/Emby.Server.Implementations/Session/SessionManager.cs
+@@ -1141,6 +1141,27 @@ namespace Emby.Server.Implementations.Session
+ 
+             session.PlaylistItemId = info.PlaylistItemId;
+ 
++            // Capture, before RemoveNowPlayingItem() below clears session state, whether this node's
++            // in-memory session already knew it was playing this exact item (i.e. this node handled a
++            // prior Start/Progress report for the play session) and the last position it heard about
++            // via automatic progress check-ins. In an HA deployment behind a shared DB, a Stop can
++            // land on a node that never saw the matching Start (e.g. after a failover); in that case
++            // NowPlayingItem won't match and there is no check-in position to fall back on, so we must
++            // not guess at a position or completion state.
++            //
++            // LastPlaybackCheckInPositionTicks is never cleared by StopAutomaticProgress() or
++            // RemoveNowPlayingItem(), so it can be stale leftover data from an earlier, different item
++            // this same in-memory session last checked in on. Only trust it as a fallback for the item
++            // actually being stopped when sessionHasPlaybackRecord confirms this node's session state
++            // matches that exact item; otherwise it must not be used.
++            var nowPlayingItem = session.NowPlayingItem;
++            var sessionHasPlaybackRecord = !info.ItemId.IsEmpty()
++                && nowPlayingItem is not null
++                && info.ItemId.Equals(nowPlayingItem.Id);
++            var fallbackPositionTicks = sessionHasPlaybackRecord
++                ? session.LastPlaybackCheckInPositionTicks
++                : (long?)null;
++
+             RemoveNowPlayingItem(session);
+ 
+             var users = GetUsers(session);
+@@ -1149,9 +1170,10 @@ namespace Emby.Server.Implementations.Session
+             if (libraryItem is not null)
+             {
+                 var progressItem = GetProgressItem(libraryItem, info.MediaSourceId);
++                var resolvedPositionTicks = info.PositionTicks ?? fallbackPositionTicks;
+                 foreach (var user in users)
+                 {
+-                    playedToCompletion = OnPlaybackStopped(user, progressItem, info.PositionTicks, info.Failed);
++                    playedToCompletion = OnPlaybackStopped(user, progressItem, resolvedPositionTicks, info.Failed, sessionHasPlaybackRecord);
+                 }
+             }
+ 
+@@ -1180,7 +1202,7 @@ namespace Emby.Server.Implementations.Session
+             EventHelper.QueueEventIfNotNull(PlaybackStopped, this, eventArgs, _logger);
+         }
+ 
+-        private bool OnPlaybackStopped(User user, BaseItem item, long? positionTicks, bool playbackFailed)
++        private bool OnPlaybackStopped(User user, BaseItem item, long? positionTicks, bool playbackFailed, bool sessionHasPlaybackRecord)
+         {
+             if (playbackFailed)
+             {
+@@ -1193,14 +1215,25 @@ namespace Emby.Server.Implementations.Session
+             {
+                 playedToCompletion = _userDataManager.UpdatePlayState(item, data, positionTicks.Value);
+             }
+-            else
++            else if (sessionHasPlaybackRecord)
+             {
+-                // If the client isn't able to report this, then we'll just have to make an assumption
+-                data.PlayCount++;
++                // This node tracked the play session from its Start, but neither the client nor this
++                // node's automatic progress check-ins ever carried a position (e.g. some DLNA-style
++                // renderers only ever report transport state, never position). There is no position to
++                // reason about, so fall back to the historical assumption that a Stop following a known
++                // Start on this node means the item played through.
+                 data.Played = item.SupportsPlayedStatus;
+                 data.PlaybackPositionTicks = 0;
+                 playedToCompletion = true;
+             }
++            else
++            {
++                // Neither the client nor this node's session state has any position or playback record
++                // for this session (e.g. a Stop reaching an HA node that never saw the matching
++                // Start/Progress after a failover). We don't know whether -- or how far -- playback
++                // progressed here, so leave the persisted UserData exactly as it is rather than guessing.
++                return false;
++            }
+ 
+             _userDataManager.SaveUserData(user, item, data, UserDataSaveReason.PlaybackFinished, CancellationToken.None);
+ 
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/SessionManager/SessionManagerPlaybackStoppedTests.cs b/tests/Jellyfin.Server.Implementations.Tests/SessionManager/SessionManagerPlaybackStoppedTests.cs
+new file mode 100644
+index 000000000..e9b094a28
+--- /dev/null
++++ b/tests/Jellyfin.Server.Implementations.Tests/SessionManager/SessionManagerPlaybackStoppedTests.cs
+@@ -0,0 +1,264 @@
++using System;
++using System.Threading;
++using System.Threading.Tasks;
++using Jellyfin.Data;
++using Jellyfin.Database.Implementations.Entities;
++using Jellyfin.Database.Implementations.Enums;
++using MediaBrowser.Controller;
++using MediaBrowser.Controller.Configuration;
++using MediaBrowser.Controller.Devices;
++using MediaBrowser.Controller.Drawing;
++using MediaBrowser.Controller.Dto;
++using MediaBrowser.Controller.Entities;
++using MediaBrowser.Controller.Events;
++using MediaBrowser.Controller.Library;
++using MediaBrowser.Controller.Session;
++using MediaBrowser.Model.Dto;
++using MediaBrowser.Model.Entities;
++using MediaBrowser.Model.Session;
++using Microsoft.Extensions.Hosting;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.Server.Implementations.Tests.SessionManager;
++
++/// <summary>
++/// Regression tests for <see cref="Emby.Server.Implementations.Session.SessionManager.OnPlaybackStopped(MediaBrowser.Model.Session.PlaybackStopInfo)"/>
++/// handling of a Stop report that carries no <c>PositionTicks</c> (the client omitted it, or an
++/// HA node received it without ever having seen the matching Start/Progress for this session).
++/// </summary>
++public class SessionManagerPlaybackStoppedTests
++{
++    [Fact]
++    public async Task OnPlaybackStopped_NoPosition_UsesSessionCheckInPositionAsFallback()
++    {
++        const long FallbackPositionTicks = 500_000_000; // ~5% of the runtime below, well under MaxResumePct.
++        var itemId = Guid.NewGuid();
++        var item = new Video { Id = itemId, RunTimeTicks = 10_000_000_000 };
++        var user = new User("test-user", "default", "default");
++
++        long? capturedPositionTicks = null;
++        UserItemData? savedData = null;
++
++        var userDataManager = new Mock<IUserDataManager>();
++        var trackedData = new UserItemData { Key = "test-key", PlaybackPositionTicks = 0, Played = false };
++        userDataManager.Setup(m => m.GetUserData(user, item)).Returns(trackedData);
++        userDataManager
++            .Setup(m => m.UpdatePlayState(item, trackedData, It.IsAny<long?>()))
++            .Callback<BaseItem, UserItemData, long?>((_, data, positionTicks) =>
++            {
++                capturedPositionTicks = positionTicks;
++
++                // Stand-in for the real resume-percentage logic (covered by UserDataManagerTests):
++                // a small fraction of the runtime is neither "played" nor discarded to zero.
++                data.PlaybackPositionTicks = positionTicks ?? 0;
++                data.Played = false;
++            })
++            .Returns(false);
++        userDataManager
++            .Setup(m => m.SaveUserData(user, item, trackedData, UserDataSaveReason.PlaybackFinished, It.IsAny<CancellationToken>()))
++            .Callback<User, BaseItem, UserItemData, UserDataSaveReason, CancellationToken>((_, _, data, _, _) => savedData = data);
++
++        var libraryManager = new Mock<ILibraryManager>();
++        libraryManager.Setup(m => m.GetItemById(itemId)).Returns(item);
++
++        var userManager = new Mock<IUserManager>();
++        userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
++
++        await using var sessionManager = CreateSessionManager(userDataManager.Object, libraryManager.Object, userManager.Object);
++
++        var session = await sessionManager.LogSessionActivity("Test Client", "1.0.0", "test-device", "Test Device", "127.0.0.1", user);
++
++        // This node saw the Start/Progress for this exact item and recorded a real check-in position.
++        session.NowPlayingItem = new BaseItemDto { Id = itemId };
++        session.StartAutomaticProgress(new PlaybackProgressInfo { PositionTicks = FallbackPositionTicks });
++
++        await sessionManager.OnPlaybackStopped(new PlaybackStopInfo
++        {
++            SessionId = session.Id,
++            ItemId = itemId,
++            Item = new BaseItemDto { Id = itemId },
++            PositionTicks = null
++        });
++
++        Assert.Equal(FallbackPositionTicks, capturedPositionTicks);
++        userDataManager.Verify(m => m.SaveUserData(user, item, trackedData, UserDataSaveReason.PlaybackFinished, It.IsAny<CancellationToken>()), Times.Once);
++        Assert.NotNull(savedData);
++        Assert.False(savedData.Played);
++        Assert.Equal(FallbackPositionTicks, savedData.PlaybackPositionTicks);
++    }
++
++    [Fact]
++    public async Task OnPlaybackStopped_NoPosition_SessionSawStart_NoCheckInEver_StillMarksPlayed()
++    {
++        // "MUST keep" rule: a client that legitimately never reports a position at all (e.g. some
++        // DLNA-style renderers that only report transport state) still ends up Played=true when it
++        // played through, as long as this node's session recorded the Start for this exact item.
++        var itemId = Guid.NewGuid();
++        var item = new Video { Id = itemId, RunTimeTicks = 10_000_000_000 };
++        var user = new User("test-user", "default", "default");
++
++        var trackedData = new UserItemData { Key = "test-key", PlaybackPositionTicks = 0, Played = false };
++        UserItemData? savedData = null;
++
++        var userDataManager = new Mock<IUserDataManager>();
++        userDataManager.Setup(m => m.GetUserData(user, item)).Returns(trackedData);
++        userDataManager
++            .Setup(m => m.SaveUserData(user, item, trackedData, UserDataSaveReason.PlaybackFinished, It.IsAny<CancellationToken>()))
++            .Callback<User, BaseItem, UserItemData, UserDataSaveReason, CancellationToken>((_, _, data, _, _) => savedData = data);
++
++        var libraryManager = new Mock<ILibraryManager>();
++        libraryManager.Setup(m => m.GetItemById(itemId)).Returns(item);
++        // Video.PropagatePlayedState (invoked once data.Played is set true) consults the static
++        // BaseItem.LibraryManager to check for alternate versions; save/restore it like the
++        // BaseItem/Video tests do, so this doesn't leak into other tests in the assembly.
++        libraryManager.Setup(m => m.GetLocalAlternateVersionIds(It.IsAny<Video>())).Returns(Array.Empty<Guid>());
++
++        var userManager = new Mock<IUserManager>();
++        userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
++
++        await using var sessionManager = CreateSessionManager(userDataManager.Object, libraryManager.Object, userManager.Object);
++
++        var session = await sessionManager.LogSessionActivity("Test Client", "1.0.0", "test-device", "Test Device", "127.0.0.1", user);
++
++        // This node saw the Start for this exact item (NowPlayingItem is set), but no Start or
++        // Progress report from the client ever carried a position, so there is no check-in fallback.
++        session.NowPlayingItem = new BaseItemDto { Id = itemId };
++
++        var previousLibraryManager = BaseItem.LibraryManager;
++        try
++        {
++            BaseItem.LibraryManager = libraryManager.Object;
++
++            await sessionManager.OnPlaybackStopped(new PlaybackStopInfo
++            {
++                SessionId = session.Id,
++                ItemId = itemId,
++                Item = new BaseItemDto { Id = itemId },
++                PositionTicks = null
++            });
++        }
++        finally
++        {
++            BaseItem.LibraryManager = previousLibraryManager;
++        }
++
++        userDataManager.Verify(m => m.UpdatePlayState(It.IsAny<BaseItem>(), It.IsAny<UserItemData>(), It.IsAny<long?>()), Times.Never);
++        userDataManager.Verify(m => m.SaveUserData(user, item, trackedData, UserDataSaveReason.PlaybackFinished, It.IsAny<CancellationToken>()), Times.Once);
++        Assert.NotNull(savedData);
++        Assert.True(savedData.Played);
++        Assert.Equal(0, savedData.PlaybackPositionTicks);
++
++        // OnPlaybackStart already incremented PlayCount once for this play session; the no-position
++        // completion shortcut must not increment it again.
++        Assert.Equal(0, savedData.PlayCount);
++    }
++
++    [Fact]
++    public async Task OnPlaybackStopped_NoPosition_StaleCheckInFromEarlierItem_LeavesUserDataUntouched()
++    {
++        // Regression for a stale-fallback bug: LastPlaybackCheckInPositionTicks is never cleared by
++        // StopAutomaticProgress() or RemoveNowPlayingItem(), so it can still hold a check-in position
++        // left over from an earlier or different item this same in-memory session last reported on.
++        // This node's session has no record of the item actually being stopped here (NowPlayingItem
++        // never matched it), so that stale position must never be applied to it -- UserData must be
++        // left completely untouched, exactly as in the "no record at all" case.
++        var itemId = Guid.NewGuid();
++        var item = new Video { Id = itemId, RunTimeTicks = 10_000_000_000 };
++        var user = new User("test-user", "default", "default");
++
++        var userDataManager = new Mock<IUserDataManager>();
++        userDataManager.Setup(m => m.GetUserData(user, item)).Returns(new UserItemData { Key = "test-key" });
++
++        var libraryManager = new Mock<ILibraryManager>();
++        libraryManager.Setup(m => m.GetItemById(itemId)).Returns(item);
++
++        var userManager = new Mock<IUserManager>();
++        userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
++
++        await using var sessionManager = CreateSessionManager(userDataManager.Object, libraryManager.Object, userManager.Object);
++
++        var session = await sessionManager.LogSessionActivity("Test Client", "1.0.0", "test-device", "Test Device", "127.0.0.1", user);
++
++        // Simulate a leftover check-in from an earlier/different item: a check-in position is recorded
++        // (LastPlaybackCheckInPositionTicks), but NowPlayingItem is left null -- as it would be once
++        // that earlier item's own Stop ran RemoveNowPlayingItem(), or if the check-in belonged to a
++        // different item entirely. This node never saw a Start/Progress for the item under test.
++        session.StartAutomaticProgress(new PlaybackProgressInfo { PositionTicks = 500_000_000 });
++
++        await sessionManager.OnPlaybackStopped(new PlaybackStopInfo
++        {
++            SessionId = session.Id,
++            ItemId = itemId,
++            Item = new BaseItemDto { Id = itemId },
++            PositionTicks = null
++        });
++
++        userDataManager.Verify(m => m.UpdatePlayState(It.IsAny<BaseItem>(), It.IsAny<UserItemData>(), It.IsAny<long?>()), Times.Never);
++        userDataManager.Verify(
++            m => m.SaveUserData(It.IsAny<User>(), It.IsAny<BaseItem>(), It.IsAny<UserItemData>(), It.IsAny<UserDataSaveReason>(), It.IsAny<CancellationToken>()),
++            Times.Never);
++    }
++
++    [Fact]
++    public async Task OnPlaybackStopped_NoPosition_NoSessionRecordForItem_LeavesUserDataUntouched()
++    {
++        // HA failover case: this node's in-memory session never saw a Start/Progress for this play
++        // session (e.g. the client failed over from another node after playback already began), so
++        // there is neither a client-reported position nor a check-in fallback, and no record that
++        // this node ever knew about the item. We must not guess -- leave persisted UserData as-is.
++        var itemId = Guid.NewGuid();
++        var item = new Video { Id = itemId, RunTimeTicks = 10_000_000_000 };
++        var user = new User("test-user", "default", "default");
++
++        var userDataManager = new Mock<IUserDataManager>();
++        userDataManager.Setup(m => m.GetUserData(user, item)).Returns(new UserItemData { Key = "test-key" });
++
++        var libraryManager = new Mock<ILibraryManager>();
++        libraryManager.Setup(m => m.GetItemById(itemId)).Returns(item);
++
++        var userManager = new Mock<IUserManager>();
++        userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
++
++        await using var sessionManager = CreateSessionManager(userDataManager.Object, libraryManager.Object, userManager.Object);
++
++        var session = await sessionManager.LogSessionActivity("Test Client", "1.0.0", "test-device", "Test Device", "127.0.0.1", user);
++
++        // Deliberately not touched: session.NowPlayingItem stays null, as it would on a node that
++        // never handled this play session's Start/Progress.
++        await sessionManager.OnPlaybackStopped(new PlaybackStopInfo
++        {
++            SessionId = session.Id,
++            ItemId = itemId,
++            Item = new BaseItemDto { Id = itemId },
++            PositionTicks = null
++        });
++
++        userDataManager.Verify(m => m.UpdatePlayState(It.IsAny<BaseItem>(), It.IsAny<UserItemData>(), It.IsAny<long?>()), Times.Never);
++        userDataManager.Verify(
++            m => m.SaveUserData(It.IsAny<User>(), It.IsAny<BaseItem>(), It.IsAny<UserItemData>(), It.IsAny<UserDataSaveReason>(), It.IsAny<CancellationToken>()),
++            Times.Never);
++    }
++
++    private static Emby.Server.Implementations.Session.SessionManager CreateSessionManager(
++        IUserDataManager userDataManager,
++        ILibraryManager libraryManager,
++        IUserManager userManager)
++    {
++        return new Emby.Server.Implementations.Session.SessionManager(
++            NullLogger<Emby.Server.Implementations.Session.SessionManager>.Instance,
++            Mock.Of<IEventManager>(),
++            userDataManager,
++            Mock.Of<IServerConfigurationManager>(),
++            libraryManager,
++            userManager,
++            Mock.Of<IMusicManager>(),
++            Mock.Of<IDtoService>(),
++            Mock.Of<IImageProcessor>(),
++            Mock.Of<IServerApplicationHost>(),
++            Mock.Of<IDeviceManager>(),
++            Mock.Of<IMediaSourceManager>(),
++            Mock.Of<IHostApplicationLifetime>());
++    }
++}

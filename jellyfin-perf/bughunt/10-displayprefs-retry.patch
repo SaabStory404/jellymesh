@@ -1,0 +1,175 @@
+diff --git a/Jellyfin.Server.Implementations/Users/DisplayPreferencesManager.cs b/Jellyfin.Server.Implementations/Users/DisplayPreferencesManager.cs
+index 0e126fe9a..07b071ebb 100644
+--- a/Jellyfin.Server.Implementations/Users/DisplayPreferencesManager.cs
++++ b/Jellyfin.Server.Implementations/Users/DisplayPreferencesManager.cs
+@@ -1,6 +1,9 @@
++#pragma warning disable RS0030 // Do not use banned APIs
++
+ using System;
+ using System.Collections.Generic;
+ using System.Linq;
++using System.Threading;
+ using Jellyfin.Database.Implementations;
+ using Jellyfin.Database.Implementations.Entities;
+ using MediaBrowser.Controller;
+@@ -26,6 +29,28 @@ public sealed class DisplayPreferencesManager : IDisplayPreferencesManager
+ 
+     /// <inheritdoc />
+     public DisplayPreferences GetDisplayPreferences(Guid userId, Guid itemId, string client)
++    {
++        // Check-then-insert is only atomic where write transactions are serialized (SQLite). On an
++        // MVCC database two concurrent first requests for the same (UserId, ItemId, Client) both see
++        // "absent" and race on the unique-indexed insert; a multi-primary cluster can additionally
++        // abort a commit on certification. Both are safe to retry: the retry re-queries and finds the
++        // winner's row. Mirrors UserDataManager.SaveUserData's retry (Emby.Server.Implementations/Library/UserDataManager.cs).
++        const int MaxAttempts = 6;
++        for (var attempt = 1; ; attempt++)
++        {
++            try
++            {
++                return GetOrCreateDisplayPreferences(userId, itemId, client);
++            }
++            catch (Exception ex) when (attempt < MaxAttempts && IsWriteConflict(ex))
++            {
++                // Fresh context next attempt; jitter so racing writers stop colliding.
++                Thread.Sleep(Random.Shared.Next(5, 20) * attempt);
++            }
++        }
++    }
++
++    private DisplayPreferences GetOrCreateDisplayPreferences(Guid userId, Guid itemId, string client)
+     {
+         using var dbContext = _dbContextFactory.CreateDbContext();
+         var prefs = dbContext.DisplayPreferences
+@@ -43,6 +68,10 @@ public sealed class DisplayPreferencesManager : IDisplayPreferencesManager
+         return prefs;
+     }
+ 
++    private static bool IsWriteConflict(Exception ex)
++        => ex is DbUpdateException or System.Data.Common.DbException
++            || ex is InvalidOperationException { InnerException: DbUpdateException or System.Data.Common.DbException };
++
+     /// <inheritdoc />
+     public ItemDisplayPreferences GetItemDisplayPreferences(Guid userId, Guid itemId, string client)
+     {
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Users/DisplayPreferencesManagerTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Users/DisplayPreferencesManagerTests.cs
+new file mode 100644
+index 000000000..de80d065c
+--- /dev/null
++++ b/tests/Jellyfin.Server.Implementations.Tests/Users/DisplayPreferencesManagerTests.cs
+@@ -0,0 +1,115 @@
++using System;
++using System.IO;
++using System.Linq;
++using System.Threading.Tasks;
++using Jellyfin.Database.Implementations;
++using Jellyfin.Database.Implementations.Entities;
++using Jellyfin.Database.Implementations.Locking;
++using Jellyfin.Database.Providers.Sqlite;
++using Jellyfin.Server.Implementations.Users;
++using Microsoft.Data.Sqlite;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.Server.Implementations.Tests.Users;
++
++/// <summary>
++/// Regression tests for the check-then-insert race in <see cref="DisplayPreferencesManager.GetDisplayPreferences"/>:
++/// on a multi-writer database (e.g. Galera) two concurrent first requests for the same
++/// (UserId, ItemId, Client) can both pass the initial SELECT and race on the unique-indexed INSERT,
++/// so one attempt must retry instead of surfacing the write conflict to the caller.
++/// </summary>
++public sealed class DisplayPreferencesManagerTests : IDisposable
++{
++    private readonly string _dbPath;
++    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
++
++    public DisplayPreferencesManagerTests()
++    {
++        // A shared in-memory connection serializes every DbContext onto one connection, which would
++        // mask the race this test exists to catch. A temp file backs genuinely separate connections,
++        // the same way separate DB nodes do, so the unique-index conflict actually happens.
++        _dbPath = Path.Combine(Path.GetTempPath(), "jf-displayprefs-test-" + Guid.NewGuid().ToString("N") + ".db");
++
++        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
++            .UseSqlite("Data Source=" + _dbPath)
++            .Options;
++
++        using var ctx = CreateDbContext();
++        ctx.Database.EnsureCreated();
++    }
++
++    public void Dispose()
++    {
++        SqliteConnection.ClearAllPools();
++        File.Delete(_dbPath);
++    }
++
++    private JellyfinDbContext CreateDbContext()
++    {
++        return new JellyfinDbContext(
++            _dbOptions,
++            NullLogger<JellyfinDbContext>.Instance,
++            new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
++            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
++    }
++
++    private DisplayPreferencesManager CreateManager()
++    {
++        var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
++        factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
++        return new DisplayPreferencesManager(factory.Object);
++    }
++
++    private Guid SeedUser()
++    {
++        var user = new User("test", "auth-provider", "reset-provider");
++        using var ctx = CreateDbContext();
++        ctx.Users.Add(user);
++        ctx.SaveChanges();
++        return user.Id;
++    }
++
++    [Fact]
++    public async Task GetDisplayPreferences_ConcurrentFirstWrites_DoNotThrowAndConverge()
++    {
++        var manager = CreateManager();
++        var userId = SeedUser();
++        var itemId = Guid.NewGuid();
++        const string Client = "Jellyfin Web";
++
++        // Several concurrent "first ever" requests for the same (UserId, ItemId, Client) key, as
++        // happens when a browser fires more than one request for the same view (e.g. two tabs, or a
++        // first-login page load) against an HA pair sharing one multi-writer database.
++        var tasks = Enumerable.Range(0, 8)
++            .Select(_ => Task.Run(() => manager.GetDisplayPreferences(userId, itemId, Client)))
++            .ToArray();
++
++        // None of the concurrent attempts should surface the write conflict to the caller.
++        var results = await Task.WhenAll(tasks);
++
++        // All callers must observe the same persisted row rather than distinct/duplicate ones.
++        Assert.All(results, r => Assert.Equal(results[0].Id, r.Id));
++
++        using var verifyContext = CreateDbContext();
++        var rowCount = verifyContext.DisplayPreferences
++            .Count(p => p.UserId.Equals(userId) && p.ItemId.Equals(itemId) && p.Client == Client);
++        Assert.Equal(1, rowCount);
++    }
++
++    [Fact]
++    public void GetDisplayPreferences_ExistingRow_ReturnsItWithoutInserting()
++    {
++        var manager = CreateManager();
++        var userId = SeedUser();
++        var itemId = Guid.NewGuid();
++        const string Client = "Jellyfin Web";
++
++        var first = manager.GetDisplayPreferences(userId, itemId, Client);
++        var second = manager.GetDisplayPreferences(userId, itemId, Client);
++
++        Assert.Equal(first.Id, second.Id);
++    }
++}
