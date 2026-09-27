@@ -608,4 +608,20 @@ mod tests {
         b.splice(4..4, s(&["-xerror", "-passlogfile:v"]));
         assert!(validate(&b, &Policy::default(), Shape::Hls).is_err());
     }
+
+    // P5 (transcode/docs/PLAN.md): the DV7->8.1 signal (`crate::DV81_SIGNAL_FLAG`/
+    // `DV81_SIGNAL_VALUE`) is not special-cased anywhere in this allowlist -- it is just another
+    // `-metadata:s:vN` option/value pair, which was already opaque to `validate()` before P5
+    // existed. This test is regression coverage for that fact, not a widening: if a future change
+    // to this file ever makes the signal rejected (or, worse, makes it trigger different
+    // acceptance behaviour), this must fail loudly.
+    #[test]
+    fn dv81_signal_is_already_opaque_to_the_allowlist() {
+        let mut a = base();
+        a.splice(
+            4..4,
+            s(&[crate::DV81_SIGNAL_FLAG, crate::DV81_SIGNAL_VALUE]),
+        );
+        assert_eq!(validate(&a, &Policy::default(), Shape::Hls), Ok(()));
+    }
 }

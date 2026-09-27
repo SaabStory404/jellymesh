@@ -281,16 +281,85 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
       invariant every other fallback in this codebase relies on
 
 ### P5 Quality
-- [ ] On-the-fly Dolby Vision 7 -> 8.1 (Brian 2026-09-27): 124 of 329 movies are DV profile 7 (dual-layer BD
-      remuxes); TVs/streamers decode only single-layer DV (8.1/5), so Jellyfin strips them to HDR10 or
-      transcodes. Offline conversion with dovi_tool is proven (two titles converted and verified 2026-09-27)
-      but costs a second copy of each file. Instead, during a remux for a client that plays DV 8.1: drop the
-      enhancement layer and rewrite the RPUs to profile 8.1 in-stream (the `dolby_vision` Rust crate that
-      dovi_tool is built on, inside the agent, between demux and mux), and mark the output DV 8.1.
-      Two halves: (a) Jellyfin's decision (core patch: P7 is servable as 8.1 to a client that supports
-      DOVIWithHDR10) — owned by the jellyfin bug-hunt session, brief item 5; (b) the pool's execution
-      (agent/IR). MEL sources lose nothing visible; FEL sources lose the enhancement detail. Done when the
-      Bravia shows the Dolby Vision badge on a DV7 title with Direct Stream (remux) and no extra disk use.
+- [~] On-the-fly Dolby Vision 7 -> 8.1 (Brian 2026-09-27, re-scoped 2026-09-27 after lab measurement):
+      124 of 329 movies are DV profile 7 (dual-layer BD remuxes); TVs/streamers decode only
+      single-layer DV (8.1/5), so Jellyfin strips them to HDR10 or transcodes. Offline conversion with
+      dovi_tool is proven (two titles converted and verified 2026-09-27) but costs a second copy of
+      each file. Two halves: (a) Jellyfin's decision (core patch: P7 is servable as 8.1 to a client
+      that supports DOVIWithHDR10) — owned by the jellyfin bug-hunt session, brief item 5; (b) the
+      pool's execution (agent/IR) — this entry.
+
+      **Signal contract (shipped, `crates/ir/src/lib.rs` `wants_dv81`/`DV81_SIGNAL_FLAG`/
+      `DV81_SIGNAL_VALUE`):** Jellyfin's decision patch appends `-metadata:s:v:0 TC_DV81=1` once, on
+      the output video stream, only when it selects a DV7->8.1 remux. Chosen because it's a real,
+      harmless ffmpeg option: any fallback that execs ffmpeg with this argv unmodified (an older
+      agent's shape, or the shim's own `exec_real` when the pool is unreachable) still runs correctly,
+      it just tags the output with one inert extra metadata key. `validate()` needed no widening —
+      it was already opaque to this option/value pair (regression test:
+      `validate::tests::dv81_signal_is_already_opaque_to_the_allowlist`). Detection is wired
+      (`wants_dv81`, tested); **`render()` does not act on it yet** — see below for why, and note
+      this means the pool is a no-op for a signaled job today, same as for any other job, which is
+      the deliberately safe starting state, not a bug.
+
+      **Gate design (shipped, `crates/agent/src/probe.rs` `source_dovi_profile`):** the signal alone
+      is never enough to convert — it says what Jellyfin *wants*, not what the source *is*. The
+      agent-side gate (once wired into `job.rs`) must require BOTH `wants_dv81(&job.args)` AND
+      `probe::source_dovi_profile(...) == Some(7)` (an ffprobe side-data check against the real
+      file). A signal on a DV5/DV8/non-DV source (stale client state, a mismatched library scan, a
+      probe timeout) must fall through to the normal render path unchanged — `source_dovi_profile`
+      fails closed (`None`) on any timeout/parse error precisely so the caller's default is "don't
+      convert", never "convert anyway."
+
+      **RPU rewrite core (shipped, `crates/agent/src/dv81.rs` `convert_annexb_to_dv81`, unit-tested):**
+      Annex-B NAL splitting, enhancement-layer NAL removal (`nuh_layer_id != 0`, RPU NAL excepted),
+      and RPU profile rewriting via the `dolby_vision` crate (`ConversionMode::To81` — dovi_tool's own
+      DV7->8.1 conversion: MEL sources keep their luma/chroma mapping, FEL sources have it removed,
+      i.e. exactly "MEL loses nothing visible; FEL loses the enhancement detail"). Fails closed (no
+      RPU found, or any RPU fails to convert -> `Err`, never a partial conversion).
+
+      **BLOCKED on a real problem, not a TODO — MEASURED 2026-09-27 in `tc-lab` against a real DV
+      profile-7 source** (`tc-worker-cpu`, jellyfin-ffmpeg 8.1.2, a Blu-ray-remux MKV, profile 7,
+      `dv_bl_signal_compatibility_id` 6 — the common "\[DV HDR10\]" release-group muxing, the same
+      shape as a large fraction of the 124 titles this item is about):
+        1. The naive fix (`-bsf:v dovi_rpu=compression=0 -strict unofficial -tag:v hvc1` on a plain
+           `-c:v copy` remux, as an earlier session's report proposed) does **not** convert the
+           profile: re-probed output still reports `profile: 7, el flag: 1`. The `dovi_rpu` bsf in
+           this ffmpeg build only exposes `-strip` (delete DV metadata entirely, producing HDR10, not
+           DV8.1) and `-compression` (metadata compression level) — no profile-conversion option.
+           Actual profile rewriting needs the `dolby_vision` crate's `convert_with_mode` (now wired,
+           see above), not a bsf flag.
+        2. More fundamentally: `ffmpeg -i <file> -map 0:v:0 -c:v copy -bsf:v trace_headers -t 3 -f
+           null -` on this file traces 301 real NALs over 3 seconds and finds **zero** with
+           `nal_unit_type == 62` (RPU) and **zero** with `nuh_layer_id != 0` (enhancement layer).
+           `ffprobe` still reports `rpu_present_flag: 1, el_present_flag: 1` (a static per-track
+           descriptor from CodecPrivate), but the per-frame RPU/EL bitstream itself is not reachable
+           through a plain `-map`/stream-copy/bsf pipeline. ffmpeg logs why on open: `Invalid Block
+           Addition value 0x0 for unknown Block Addition Mapping type 68766345` — this MKV carries the
+           profile-7 enhancement layer + RPU as a Matroska Block Addition whose mapping type this
+           demuxer does not parse. Reproduced identically on a 20 MB and a 300 MB prefix of the same
+           file (not a truncation artifact).
+
+           **This rules out a pure-ffmpeg two-process pipeline** (extract Annex-B, rewrite via bsf or
+           the crate, remux — both this session's design and the prior report's) **for this common
+           muxing.** `convert_annexb_to_dv81` (above) is still correct and useful for any Annex-B
+           stream that already carries its RPU in-band as NAL 62 (true of some encoders/muxings); the
+           missing piece is getting the bytes out of a Block-Addition-muxed MKV in the first place.
+           Candidates for the next session, untried: (a) a newer/different ffmpeg build that
+           understands this Block Addition Mapping Type; (b) a Matroska Block-Addition-aware reader
+           in Rust (the `matroska` crate or similar) to pull RPU bytes out band-by-band, independent
+           of what ffmpeg exposes for the video stream; (c) shelling to `mkvextract`/`dovi_tool` as a
+           helper binary (adds an image dependency, `deploy/Containerfile.agent`). Do **not** wire
+           `job.rs` to call `convert_annexb_to_dv81` until one of these is proven end-to-end against a
+           real profile-7 source in `tc-lab` with the built agent binary — an untested change to the
+           agent's single-process exec invariant is not something to ship blind to a pool that runs
+           prod live.
+        3. Also unconfirmed (INHERITED, not measured this session): whether a real in-band RPU NAL
+           (once one is obtainable) carries `nuh_layer_id == 0` or `1`. `convert_annexb_to_dv81`
+           currently converts the RPU NAL regardless of its layer id (so either case is handled), but
+           this hasn't been exercised against real in-band bytes — verify once (2) has a fix.
+
+      Done when the Bravia shows the Dolby Vision badge on a DV7 title with Direct Stream (remux) and
+      no extra disk use — still the target; the blocker above is what stands between here and there.
 - [x] Baseline measured (P0, calibration/README.md): Arc delivers 16-22% of the cap, VMAF 87.1/87.5 @8M
       (h264/hevc); P4 94.8/93.2; Arc-vs-P4 gap 5.4-7.8 (a failover is visible). Calibrated settings
       measured Arc 93.5/97.6, P4 93.5/96.9, gap +0.04/+0.72

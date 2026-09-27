@@ -567,6 +567,33 @@ pub fn required_output(args: &[String]) -> Option<&'static str> {
     })
 }
 
+/// The Jellyfin-side decision patch's signal for an on-the-fly DV profile 7 -> 8.1 remux: an
+/// explicit per-stream output metadata tag, appended once on the video stream when Jellyfin's
+/// playback decision selects a DV7 source for a client that plays DV 8.1 (`transcode/docs/PLAN.md`
+/// P5). Chosen because it is a real, harmless ffmpeg option (arbitrary output metadata): any
+/// fallback path that execs ffmpeg with this argv unmodified (an older agent, or the shim's own
+/// `exec_real` when the pool is unreachable) still runs correctly and just tags the output file
+/// with one extra, inert metadata key -- it does not change what ffmpeg does. Detection is a
+/// literal, adjacent-pair match, not a prefix/substring match, so no other stream-metadata tag can
+/// collide with it by accident.
+pub const DV81_SIGNAL_FLAG: &str = "-metadata:s:v:0";
+pub const DV81_SIGNAL_VALUE: &str = "TC_DV81=1";
+
+/// `true` when the Jellyfin-side decision patch asked for an on-the-fly DV7 -> 8.1 remux (see
+/// `DV81_SIGNAL_FLAG`).
+///
+/// Detection only: `render()` does not act on this today, so the pool is a no-op for a signaled
+/// job exactly like any other job (P5 is not wired into the agent's exec path yet -- see
+/// `transcode/docs/PLAN.md` P5 for the measured blocker and what's needed before it can be). An
+/// agent that does wire it must still confirm the *source* really is DV profile 7 (an ffprobe
+/// check -- `probe::source_dovi_profile` -- not this signal alone) before doing anything
+/// different: the signal only says what Jellyfin *wants*, never what the source *is*, so a signal
+/// on a DV5/DV8/non-DV source must fall through unchanged rather than mislabel it.
+pub fn wants_dv81(args: &[String]) -> bool {
+    args.windows(2)
+        .any(|w| w[0] == DV81_SIGNAL_FLAG && w[1] == DV81_SIGNAL_VALUE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,5 +861,62 @@ mod tests {
         ]);
         clamp_probe(&mut burn, 50_000_000, 5_000_000);
         assert_eq!(burn[1], "1G");
+    }
+
+    #[test]
+    fn wants_dv81_detects_the_exact_signal_pair() {
+        let a = s(&[
+            "-i",
+            "file:/media/movies/x.mkv",
+            "-metadata:s:v:0",
+            "TC_DV81=1",
+            "-codec:v:0",
+            "libx264",
+        ]);
+        assert!(wants_dv81(&a));
+    }
+
+    #[test]
+    fn wants_dv81_ignores_absence_and_near_misses() {
+        assert!(!wants_dv81(&s(&["-i", "x", "-codec:v:0", "libx264"])));
+        // wrong value
+        assert!(!wants_dv81(&s(&["-metadata:s:v:0", "TC_DV81=0"])));
+        // wrong stream index
+        assert!(!wants_dv81(&s(&["-metadata:s:v:1", "TC_DV81=1"])));
+        // a different metadata key that happens to contain the value string
+        assert!(!wants_dv81(&s(&["-metadata:s:v:0", "title=TC_DV81=1"])));
+        // the two tokens present but not adjacent
+        assert!(!wants_dv81(&s(&[
+            "-metadata:s:v:0",
+            "title=x",
+            "TC_DV81=1"
+        ])));
+    }
+
+    #[test]
+    fn render_does_not_yet_touch_the_dv81_signal() {
+        // P5 is detection-only so far (see `wants_dv81`'s docs): render() must pass the signal
+        // through byte-for-byte, same as any other unrecognised metadata option, until the agent
+        // side actually wires the conversion.
+        let a = s(&[
+            "-i",
+            "x",
+            "-metadata:s:v:0",
+            "TC_DV81=1",
+            "-codec:v:0",
+            "libx264",
+            "-f",
+            "hls",
+            "-hls_segment_filename",
+            "/t/a%d.ts",
+            "-y",
+            "/t/a.m3u8",
+        ]);
+        assert!(wants_dv81(&a));
+        let r = render(&a, Backend::Qsv, &TranslateOpts::default());
+        assert!(
+            wants_dv81(&r.args),
+            "the signal must survive render() unchanged"
+        );
     }
 }

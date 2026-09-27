@@ -146,6 +146,30 @@ Jellyfin waiting on a segment that already exists.
    true, and the racy marker re-create path — which returned HTTP 500 to two viewers starting at
    once, MEASURED twice — never fires.
 
+## Dolby Vision 7 -> 8.1 (P5, not applied yet)
+
+For the Jellyfin-side decision patch (bug-hunt session, brief item 5): when your patch decides a
+DV profile-7 source should be remuxed as DV 8.1 for the requesting client, append this exactly
+once, on the output video stream, to the ffmpeg argv you already emit:
+
+```
+-metadata:s:v:0 TC_DV81=1
+```
+
+That's the only contract on your side. It's a real, harmless ffmpeg option (arbitrary output
+metadata), so nothing breaks if the pool is unreachable and the shim execs your argv unmodified —
+the output just carries one extra, inert metadata key. Do not gate on whether the pool is present;
+emit the marker whenever your decision says DV7->8.1, unconditionally.
+
+**Current pool-side behavior: none yet.** The pool detects the marker
+(`tcpool_ir::wants_dv81`, tested) but does not act on it — `render()` passes a signaled job through
+completely unchanged, so today a signaled job behaves exactly like an unsignaled one on the pool.
+The RPU-rewrite core exists and is unit-tested (`crates/agent/src/dv81.rs`), but wiring it into a
+live job is blocked on a real extraction problem (Matroska Block Addition parsing for dual-layer
+profile-7 MKVs — see `transcode/docs/PLAN.md` P5 for the measured details). Until that's resolved
+and wired, a signaled job is a no-op on the pool side: no crash, no corruption, just an inert tag on
+the output. Don't build client-side logic that assumes the badge will actually change yet.
+
 ## Rollback
 
 Unchanged and unconditional. The pooled Jellyfin is GPU-less, so `jellyfin-qsv` and

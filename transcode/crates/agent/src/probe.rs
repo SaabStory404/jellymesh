@@ -229,3 +229,103 @@ pub async fn source_height(cfg: &Config, input: &str) -> Option<u32> {
         .parse()
         .ok()
 }
+
+/// The video track's Dolby Vision profile (7, 8, 5, ...) via ffprobe's side data, or `None` if
+/// the source has no DV metadata, ffprobe fails, or the probe times out.
+///
+/// This is the source-truth half of the P5 gate (`transcode/docs/PLAN.md`): `tcpool_ir::wants_dv81`
+/// says what Jellyfin's decision patch asked for; this says what the file actually is. `job.rs`
+/// must require `Some(7)` from this, not just the signal, before running any DV7->8.1 conversion --
+/// a signal on a DV5/DV8/non-DV source (a stale client decision, a mismatched library scan, ...)
+/// must fall through to the normal render path unchanged, never be treated as DV7.
+///
+/// Bounded (10s) and best-effort like `source_height`: ffprobe reads container/track headers only
+/// here, not per-frame RPU data (see `dv81`'s module docs for the difference, and why that split
+/// matters for what this function can and can't tell you), so it should be fast even on a large
+/// remux; a timeout or parse failure returns `None`, which the caller must treat as "not confirmed
+/// DV7" -- fail closed to the unconverted path, not fail open into converting an unconfirmed source.
+// Unused until P5's agent wiring lands (see dv81.rs's module docs); allow(dead_code) so
+// `cargo clippy -D warnings` doesn't fail the build in the meantime.
+#[allow(dead_code)]
+pub async fn source_dovi_profile(cfg: &Config, input: &str) -> Option<u8> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(10),
+        Command::new(&cfg.ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=index:side_data=dv_profile",
+                "-of",
+                "json",
+                input,
+            ])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_dovi_profile_json(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pure parse of ffprobe's `-show_entries stream=...:side_data=dv_profile -of json` output: the
+/// first `dv_profile` integer under any stream's `side_data_list`, or `None`. Split out from
+/// `source_dovi_profile` so the part that actually matters for correctness is unit-testable
+/// without spawning ffprobe (MEASURED shape, `tc-lab`, jellyfin-ffmpeg 8.1.2, a real DV profile-7
+/// source: `{"streams":[{"index":0,"side_data_list":[{"side_data_type":"DOVI configuration
+/// record","dv_profile":7,...}]}]}` -- field names and nesting only; no real field values are
+/// reproduced here, see `dv81.rs`'s module docs for why the RPU-level data behind this static
+/// per-track record is a separate, harder problem).
+#[allow(dead_code)]
+fn parse_dovi_profile_json(json: &str) -> Option<u8> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get("streams")?.as_array()?.iter().find_map(|stream| {
+        stream
+            .get("side_data_list")?
+            .as_array()?
+            .iter()
+            .find_map(|sd| sd.get("dv_profile")?.as_u64())
+            .and_then(|p| u8::try_from(p).ok())
+    })
+}
+
+#[cfg(test)]
+mod dv81_tests {
+    use super::parse_dovi_profile_json;
+
+    #[test]
+    fn parses_the_measured_shape() {
+        let json = r#"{
+            "streams": [
+                {
+                    "index": 0,
+                    "side_data_list": [
+                        {"side_data_type": "DOVI configuration record", "dv_profile": 7}
+                    ]
+                }
+            ]
+        }"#;
+        assert_eq!(parse_dovi_profile_json(json), Some(7));
+    }
+
+    #[test]
+    fn returns_none_for_no_dv_metadata() {
+        let json = r#"{"streams": [{"index": 0}]}"#;
+        assert_eq!(parse_dovi_profile_json(json), None);
+        assert_eq!(parse_dovi_profile_json("not json"), None);
+        assert_eq!(parse_dovi_profile_json("{}"), None);
+    }
+
+    #[test]
+    fn returns_none_when_profile_does_not_fit_a_u8() {
+        let json = r#"{"streams":[{"side_data_list":[{"dv_profile": 99999}]}]}"#;
+        assert_eq!(parse_dovi_profile_json(json), None);
+    }
+}
