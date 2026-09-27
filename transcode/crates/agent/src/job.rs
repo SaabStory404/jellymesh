@@ -7,7 +7,10 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tcpool_ir::{first_segment, input_path, is_video_copy, map_path, render, TranslateOpts};
+use tcpool_ir::{
+    first_segment, input_path, is_video_copy, map_path, render, render_trickplay, Shape,
+    TranslateOpts,
+};
 use tcpool_proto::{
     client_msg, server_msg, Accepted, Busy, ClientMsg, Exit, Heartbeat, Job, ServerMsg,
 };
@@ -40,6 +43,52 @@ async fn job_weight(cfg: &Config, args: &[String]) -> f64 {
 enum Ended {
     Stalled,
     Drained,
+    /// A PLAYBACK admission preempted this BATCH job (before or after it produced any output).
+    Preempted,
+}
+
+/// Why a BATCH job is refused outright before admission is even attempted, or `None` to proceed.
+/// A pure function (config in, verdict out) so it's directly unit-testable without a live
+/// gRPC/ffmpeg harness.
+fn batch_refusal_reason(cfg: &Config, batch: bool) -> Option<&'static str> {
+    if !batch {
+        return None;
+    }
+    if !cfg.accept_batch {
+        return Some("batch-disabled"); // A5: this worker opted out of BATCH entirely
+    }
+    if cfg.policy.trickplay_output_root.is_none() {
+        return Some("batch-disabled"); // A2: an unset root refuses BATCH the same way
+    }
+    None
+}
+
+/// The job's final `(metrics outcome, Exit.preempted)`, from ffmpeg's own exit code, whether the
+/// agent fenced it, and whatever `Ended` reason a watchdog recorded (if any). `code == 0` (and
+/// not fenced) proves ffmpeg finished on its own: every watchdog's kill is a SIGKILL via
+/// `Ctl::end`/`Ctl::fence`, and a killed process can never report exit code 0. Checking that
+/// first, ahead of `ended`, makes the result independent of a real but narrow race: `run_ffmpeg`
+/// has one more await after `child.wait()` resolves (draining the stdout/stderr pump tasks,
+/// bounded by a 2s timeout), and a watchdog poll (stall/drain/preempt) landing in that window can
+/// still record an `Ended` reason for a job whose ffmpeg had, in truth, already exited 0. Without
+/// this, e.g. `preempt_watch` recording `Ended::Preempted` in that window would mislabel an
+/// already-successful BATCH job as preempted, causing the shim to discard good output and rerun
+/// locally, and the metrics/alerting to record a false preemption.
+fn final_outcome(code: i32, fenced: bool, ended: Option<Ended>) -> (crate::metrics::Outcome, bool) {
+    if fenced {
+        return (crate::metrics::Outcome::Fenced, false);
+    }
+    if code == 0 {
+        return (crate::metrics::Outcome::ExitOk, false);
+    }
+    match ended {
+        Some(Ended::Stalled) => (crate::metrics::Outcome::Stalled, false),
+        // Drained jobs are killed to end them (a nonzero/signal exit code), but that's a
+        // planned handoff to another worker, not a failure -- keep it out of exit_error.
+        Some(Ended::Drained) => (crate::metrics::Outcome::Drained, false),
+        Some(Ended::Preempted) => (crate::metrics::Outcome::Preempted, true),
+        None => (crate::metrics::Outcome::ExitError, false),
+    }
 }
 
 /// Shared between the tasks of one job.
@@ -112,8 +161,31 @@ impl Ctl {
     }
 }
 
-pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientMsg>, tx: Tx) {
+pub async fn run_job(
+    state: Arc<State>,
+    job: Job,
+    shape: Shape,
+    mut inbound: Streaming<ClientMsg>,
+    tx: Tx,
+) {
     let cfg = &state.cfg;
+    // Shape (validated up front in main.rs's Svc::run), not the client-asserted `job.priority`,
+    // decides admission: it can't be spoofed independently of the argv that was already checked.
+    let batch = matches!(shape, Shape::Trickplay);
+    let class = if batch { "batch" } else { "playback" };
+    if let Some(reason) = batch_refusal_reason(cfg, batch) {
+        let (used, cap) = state.usage.snapshot();
+        crate::log(format_args!("busy ({reason}): refusing a batch job"));
+        state.metrics.inc(crate::metrics::Outcome::Busy);
+        let _ = tx
+            .send(msg(server_msg::Msg::Busy(Busy {
+                reason: reason.into(),
+                units_used: used,
+                capacity: cap,
+            })))
+            .await;
+        return;
+    }
     if *state.drain.borrow() {
         let (used, cap) = state.usage.snapshot();
         state.metrics.inc(crate::metrics::Outcome::Busy);
@@ -126,16 +198,31 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
             .await;
         return;
     }
-    let weight = job_weight(cfg, &job.args).await;
-    let Some(guard) = state.usage.reserve(weight) else {
+    // A3: BATCH uses a fixed weight and skips job_weight()'s ffprobe before admission.
+    let weight = if batch {
+        cfg.batch_weight
+    } else {
+        job_weight(cfg, &job.args).await
+    };
+    let guard = if batch {
+        state.usage.reserve_batch(weight)
+    } else {
+        state.usage.reserve_playback(weight)
+    };
+    let Some(guard) = guard else {
         let (used, cap) = state.usage.snapshot();
+        let reason = if batch { "headroom" } else { "capacity" };
         crate::log(format_args!(
-            "busy: refused a {weight}-unit job ({used}/{cap} units)"
+            "busy ({reason}): refused a {weight}-unit {class} job ({used}/{cap} units)"
         ));
-        state.metrics.inc(crate::metrics::Outcome::Busy);
+        state.metrics.inc(if batch {
+            crate::metrics::Outcome::BusyHeadroom
+        } else {
+            crate::metrics::Outcome::Busy
+        });
         let _ = tx
             .send(msg(server_msg::Msg::Busy(Busy {
-                reason: "capacity".into(),
+                reason: reason.into(),
                 units_used: used,
                 capacity: cap,
             })))
@@ -144,7 +231,7 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
     };
     let (used, cap) = state.usage.snapshot();
     crate::log(format_args!(
-        "accepted a {weight}-unit job ({used}/{cap} units)"
+        "accepted a {weight}-unit {class} job ({used}/{cap} units)"
     ));
     if tx
         .send(msg(server_msg::Msg::Accepted(Accepted {
@@ -159,6 +246,9 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
         return; // shim gone before we started: nothing to do
     }
     state.metrics.inc(crate::metrics::Outcome::Accepted);
+    if batch {
+        state.metrics.inc(crate::metrics::Outcome::BatchAccepted);
+    }
     let job_id = state.metrics.new_job_id();
     let started = Instant::now();
 
@@ -175,6 +265,34 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
         state: state.clone(),
         job_id,
     });
+
+    // A4: "preempted before start" -- the preempt handle exists (it was registered atomically
+    // with the reservation, before Accepted was even sent) before this check, so a PLAYBACK
+    // admission that preempted us between Accepted and here is caught here, before ffmpeg ever
+    // spawns.
+    if let Some(preempt) = guard.preempt.clone() {
+        if preempt.is_preempted() {
+            crate::log(format_args!("batch job preempted before it started"));
+            ctl.done.store(true, Ordering::SeqCst);
+            state.metrics.inc(crate::metrics::Outcome::Preempted);
+            state
+                .metrics
+                .observe_seconds(started.elapsed().as_secs_f64());
+            let _ = tx
+                .send(msg(server_msg::Msg::Exit(Exit {
+                    // Never spawned; nonzero (mirroring a mid-run SIGKILL's -9) so this can never
+                    // be read as success by `code` alone -- the shim only inspects `preempted`.
+                    code: -9,
+                    fenced: false,
+                    gpu_filters: false,
+                    preempted: true,
+                })))
+                .await;
+            drop(guard);
+            return;
+        }
+    }
+
     let (stdin_tx, stdin_rx) = mpsc::channel::<Option<Vec<u8>>>(64);
     let stdin_rx = Arc::new(Mutex::new(stdin_rx));
 
@@ -251,7 +369,10 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
     // encode under a healthy agent would otherwise hang the session (it keeps heartbeating).
     let stall_watch = {
         let ctl = ctl.clone();
-        let (stall, grace) = (cfg.stall_after, cfg.first_progress_grace);
+        // BATCH (trickplay) jobs get their own, much longer pair: see
+        // `Config::batch_stall_after`'s doc comment for why the PLAYBACK-tuned defaults would
+        // false-positive on a healthy, slowly-progressing trickplay job.
+        let (stall, grace) = cfg.stall_limits(batch);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -288,6 +409,16 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
                     return;
                 }
             }
+            if batch {
+                // A jpg sequence has no segment boundary to wait for (last_segment_index is
+                // meaningless here, always None): end it right away so Jellyfin/the shim see a
+                // clean, immediate exit rather than a 10s wait for something that never resolves.
+                ctl.end(
+                    Ended::Drained,
+                    "agent draining (batch job has no segment boundary to wait for)",
+                );
+                return;
+            }
             let base = tcpool_ir::last_segment_index(&mapped);
             let started = Instant::now();
             loop {
@@ -303,20 +434,42 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
             }
         })
     };
+    // Preemption watchdog (BATCH jobs only, `guard.preempt` is `None` for PLAYBACK): poll the
+    // flag `reserve_playback` sets when it preempts this reservation, and end the job the same
+    // way the stall/drain watchdogs do.
+    let preempt_watch = guard.preempt.clone().map(|preempt| {
+        let ctl = ctl.clone();
+        tokio::spawn(async move {
+            loop {
+                if ctl.done.load(Ordering::SeqCst) {
+                    return;
+                }
+                if preempt.is_preempted() {
+                    ctl.end(Ended::Preempted, "preempted by a playback admission");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    });
 
     let opts = TranslateOpts {
         pathmap: cfg.pathmap.clone(),
         gpu_filters: cfg.gpu_filters,
     };
     let cwd = map_path(&job.cwd, &cfg.pathmap);
-    let render = |o: &TranslateOpts| {
-        let mut r = render(&job.args, cfg.backend, o);
+    let render_fn = |o: &TranslateOpts| {
+        let mut r = if batch {
+            render_trickplay(&job.args, cfg.backend, o)
+        } else {
+            render(&job.args, cfg.backend, o)
+        };
         if let Some((size, dur)) = cfg.probe_clamp {
             tcpool_ir::clamp_probe(&mut r.args, size, dur);
         }
         r
     };
-    let mut rendered = render(&opts);
+    let mut rendered = render_fn(&opts);
     let mut code = run_ffmpeg(
         cfg,
         &rendered.args,
@@ -342,7 +495,7 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
         state
             .metrics
             .inc(crate::metrics::Outcome::GpuFilterFallback);
-        rendered = render(&TranslateOpts {
+        rendered = render_fn(&TranslateOpts {
             gpu_filters: false,
             ..opts.clone()
         });
@@ -350,29 +503,25 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
     }
     ctl.done.store(true, Ordering::SeqCst);
     let fenced = ctl.fenced.load(Ordering::SeqCst);
-    let outcome = if fenced {
-        crate::metrics::Outcome::Fenced
-    } else {
-        match ctl.ended() {
-            Some(Ended::Stalled) => crate::metrics::Outcome::Stalled,
-            // Drained jobs are killed to end them (a nonzero/signal exit code), but that's a
-            // planned handoff to another worker, not a failure -- keep it out of exit_error.
-            Some(Ended::Drained) => crate::metrics::Outcome::Drained,
-            None if code == 0 => crate::metrics::Outcome::ExitOk,
-            None => crate::metrics::Outcome::ExitError,
-        }
-    };
+    let (outcome, preempted) = final_outcome(code, fenced, ctl.ended());
     state.metrics.inc(outcome);
     state
         .metrics
         .observe_seconds(started.elapsed().as_secs_f64());
     state.metrics.clear_speed(job_id);
-    if !fenced {
+    // A preempted BATCH job must always get an explicit Exit{preempted:true} so the shim can
+    // apply A1's frame-exists split (fall back to a local re-run, or exit non-zero with no
+    // rerun) -- unlike a plain fence, which the shim already treats as "worker gone" without
+    // one. This only ever widens the send for a job that was preempted (a
+    // PLAYBACK job's `ended` can never be `Preempted`: only a BATCH reservation gets a preempt
+    // handle), so PLAYBACK behavior (`if !fenced`) is unchanged.
+    if !fenced || preempted {
         let _ = tx
             .send(msg(server_msg::Msg::Exit(Exit {
                 code,
                 fenced,
                 gpu_filters: rendered.gpu_filters,
+                preempted,
             })))
             .await;
     }
@@ -384,6 +533,9 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
     watchdog.abort();
     stall_watch.abort();
     drain_watch.abort();
+    if let Some(h) = preempt_watch {
+        h.abort();
+    }
     reader.abort();
     drop(guard);
 }
@@ -489,5 +641,94 @@ fn exit_code(status: std::io::Result<std::process::ExitStatus>) -> i32 {
     match status {
         Ok(s) => s.code().unwrap_or_else(|| -s.signal().unwrap_or(1)),
         Err(_) => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_refusal_only_applies_to_batch_jobs() {
+        let mut cfg = Config::minimal();
+        cfg.accept_batch = false;
+        assert_eq!(
+            batch_refusal_reason(&cfg, false),
+            None,
+            "a playback job is never refused for BATCH reasons"
+        );
+    }
+
+    #[test]
+    fn batch_refused_when_the_worker_opted_out() {
+        let mut cfg = Config::minimal();
+        cfg.accept_batch = false;
+        cfg.policy.trickplay_output_root = Some("/scratch/tp".into());
+        assert_eq!(batch_refusal_reason(&cfg, true), Some("batch-disabled"));
+    }
+
+    #[test]
+    fn batch_refused_when_no_trickplay_output_root_is_configured() {
+        let mut cfg = Config::minimal();
+        cfg.policy.trickplay_output_root = None;
+        assert_eq!(batch_refusal_reason(&cfg, true), Some("batch-disabled"));
+    }
+
+    #[test]
+    fn batch_allowed_when_accepted_and_rooted() {
+        let mut cfg = Config::minimal();
+        cfg.policy.trickplay_output_root = Some("/scratch/tp".into());
+        assert_eq!(batch_refusal_reason(&cfg, true), None);
+    }
+
+    #[test]
+    fn final_outcome_a_clean_exit_wins_over_a_late_preempted_ended() {
+        // Regression: preempt_watch (or stall_watch/drain_watch) can record an `Ended` reason in
+        // the narrow window between ffmpeg actually exiting 0 and `ctl.done` being stored (the
+        // pump-drain await inside run_ffmpeg). A code-0, not-fenced exit must always win.
+        assert_eq!(
+            final_outcome(0, false, Some(Ended::Preempted)),
+            (crate::metrics::Outcome::ExitOk, false)
+        );
+        assert_eq!(
+            final_outcome(0, false, Some(Ended::Stalled)),
+            (crate::metrics::Outcome::ExitOk, false)
+        );
+        assert_eq!(
+            final_outcome(0, false, Some(Ended::Drained)),
+            (crate::metrics::Outcome::ExitOk, false)
+        );
+        assert_eq!(
+            final_outcome(0, false, None),
+            (crate::metrics::Outcome::ExitOk, false)
+        );
+    }
+
+    #[test]
+    fn final_outcome_reports_a_genuine_preemption() {
+        assert_eq!(
+            final_outcome(-9, false, Some(Ended::Preempted)),
+            (crate::metrics::Outcome::Preempted, true)
+        );
+    }
+
+    #[test]
+    fn final_outcome_fenced_wins_regardless_of_code_or_ended() {
+        assert_eq!(
+            final_outcome(0, true, Some(Ended::Preempted)),
+            (crate::metrics::Outcome::Fenced, false)
+        );
+        assert_eq!(
+            final_outcome(-9, true, None),
+            (crate::metrics::Outcome::Fenced, false)
+        );
+    }
+
+    #[test]
+    fn final_outcome_nonzero_no_ended_is_exit_error() {
+        assert_eq!(
+            final_outcome(1, false, None),
+            (crate::metrics::Outcome::ExitError, false)
+        );
     }
 }

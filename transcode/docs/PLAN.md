@@ -107,8 +107,7 @@ gRPC with mTLS, certificates from the existing step-ca (`60-step-ca.yaml`).
    - Among the top two candidates, pick with probability proportional to score (power-of-two choices). This avoids a stampede when both Jellyfin replicas choose at once.
 3. **Priority classes.**
    - `playback` (HLS for a viewer) always wins.
-   - `batch` (trickplay, keyframe extraction, and progressive/download transcodes, which have no restart primitive) goes to the pool only when there's headroom, at low priority, and may be preempted. Preemption hands the job back to Jellyfin as a retryable failure; batch jobs have no viewer.
-   - Today batch jobs run on the Jellyfin pod's CPU.
+   - `batch` (trickplay, keyframe extraction, and progressive/download transcodes, which have no restart primitive) goes to the pool only when there's headroom, at low priority, and may be preempted. A pool failure -- preempted, a lost worker, or a plain non-zero exit, not just a preemption -- hands the job back to Jellyfin as a retryable failure once a first frame exists; before that the shim reruns locally and Jellyfin never sees a failure. Landed for trickplay only (§10 P2); keyframe extraction and progressive/download transcodes are out of scope for this pass (see §10).
 4. **Degrade instead of stall (N+1 policy).** When a card is lost and the survivors are over capacity, re-admitted and new playback jobs get an "emergency" render: fastest preset, GPU chain only. That buys throughput at a small quality cost, so viewers don't stutter. A pool gauge and alert show when the pool is running degraded. When capacity returns, new jobs go back to normal quality automatically.
 
 ## 4. Quality
@@ -208,7 +207,49 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
 - [x] Metrics: agent :9903, sync :9904; alert rules `transcode/deploy/alerts.yaml` (sub A, merged)
 - [~] Fuzzing + property tests + bypass hunt (sub B, branch `tcpool-fuzz`)
 - [~] cert-manager certs, DaemonSets per GPU label, headless-Service DNS discovery, PDBs, JellyMesh contract (sub C)
-- [ ] Batch/priority class (decision 3): route trickplay/keyframe jobs to the pool at low priority. Needs workers to write Jellyfin's trickplay dir
+- [x] Batch/priority class (decision 3), trickplay only: routes at `Priority::Batch` behind `TC_BATCH=1` (unset by
+      default, so this ships dark). Keyframe extraction needs no pool routing -- Jellyfin never spawns `ffmpeg`
+      for it. Progressive/download transcodes are deferred, no restart primitive to build the preemption
+      contract on yet (out of scope, A8). `TC_TRICKPLAY_OUTPUT_ROOT` is Jellyfin's `TempDirectory`, not the
+      final sprite-sheet directory Jellyfin later reads from -- the two are wired together by a shared volume
+      mount, which is P3 work (deploy manifests), not this item. A1 (REVISED): a pool failure before a first
+      frame reruns locally (exit 0); a pool failure once a first frame exists exits the shim non-zero with no
+      local rerun (a from-scratch rerun can't catch the pool's high-water mark inside Jellyfin's ~20s poll
+      window) -- Jellyfin retries it as a normal failed trickplay task. Suite cases 15-19 (proto_test.sh)
+- [x] Seek affinity (PLAYBACK only): a fresh `rank()` on every ffmpeg restart (seek, audio/subtitle
+      track change, bitrate switch, failover) could hop a session between the Arc (QSV) and the P4
+      (NVENC) mid-playback and show a visible quality step, so the shim now pins a session to its
+      first worker and keeps it there through ordinary restarts. Key: the HLS output prefix
+      `lease::lease_path` already derives its lock file from -- Jellyfin computes it as
+      `MD5(MediaPath-UserAgent-DeviceId-PlaySessionId)` and every `DynamicHlsController` restart
+      handler carries the same `playSessionId` straight through
+      (`Jellyfin.Api/Helpers/StreamingHelpers.cs:377-386`, `DynamicHlsController.cs:229` et al. in
+      `~/.cache/jellymesh-vendor/jellyfin-src`), so it is stable **server-side** across any restart
+      that carries an existing `playSessionId`, and changes only on a genuinely new session.
+      Verified for a seek; whether a client-driven track/bitrate change reuses `PlaySessionId`
+      rather than re-invoking `/PlaybackInfo` (which mints a fresh one --
+      `MediaInfoHelper.cs:132`) was not independently checked -- no jellyfin-web client source is
+      vendored here (see `crates/shim/src/affinity.rs`'s doc comment). Store: `<md5>.worker`, a
+      sibling of the lease lock in the shared scratch dir (so every Jellyfin replica sees it),
+      written atomically (tmp + rename) with the winning `Worker.name` on every PLAYBACK
+      `Accepted`, never for BATCH. Use: `apply_affinity` moves the pinned worker to the front of
+      `rank()`'s output when it answered Hello this round and still shows free capacity; `Caps`
+      carries no draining flag, so a pinned-but-draining worker is only caught by its
+      `Busy{reason:"draining"}` at admission, which the existing per-candidate loop already falls
+      through on -- no new field needed. Failover: the pin is cleared before the 255-exit site (a
+      worker LOST mid-transcode, or another replica's lease holder gone after the first segment),
+      before a non-zero exit from the agent's own stall watchdog or drain (a wedged/hung card, or
+      a rolling update -- these reach the shim the same as any other post-first-segment failure,
+      not as a dropped connection), and opportunistically by `affinity::sweep_stale` for any file
+      past `TC_AFFINITY_TTL_SECS` that a session never revisits, so the restart ranks fresh
+      instead of returning to a card that just died or is draining, and a fully-orphaned pin does
+      not sit in shared scratch forever; a clean Busy/refusal, or the file's own session simply
+      ending cleanly, leaves it alone otherwise. `TC_AFFINITY_TTL_SECS` (default 6h) ages out an
+      orphaned file; `TC_AFFINITY=0` disables the feature (default on). Unit tests:
+      `crates/shim/src/affinity.rs` (round-trip, overwrite, clear, sweep, TTL, garbage/blank
+      content, env parsing) and `crates/shim/src/tests.rs` (`apply_affinity_*`); suite case 20
+      (proto_test.sh) exercises the full write-on-Accept / seek-stays-pinned /
+      kill-clears-and-fails-over / stall-clears-and-fails-over path against the native binaries.
 - [ ] Chaos CronJob + Kuma push monitor (weekly drills against a canary)
 - [ ] Drain drill: `kubectl drain` a GPU node during 3 sessions → 0 failed requests
 
@@ -222,6 +263,22 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
 - [x] Resolution-weighted capacity (Arc 14 / 4K 2.3, P4 6 / 4K 2), busy → next worker, free-capacity ranking
 - [~] Emergency degrade (fastest preset + emergency capacity when every worker is busy)
 - [ ] Online cost model (EWMA of unpaused speed), quality-aware placement score, power-of-two-choices
+- [ ] Sticky server failover (future release, Brian 2026-09-27): prod's Traefik failover route sends a
+      failed-over viewer back to the primary as soon as it is healthy, so one failover costs two ffmpeg
+      restarts. MEASURED 2026-09-27 18:02Z/18:05Z: a Safari remux (video copy, DTS->AAC) restarted at 49:12
+      on the fallback and again at 52:48 on the primary, and the viewer reported audio drifting out of sync.
+      Pin sessions with a sticky cookie so new sessions prefer the primary but a failed-over one stays put.
+      Prototype + drill in jm-lab first. Related: remux restarts can drift A/V (video resumes on a source
+      keyframe, audio at the exact second); add an A/V start-PTS check to the restart drills.
+- [ ] Trickplay resume from high-water mark: instead of retrying whole (§10 P2), resume a preempted-after-first-
+      -frame job with `-ss` + `-start_number` at the pool's last complete frame. Not done in P2 because of four
+      unresolved hazards (A1 REVISED): (1) keyframe-only mode (`-skip_frame nokey`, no `setpts`) doesn't land on
+      an `N * interval` boundary after a seek, so the resumed sequence can't be spliced onto the original
+      numbering; (2) the pool's last `.jpg` may be truncated by the kill, so resuming needs an EOI-byte check to
+      decide whether to resume at N or overwrite N-1; (3) `-threads 1` software seek+decode of a 4K source may
+      itself exceed Jellyfin's ~20s trickplay window, i.e. the resume could be slower than a full local retry;
+      (4) resuming changes the argv the pool renders, which breaks the "exec_real preserves argv exactly"
+      invariant every other fallback in this codebase relies on
 
 ### P5 Quality
 - [x] Baseline measured (P0, calibration/README.md): Arc delivers 16-22% of the cap, VMAF 87.1/87.5 @8M
@@ -245,8 +302,10 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
 **How it stays seamless.** Jellyfin is not modified. It runs with hardware acceleration
 **none**, so it always emits a portable software command line (`libx264`/`libx265`, `scale`,
 `tonemapx`). The shim sits at Jellyfin's configured ffmpeg path. Every HLS transcode goes to the
-pool, and every other invocation (probes, `-encoders`, trickplay, subtitle extraction) execs the
-real local ffmpeg. Each agent swaps in its own card's decoder, encoder and GPU filter chain
+pool. Every other invocation (probes, `-encoders`, subtitle extraction) execs the real local
+ffmpeg unconditionally; trickplay does too unless `TC_BATCH=1` and its output directory is under
+`TC_TRICKPLAY_OUTPUT_ROOT` (§10 P2, shipped dark), in which case it routes to the pool at
+`Priority::Batch` instead. Each agent swaps in its own card's decoder, encoder and GPU filter chain
 (`crates/ir/src/lib.rs`, `filters.rs`). Consequences:
 - Jellyfin needs no GPU, and its per-device probes (`IsVaapiDevice*`) never matter, because they
   only feed vaapi/qsv command building (EncodingHelper.cs:1051).

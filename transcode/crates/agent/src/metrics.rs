@@ -25,10 +25,19 @@ pub enum Outcome {
     Stalled,
     Drained,
     GpuFilterFallback,
+    /// A BATCH job's `reserve_batch` refused because admitting it would have eaten into
+    /// `TC_BATCH_HEADROOM` (distinct from `Busy`'s `"capacity"`/`"draining"`/`"batch-disabled"`
+    /// reasons, which are not headroom-specific).
+    BusyHeadroom,
+    /// A BATCH job ended because a PLAYBACK admission preempted it (before or after it produced
+    /// any output).
+    Preempted,
+    /// A BATCH job was admitted (counted in addition to, not instead of, `Accepted`).
+    BatchAccepted,
 }
 
 impl Outcome {
-    pub const ALL: [Outcome; 9] = [
+    pub const ALL: [Outcome; 12] = [
         Outcome::Accepted,
         Outcome::Busy,
         Outcome::RefusedPolicy,
@@ -38,6 +47,9 @@ impl Outcome {
         Outcome::Stalled,
         Outcome::Drained,
         Outcome::GpuFilterFallback,
+        Outcome::BusyHeadroom,
+        Outcome::Preempted,
+        Outcome::BatchAccepted,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -51,6 +63,9 @@ impl Outcome {
             Outcome::Stalled => "stalled",
             Outcome::Drained => "drained",
             Outcome::GpuFilterFallback => "gpu_filter_fallback",
+            Outcome::BusyHeadroom => "busy_headroom",
+            Outcome::Preempted => "preempted",
+            Outcome::BatchAccepted => "batch_accepted",
         }
     }
 }
@@ -237,6 +252,22 @@ pub fn render(state: &State) -> String {
     let _ = writeln!(out, "# TYPE tcpool_jobs_active gauge");
     let _ = writeln!(out, "tcpool_jobs_active{{{labels}}} {}", state.usage.jobs());
 
+    let (batch_used, batch_jobs) = state.usage.batch_snapshot();
+    let _ = writeln!(out, "# TYPE tcpool_batch_units_used gauge");
+    let _ = writeln!(
+        out,
+        "tcpool_batch_units_used{{{labels}}} {}",
+        fmt_f64(batch_used)
+    );
+    let _ = writeln!(out, "# TYPE tcpool_batch_jobs_active gauge");
+    let _ = writeln!(out, "tcpool_batch_jobs_active{{{labels}}} {batch_jobs}");
+    let _ = writeln!(out, "# TYPE tcpool_batch_headroom_units gauge");
+    let _ = writeln!(
+        out,
+        "tcpool_batch_headroom_units{{{labels}}} {}",
+        fmt_f64(state.usage.headroom())
+    );
+
     let _ = writeln!(out, "# TYPE tcpool_jobs_total counter");
     for outcome in Outcome::ALL {
         let n = state.metrics.jobs_total[outcome as usize].load(Ordering::Relaxed);
@@ -399,11 +430,18 @@ mod tests {
         m.inc(Outcome::Accepted);
         m.inc(Outcome::Accepted);
         m.inc(Outcome::ExitOk);
+        m.inc(Outcome::BusyHeadroom);
+        m.inc(Outcome::Preempted);
+        m.inc(Outcome::Preempted);
+        m.inc(Outcome::BatchAccepted);
         for outcome in Outcome::ALL {
             let n = m.jobs_total[outcome as usize].load(Ordering::Relaxed);
             match outcome {
                 Outcome::Accepted => assert_eq!(n, 2),
                 Outcome::ExitOk => assert_eq!(n, 1),
+                Outcome::BusyHeadroom => assert_eq!(n, 1),
+                Outcome::Preempted => assert_eq!(n, 2),
+                Outcome::BatchAccepted => assert_eq!(n, 1),
                 _ => assert_eq!(n, 0),
             }
         }

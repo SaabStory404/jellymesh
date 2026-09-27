@@ -340,6 +340,153 @@ pub fn is_hls_transcode(args: &[String]) -> bool {
     args.iter().any(|a| a.ends_with(".m3u8")) && args.iter().any(|a| a == "-i")
 }
 
+/// The command shape, for routing and for `validate::validate`'s per-shape allowlist rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// An HLS transcode: `is_hls_transcode` (unchanged).
+    Hls,
+    /// Jellyfin's trickplay sprite extraction: `mjpeg` to a `%0Nd.jpg` pattern.
+    Trickplay,
+    /// Anything else (probes, `-encoders`, chapter images, subtitle extraction, ...): the shim
+    /// execs it locally, unchanged.
+    Other,
+}
+
+/// Classify a command line. `Hls` is checked first, so a (theoretical) argv matching both shapes
+/// keeps today's HLS behavior.
+pub fn classify(args: &[String]) -> Shape {
+    if is_hls_transcode(args) {
+        return Shape::Hls;
+    }
+    if is_trickplay(args) {
+        return Shape::Trickplay;
+    }
+    Shape::Other
+}
+
+fn video_codec_value(args: &[String]) -> Option<&str> {
+    args.iter()
+        .position(|a| is_video_codec_flag(a))
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+/// `true` for a value shaped like image2's frame-number pattern (`%d` or `%0[1-9]d`) ending in
+/// `.jpg`/`.jpeg` -- Jellyfin's trickplay output. The pattern must sit immediately before the
+/// extension, matching every trickplay argv seen (`.../%08d.jpg`); this also excludes
+/// chapter-image extraction, which writes a single fixed `<guid>.jpg` with no `%d` at all.
+pub(crate) fn is_trickplay_pattern(s: &str) -> bool {
+    let s = s.trim_matches('"');
+    let stem = match s.strip_suffix(".jpg").or_else(|| s.strip_suffix(".jpeg")) {
+        Some(stem) => stem,
+        None => return false,
+    };
+    if stem.ends_with("%d") {
+        return true;
+    }
+    let bytes = stem.as_bytes();
+    if bytes.len() >= 4 {
+        let tail = &bytes[bytes.len() - 4..];
+        // %0Nd, N in 1..=9 (0 would be a no-op width, and image2 pads left with zeros anyway).
+        if tail[0] == b'%'
+            && tail[1] == b'0'
+            && tail[2].is_ascii_digit()
+            && tail[2] != b'0'
+            && tail[3] == b'd'
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_trickplay(args: &[String]) -> bool {
+    args.iter().any(|a| a == "-i")
+        && video_codec_value(args) == Some("mjpeg")
+        && args.last().is_some_and(|a| is_trickplay_pattern(a))
+}
+
+/// The directory a trickplay job writes its frames into (the parent of the final `%0Nd.jpg`
+/// pattern).
+pub fn trickplay_output_dir(args: &[String]) -> Option<String> {
+    let last = args.last()?.trim_matches('"');
+    std::path::Path::new(last)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Replace a `%d`/`%0Nd` token with `n`, zero-padded to its declared width (`%d` gets no padding).
+fn replace_frame_token(pattern: &str, n: u64) -> Option<String> {
+    let pos = pattern.rfind('%')?;
+    let rest = &pattern[pos + 1..];
+    if let Some(after) = rest.strip_prefix('d') {
+        return Some(format!("{}{n}{after}", &pattern[..pos]));
+    }
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0] == b'0'
+        && bytes[1].is_ascii_digit()
+        && bytes[1] != b'0'
+        && bytes[2] == b'd'
+    {
+        let width = (bytes[1] - b'0') as usize;
+        return Some(format!("{}{n:0width$}{}", &pattern[..pos], &rest[3..]));
+    }
+    None
+}
+
+/// The first frame file a trickplay job writes: the output pattern with its `%0Nd`/`%d` token
+/// replaced by `-start_number` (or image2's own default, `1` -- unlike HLS's `0`, and unlike
+/// `first_segment` there is no `-start_number` in today's trickplay argv, but honour one if
+/// Jellyfin ever emits it).
+pub fn trickplay_first_frame(args: &[String]) -> Option<String> {
+    let pattern = args.last()?.trim_matches('"');
+    let start: u64 = value_of(args, "-start_number")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    replace_frame_token(pattern, start)
+}
+
+/// Adapt a trickplay command to `backend`. A parallel, narrow renderer -- not a `translate()`
+/// extension -- so the HLS path (and the 201-golden parity test) is byte-identical by
+/// construction, not by care: nothing here is reachable from `translate()`/`render()`.
+///
+/// - Hardware **decode only** (no `-hwaccel_output_format`): frames land in system memory, so the
+///   untouched CPU `-vf` chain (`fps`/`setpts`/`scale`, none of which are in `filters::hw_filters`'s
+///   `KNOWN` list -- there is no GPU chain to move them to) and the always-software `mjpeg` encoder
+///   see exactly what they do today. This is the standard, widely-used ffmpeg shape
+///   (`-hwaccel cuda -i ... <software filters/encoder>`); a worker whose hardware decoder rejects
+///   a source (an unusual codec/profile) just exits non-zero before writing anything, and the
+///   shim's contract (see `shim::run_batch`'s `batch_pool_failure`) reruns a failure with no
+///   frame on disk locally regardless of *why* the worker failed, so there is no golden-path or
+///   correctness risk from choosing hardware decode here.
+/// - `-c:v mjpeg`, `-crf`/`-preset`, and `-forced_idr` are untouched: none apply to mjpeg, and
+///   `translate()`'s forced-IDR splice is deliberately not reused (see the module docs above).
+/// - `-stats` is inserted right after `-loglevel`'s value (defensively prepended if `-loglevel` is
+///   ever absent): `-loglevel error` alone suppresses ffmpeg's `time=` progress line, which the
+///   agent's stall watchdog keys on; `-stats` overrides that and is already flag-allowlisted.
+pub fn render_trickplay(args: &[String], backend: Backend, o: &TranslateOpts) -> Translated {
+    let mut out: Vec<String> = args.iter().map(|a| map_path(a, &o.pathmap)).collect();
+    if let Some(first_input) = out.iter().position(|a| a == "-i") {
+        let dec: Vec<String> = backend
+            .hwaccel_args()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        out.splice(first_input..first_input, dec);
+    }
+    if !out.iter().any(|a| a == "-stats") {
+        match out.iter().position(|a| a == "-loglevel") {
+            Some(i) => out.insert((i + 2).min(out.len()), "-stats".to_string()),
+            None => out.insert(0, "-stats".to_string()),
+        }
+    }
+    Translated {
+        args: out,
+        gpu_filters: false,
+    }
+}
+
 fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.iter()
         .position(|a| a == flag)
@@ -484,6 +631,164 @@ mod tests {
         assert_eq!(required_output(&a), Some("hevc10"));
         let c = s(&["-i", "x", "-codec:v:0", "copy"]);
         assert_eq!(required_output(&c), None);
+    }
+
+    fn trickplay_row(keyframe_only: bool, fps_flag: &[&str], out: &str) -> Vec<String> {
+        let mut v: Vec<String> = Vec::new();
+        v.extend(s(&["-loglevel", "error", "-threads", "1"]));
+        if keyframe_only {
+            v.extend(s(&["-skip_frame", "nokey"]));
+        }
+        v.extend(s(&[
+            "-i",
+            "file:/media/movies/x.mkv",
+            "-map",
+            "0:0",
+            "-an",
+            "-sn",
+        ]));
+        let vf = if keyframe_only {
+            "fps=0.1,scale=320:-2".to_string()
+        } else {
+            "setpts=N/23.976/TB,fps=0.1,scale=320:-2".to_string()
+        };
+        v.push("-vf".to_string());
+        v.push(vf);
+        v.extend(s(&["-threads", "1", "-c:v", "mjpeg", "-qscale:v", "4"]));
+        v.extend(fps_flag.iter().map(|x| x.to_string()));
+        v.extend(s(&["-f", "image2", out]));
+        v
+    }
+
+    #[test]
+    fn classify_recognises_trickplay_shapes_and_rejects_chapter_images() {
+        let sdr = trickplay_row(false, &["-vsync", "0"], "/tmp/tp/a/%08d.jpg");
+        assert_eq!(classify(&sdr), Shape::Trickplay);
+        let keyframe_only =
+            trickplay_row(true, &["-fps_mode", "passthrough"], "/tmp/tp/b/%08d.jpg");
+        assert_eq!(classify(&keyframe_only), Shape::Trickplay);
+        let hdr_4k = trickplay_row(false, &["-fps_mode", "passthrough"], "/tmp/tp/c/%08d.jpeg");
+        assert_eq!(classify(&hdr_4k), Shape::Trickplay);
+        let bare_pct_d = trickplay_row(false, &["-vsync", "0"], "/tmp/tp/d/%d.jpg");
+        assert_eq!(classify(&bare_pct_d), Shape::Trickplay);
+
+        // Existing HLS golden shape stays Hls, unchanged.
+        let hls = s(&[
+            "-i",
+            "x",
+            "-codec:v:0",
+            "libx264",
+            "-f",
+            "hls",
+            "-hls_segment_filename",
+            "/t/a%d.ts",
+            "-y",
+            "/t/a.m3u8",
+        ]);
+        assert_eq!(classify(&hls), Shape::Hls);
+
+        // Chapter images: -vframes 1 to a fixed <guid>.jpg, no %0Nd pattern -- the explicit
+        // negative case (must not be mistaken for trickplay).
+        let chapter = s(&[
+            "-loglevel",
+            "error",
+            "-i",
+            "file:/media/movies/x.mkv",
+            "-map",
+            "0:0",
+            "-vframes",
+            "1",
+            "-c:v",
+            "mjpeg",
+            "-f",
+            "image2",
+            "/tmp/chapters/9f1c2b3a.jpg",
+        ]);
+        assert_eq!(classify(&chapter), Shape::Other);
+    }
+
+    #[test]
+    fn trickplay_first_frame_defaults_to_start_1_and_honours_start_number() {
+        let a = trickplay_row(false, &["-vsync", "0"], "/tmp/tp/%08d.jpg");
+        assert_eq!(
+            trickplay_first_frame(&a).as_deref(),
+            Some("/tmp/tp/00000001.jpg")
+        );
+        let mut b = a.clone();
+        let n = b.len();
+        b.splice(n - 1..n - 1, s(&["-start_number", "5"]));
+        assert_eq!(
+            trickplay_first_frame(&b).as_deref(),
+            Some("/tmp/tp/00000005.jpg")
+        );
+        let bare = trickplay_row(false, &["-vsync", "0"], "/tmp/tp/%d.jpg");
+        assert_eq!(
+            trickplay_first_frame(&bare).as_deref(),
+            Some("/tmp/tp/1.jpg")
+        );
+    }
+
+    #[test]
+    fn trickplay_output_dir_is_the_pattern_parent() {
+        let a = trickplay_row(false, &["-vsync", "0"], "/tmp/tp/guid1/%08d.jpg");
+        assert_eq!(trickplay_output_dir(&a).as_deref(), Some("/tmp/tp/guid1"));
+    }
+
+    #[test]
+    fn render_trickplay_leaves_mjpeg_and_vf_untouched_and_adds_stats_and_hwaccel() {
+        let a = trickplay_row(false, &["-vsync", "0"], "/tmp/tp/%08d.jpg");
+        let vf_before = a[a.iter().position(|x| x == "-vf").unwrap() + 1].clone();
+        for backend in [Backend::Cpu, Backend::Qsv, Backend::Nvenc] {
+            let r = render_trickplay(&a, backend, &TranslateOpts::default());
+            assert!(!r.gpu_filters);
+            assert_eq!(
+                r.args[r.args.iter().position(|x| x == "-c:v").unwrap() + 1],
+                "mjpeg"
+            );
+            assert!(!r
+                .args
+                .iter()
+                .any(|x| x == "-forced_idr" || x == "-forced-idr"));
+            let vf_after = &r.args[r.args.iter().position(|x| x == "-vf").unwrap() + 1];
+            assert_eq!(vf_after, &vf_before, "backend {backend:?} touched -vf");
+            assert_eq!(
+                r.args.iter().filter(|x| *x == "-stats").count(),
+                1,
+                "backend {backend:?}: -stats must appear exactly once"
+            );
+            let has_hwaccel = r.args.iter().any(|x| x == "-hwaccel");
+            match backend {
+                Backend::Cpu => assert!(!has_hwaccel, "CPU must not get decode hwaccel args"),
+                Backend::Qsv | Backend::Nvenc => {
+                    assert!(has_hwaccel, "{backend:?} must get decode hwaccel args");
+                    let i_pos = r.args.iter().position(|x| x == "-i").unwrap();
+                    let hw_pos = r.args.iter().position(|x| x == "-hwaccel").unwrap();
+                    assert!(hw_pos < i_pos, "hwaccel args must precede -i");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_trickplay_inserts_stats_after_loglevel_value_or_at_front() {
+        let a = trickplay_row(false, &["-vsync", "0"], "/tmp/tp/%08d.jpg");
+        let r = render_trickplay(&a, Backend::Cpu, &TranslateOpts::default());
+        let ll = r.args.iter().position(|x| x == "-loglevel").unwrap();
+        assert_eq!(r.args[ll + 2], "-stats");
+
+        let no_loglevel = s(&[
+            "-i",
+            "file:/media/movies/x.mkv",
+            "-vf",
+            "fps=0.1",
+            "-c:v",
+            "mjpeg",
+            "-f",
+            "image2",
+            "/tmp/tp/%08d.jpg",
+        ]);
+        let r2 = render_trickplay(&no_loglevel, Backend::Cpu, &TranslateOpts::default());
+        assert_eq!(r2.args[0], "-stats");
     }
 
     #[test]
