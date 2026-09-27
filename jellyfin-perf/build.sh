@@ -13,7 +13,7 @@ git -C "$SRC" checkout -q -f v12.1
 git -C "$SRC" apply "$HERE/jellyfin-12.1-perf.patch"
 dotnet build "$SRC/Jellyfin.Server/Jellyfin.Server.csproj" -c Release
 mkdir -p "$OUT"
-for a in Emby.Server.Implementations Jellyfin.Server.Implementations MediaBrowser.Controller; do
+for a in Emby.Server.Implementations Jellyfin.Server.Implementations MediaBrowser.Controller MediaBrowser.MediaEncoding; do
   cp "$SRC/Jellyfin.Server/bin/Release/net10.0/$a.dll" "$OUT/"
 done
 echo "overlay in $OUT"

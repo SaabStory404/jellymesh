@@ -1,3 +1,26 @@
+diff --git a/Emby.Server.Implementations/AppBase/BaseApplicationPaths.cs b/Emby.Server.Implementations/AppBase/BaseApplicationPaths.cs
+index 56d977b..a7c1b44 100644
+--- a/Emby.Server.Implementations/AppBase/BaseApplicationPaths.cs
++++ b/Emby.Server.Implementations/AppBase/BaseApplicationPaths.cs
+@@ -147,7 +147,17 @@ namespace Emby.Server.Implementations.AppBase
+             var markerPath = Path.Combine(path, markerName);
+             if (!File.Exists(markerPath))
+             {
+-                FileHelper.CreateEmpty(markerPath);
++                try
++                {
++                    FileHelper.CreateEmpty(markerPath);
++                }
++                catch (IOException) when (File.Exists(markerPath))
++                {
++                    // Another request created it concurrently (CreateEmpty opens with FileShare.None).
++                    // GetTranscodePath runs on every transcode and DeleteEncodedMediaCache removes the
++                    // marker at startup, so two transcodes starting together raced here and one failed
++                    // with HTTP 500 "being used by another process" (seen on an NFS transcode dir).
++                }
+             }
+         }
+     }
 diff --git a/Emby.Server.Implementations/Dto/DtoService.cs b/Emby.Server.Implementations/Dto/DtoService.cs
 index e539508..87f3f11 100644
 --- a/Emby.Server.Implementations/Dto/DtoService.cs
@@ -616,3 +639,41 @@ index de04ff0..6d3aa40 100644
      /// <summary>
      /// Saves the media streams.
      /// </summary>
+diff --git a/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs b/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
+index dfc057f..a534fdd 100644
+--- a/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
++++ b/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
+@@ -532,6 +532,10 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+         }
+         else if (transcodingJob.ExitCode != 0)
+         {
++            // Unregister the job, or it stays in _activeTranscodingJobs with ActiveRequestCount = 1
++            // (the decrement lives in the segment response's OnCompleted, which is never reached) and
++            // every retry for this play session spins forever in WaitForActiveTranscodingRequests.
++            OnTranscodeFailedToStart(outputPath, transcodingJob.Type, state);
+             throw new FfmpegException(string.Format(CultureInfo.InvariantCulture, "FFmpeg exited with code {0}", transcodingJob.ExitCode));
+         }
+ 
+@@ -723,10 +727,22 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+             return;
+         }
+ 
++        // JELLYFIN_SHARED_DB=1: several Jellyfin replicas share one transcode dir, so wiping it at
++        // startup would delete the segments another replica is serving right now. Only clear what is
++        // old enough to belong to no live session.
++        var sharedCutoff = Environment.GetEnvironmentVariable("JELLYFIN_SHARED_DB") == "1"
++            ? DateTime.UtcNow.AddHours(-6)
++            : (DateTime?)null;
++
+         foreach (var file in _fileSystem.GetFilePaths(path, true))
+         {
+             try
+             {
++                if (sharedCutoff is { } cutoff && File.GetLastWriteTimeUtc(file) > cutoff)
++                {
++                    continue;
++                }
++
+                 _fileSystem.DeleteFile(file);
+             }
+             catch (Exception ex)

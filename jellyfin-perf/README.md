@@ -12,6 +12,9 @@ assemblies it touches; the lab mounts them over the stock image
 | `HasLyrics` for a page of tracks in one query (`IMediaStreamRepository.GetItemIdsWithStreamType`) | `DtoService` | one full stream load per Audio item: 200 statements per 200-track grid |
 | Dedupe by id sub-select instead of `DISTINCT` over whole rows | `BaseItemRepository.ApplyGroupingFilter` | DISTINCT hashed the multi-KB `Data` JSON of every row into temp tables |
 | "Date played" sort key: alternate versions looked up from the `PrimaryVersionId` index (MAX over the item's alternates of a per-alternate lookup), combined with the item's own by CASE, instead of MAX over a correlated UNION ALL | `OrderMapper` (DatePlayed) | MySQL drove the alternate side from every UserData row of the user, per sorted row: 166,800 lookups for 400 candidates. Resume 0.4-2.6 s with a few hundred in-progress items → 0.14 s |
+| Early-exit wedge fix: unregister a transcode whose ffmpeg exited non-zero before its first segment | `TranscodeManager` | otherwise every retry of that play session spins forever (found by the transcode-mesh work) |
+| Transcode marker created race-safely | `BaseApplicationPaths` | two transcodes right after a wipe raced on `.jellyfin-transcode` (FileShare.None) → one HTTP 500 |
+| Shared mode: the startup wipe of the transcode dir only deletes files older than 6 h | `TranscodeManager.DeleteEncodedMediaCache` | several replicas share one transcode dir; a restart must not delete another replica's live segments |
 | User-data save retried (fresh context, jittered backoff, 6 attempts) on a write conflict | `UserDataManager.SaveUserData` | check-then-insert is atomic only where writes serialize (SQLite). On MySQL, concurrent first progress reports for one item raced on the insert (stock: 2-7 of 200 → HTTP 500); multi-writer Galera aborted commits on certification (35% → 500). Patched: 200/200 in both, 200/200 on SQLite |
 
 ## Shared-database mode (`JELLYFIN_SHARED_DB=1`)

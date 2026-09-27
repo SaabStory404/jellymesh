@@ -1,11 +1,20 @@
-# JellyMesh Jellyfin: hotio Jellyfin 12.1 (digest-pinned, the build the patch is tested against)
-# + jellymesh/jellyfin-perf patch (query shapes, write retry, JELLYFIN_SHARED_DB mode)
-# + the Galera provider plugin and jellyfin-dbmigrate under /opt/jellymesh (installed into
-#   /config by the cutover Job; Jellyfin only loads plugins from /config/data/plugins).
+# jellymesh-jellyfin: one image for Jellyfin replicas AND transcode workers.
+#   hotio Jellyfin 12.1 (digest-pinned; the build the patches are tested against)
+#   + jellyfin-perf patch DLLs (query shapes, write retry, JELLYFIN_SHARED_DB mode, transcode
+#     fixes: early-exit wedge, marker race, no startup wipe of a shared transcode dir)
+#   + plugins under /opt/jellymesh/plugins (Galera provider, Lease task leader), installed into
+#     /config by /opt/jellymesh/install-plugins.sh (initContainer)
+#   + transcode mesh code (shim, agent, mesh-sync) under /opt/jellymesh/transcode
+#   + jellyfin-dbmigrate (SQLite <-> MySQL/Galera, self-contained)
+#   + hotio's s6 run script with TMPDIR overridable (per-replica temp dir)
+# Build context: see stage_jm3.py in the JellyMesh repo notes; SHA256SUMS lists every file.
 FROM ghcr.io/hotio/jellyfin:release-12.1@sha256:81de291f9d0813350ad6412e10f3333c4153276798e1f44c3b9e862791fecda3
-COPY overlay/Emby.Server.Implementations.dll overlay/Jellyfin.Server.Implementations.dll overlay/MediaBrowser.Controller.dll /usr/lib/jellyfin/bin/
-COPY plugin/ /opt/jellymesh/plugin/
+COPY overlay/ /usr/lib/jellyfin/bin/
+COPY s6/run /etc/s6-overlay/s6-rc.d/service-jellyfin/run
+COPY plugins/ /opt/jellymesh/plugins/
+COPY transcode/ /opt/jellymesh/transcode/
+COPY install-plugins.sh /opt/jellymesh/install-plugins.sh
 COPY dbmigrate/jellyfin-dbmigrate dbmigrate/libe_sqlite3.so /opt/jellymesh/
 COPY SHA256SUMS /opt/jellymesh/SHA256SUMS
 LABEL org.opencontainers.image.source="https://github.com/SaabStory404/jellymesh" \
-      org.opencontainers.image.description="Jellyfin 12.1 + JellyMesh patch + Galera provider"
+      org.opencontainers.image.description="Jellyfin 12.1 + JellyMesh (shared-database HA) + transcode mesh"
