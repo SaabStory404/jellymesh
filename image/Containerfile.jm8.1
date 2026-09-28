@@ -1,0 +1,21 @@
+# jellymesh-jellyfin 12.1-jm8.1: jm8 with the pool-r1 shim and sync binaries.
+#
+# Same method and base as Containerfile.jm8 (jm8 branch):
+#   overlay/     jm8's 7 assemblies, unchanged (v12.1 + perf + bughunt 00-16; sha256 as in jm8's
+#                build context, extracted from the pushed 12.1-jm8 image and verified)
+#   tcpool-shim  pool-r1 build (see the pool-r1 release notes for whether it differs from jm8's)
+#   tcpool-sync  pool-r1 build
+#
+# The Galera provider, install-plugins.sh and /opt/jellymesh/SHA256SUMS are jm7.1's (not touched).
+# Pair with agents from the same pool-r1 commit (any agent works: an old agent ignores the
+# keepalive field, so the job is fenced on shim loss as before).
+#
+# Build context = a staging dir holding overlay/ plus the static musl binaries
+# (transcode/deploy/build-musl.sh), all from one committed SHA:
+#   podman build -f image/Containerfile.jm8.1 -t ghcr.io/saabstory404/jellymesh-jellyfin:12.1-jm8.1 <ctx>
+FROM ghcr.io/saabstory404/jellymesh-jellyfin:12.1-jm7.1@sha256:ec0d2bf6ec3c9771c93d558e4446499a0a1842dca256070c78f49ec74dc7e977
+COPY overlay/ /usr/lib/jellyfin/bin/
+COPY tcpool-shim /usr/lib/jellyfin-ffmpeg/ffmpeg
+COPY tcpool-sync /usr/local/bin/tcpool-sync
+LABEL org.opencontainers.image.source="https://github.com/SaabStory404/jellymesh" \
+      org.opencontainers.image.description="Jellyfin 12.1 + JellyMesh (shared-database HA, cross-node cache invalidation, shared transcode dir) + bughunt patches + transcode-pool shim (DV7->8.1)"
