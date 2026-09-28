@@ -311,9 +311,22 @@ pub fn render(args: &[String], backend: Backend, o: &TranslateOpts) -> Translate
     t
 }
 
-/// Target average bitrate as a percentage of the client's cap (`-maxrate`). Both cards were
-/// calibrated at 95% (MEASURED P0: Arc 94-97% delivered, never over; P4 96-105%).
+/// Target average bitrate as a percentage of the client's cap (`-maxrate`), QSV. MEASURED
+/// P0/P5/P5.1: the Arc delivers 94-97% of the cap at 95%, never over.
 pub const RC_TARGET_PCT: u64 = 95;
+/// Same for NVENC. The P4 delivers 7-9% **above** its `-b:v` (P5.1 lab, sample-b, VBV loose:
+/// 8183 kbps for 7600, 6492 for 6080, 4587 for 4275), so at 95% a binding 4M cap came out at
+/// 99.7-101.3% of the cap (P0: up to 105%). At 90% it delivered 96.5-98.4% of a 4M cap.
+pub const NVENC_TARGET_PCT: u64 = 90;
+
+/// The target percentage for `backend` (see `RC_TARGET_PCT`, `NVENC_TARGET_PCT`).
+pub fn target_pct(backend: Backend) -> u64 {
+    if backend == Backend::Nvenc {
+        NVENC_TARGET_PCT
+    } else {
+        RC_TARGET_PCT
+    }
+}
 /// Calibrated preset per backend (calibration README recommendation). Single-job cost vs the old
 /// `veryfast`/`p2` (MEASURED P0, min over titles at 8M): Arc 11.5x vs 11.1x realtime, P4 4.48x vs
 /// 4.56x.
@@ -365,7 +378,7 @@ fn is_opt(a: &str, base: &str) -> bool {
 /// Jellyfin's `-crf N -maxrate cap -bufsize 2cap` became `-global_quality N` (QSV) / `-cq N`
 /// (NVENC) in the parity translation. On the Arc that is CQP, which ignores the cap (MEASURED P0:
 /// 16-22% of the cap, VMAF 87 at 8 Mbps, identical at every rung). This replaces the quality
-/// target with a bitrate target of `RC_TARGET_PCT`% of `-maxrate`, keeps Jellyfin's
+/// target with a bitrate target of `target_pct(backend)`% of `-maxrate`, keeps Jellyfin's
 /// `-maxrate`/`-bufsize` exactly (clients depend on them), adds `rc_options`, and sets the
 /// calibrated preset.
 ///
@@ -397,7 +410,7 @@ pub fn apply_rate_control(args: &mut Vec<String>, backend: Backend) {
     let mut set: Vec<String> = Vec::with_capacity(opts.len() + 2);
     if !args.iter().any(|a| is_opt(a, "-b:v") || a == "-vb") {
         set.push("-b:v".into());
-        set.push((cap.saturating_mul(RC_TARGET_PCT) / 100).to_string());
+        set.push((cap.saturating_mul(target_pct(backend)) / 100).to_string());
     }
     set.extend(opts.iter().map(|s| s.to_string()));
     // The quality target goes; the rate-control set takes its slot (else follows -maxrate's value).
@@ -1424,7 +1437,7 @@ mod tests {
                     "-preset",
                     "p5",
                     "-b:v",
-                    "7600000",
+                    "7200000",
                     "-rc",
                     "vbr",
                     "-tune",
@@ -1450,7 +1463,7 @@ mod tests {
                     "-preset",
                     "p5",
                     "-b:v",
-                    "7600000",
+                    "7200000",
                     "-rc",
                     "vbr",
                     "-tune",
