@@ -155,8 +155,9 @@ public sealed partial class GaleraDatabaseProvider : IJellyfinDatabaseProvider
 
             return builder.ConnectionString;
         }
-        catch (ArgumentException)
+        catch (Exception ex) when (ex is ArgumentException or FormatException or InvalidOperationException)
         {
+            // Logging must never be what fails startup; a bad value (Port=abc) surfaces at connect.
             return PasswordPattern().Replace(connectionString, "$1*****");
         }
     }

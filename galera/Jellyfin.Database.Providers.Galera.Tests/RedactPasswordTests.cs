@@ -29,6 +29,7 @@ public class RedactPasswordTests
     [InlineData("Bogus Key=1;pwd='pre;" + Secret + "';Database=jellyfin")]
     [InlineData("Bogus Key=1;Password=\"a\"\"b;" + Secret + "\";Database=jellyfin")]
     [InlineData("Bogus Key=1;Password=" + Secret + ";Database=jellyfin")]
+    [InlineData("Port=abc;Password=\"pre;" + Secret + "\";Database=jellyfin")]
     public void FallbackMasksQuotedValues(string connectionString)
     {
         var redacted = GaleraDatabaseProvider.RedactPassword(connectionString);
