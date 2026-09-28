@@ -456,6 +456,7 @@ pub async fn run_job(
     let opts = TranslateOpts {
         pathmap: cfg.pathmap.clone(),
         gpu_filters: cfg.gpu_filters,
+        rate_control: cfg.rate_control,
     };
     let cwd = map_path(&job.cwd, &cfg.pathmap);
     let render_fn = |o: &TranslateOpts| {

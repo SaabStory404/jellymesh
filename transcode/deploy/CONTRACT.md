@@ -58,6 +58,7 @@ to a worker that is shutting down.
 | `TC_OUTPUT_ROOT` | `/transcodes` | allowlist: outputs only under here |
 | `TC_READ_ROOTS` | `/config/data/data/subtitles,/config/data/data/attachments` | subtitle burn-in and attachment fonts, read-only |
 | `TC_HW_FILTERS` | `0` on the CPU worker only | |
+| `TC_RC` | **unset** (= `calibrated`) | P5 per-encoder rate control; `legacy` restores the P1 `-global_quality`/`-cq` mapping on one card without a rebuild. Any other value fails agent startup |
 | `TC_PATHMAP` | **unset** | not needed: the agents mount `/data/media` at `/data/media`, the same path prod Jellyfin uses, so the command line's paths are already valid |
 
 ### Shim (inside Jellyfin, installed as `/usr/lib/jellyfin-ffmpeg/ffmpeg`)

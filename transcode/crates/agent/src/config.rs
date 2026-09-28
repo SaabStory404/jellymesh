@@ -23,6 +23,9 @@ pub struct Config {
     /// Operator restriction on the probed outputs (never an addition).
     pub outputs_allow: Option<Vec<String>>,
     pub gpu_filters: bool,
+    /// TC_RC=calibrated|legacy (default calibrated): P5 per-encoder rate control, or the P1 parity
+    /// mapping as a per-card rollback without a rebuild.
+    pub rate_control: tcpool_ir::RateControl,
     /// Upper bounds for Jellyfin's `-probesize`/`-analyzeduration` (bytes, microseconds); None = off.
     pub probe_clamp: Option<(u64, u64)>,
     /// Kill ffmpeg after this long without a client message (must stay below the shim's 6 s).
@@ -147,6 +150,11 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .map(|v| v.split(',').map(str::to_string).collect()),
             gpu_filters: env("TC_HW_FILTERS", "1") != "0",
+            rate_control: {
+                let v = env("TC_RC", "calibrated");
+                tcpool_ir::RateControl::parse(&v)
+                    .ok_or_else(|| format!("TC_RC={v}: want calibrated|legacy"))?
+            },
             // TC_PROBE_CLAMP="probesize,analyzeduration" (ffmpeg size syntax), "0" = off. See
             // tcpool_ir::clamp_probe for why the default is 50M,5M.
             probe_clamp: {
@@ -208,6 +216,7 @@ impl Config {
             weight_copy: 1.0,
             outputs_allow: None,
             gpu_filters: false,
+            rate_control: tcpool_ir::RateControl::Calibrated,
             probe_clamp: None,
             fence_after: Duration::from_secs(3),
             stall_after: Duration::from_secs(20),

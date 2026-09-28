@@ -118,7 +118,7 @@ proptest! {
 
         for backend in [Backend::Cpu, Backend::Qsv, Backend::Nvenc] {
             for gpu_filters in [false, true] {
-                let opts = TranslateOpts { pathmap: vec![], gpu_filters };
+                let opts = TranslateOpts { pathmap: vec![], gpu_filters, ..Default::default() };
                 let out = render(&mutated, backend, &opts);
                 prop_assert!(
                     validate(&out.args, &p, Shape::Hls).is_ok(),
