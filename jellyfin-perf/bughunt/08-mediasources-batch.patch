@@ -1,0 +1,1048 @@
+diff --git a/Emby.Server.Implementations/Dto/DtoService.cs b/Emby.Server.Implementations/Dto/DtoService.cs
+index 87f3f113e..78f118373 100644
+--- a/Emby.Server.Implementations/Dto/DtoService.cs
++++ b/Emby.Server.Implementations/Dto/DtoService.cs
+@@ -19,6 +19,7 @@ using MediaBrowser.Controller.Entities;
+ using MediaBrowser.Controller.Entities.Audio;
+ using MediaBrowser.Controller.Library;
+ using MediaBrowser.Controller.LiveTv;
++using MediaBrowser.Controller.MediaSegments;
+ using MediaBrowser.Controller.Playlists;
+ using MediaBrowser.Controller.Persistence;
+ using MediaBrowser.Controller.Providers;
+@@ -129,6 +130,7 @@ namespace Emby.Server.Implementations.Dto
+         private readonly IChapterManager _chapterManager;
+ 
+         private readonly IMediaStreamRepository _mediaStreamRepository;
++        private readonly IMediaSegmentManager _mediaSegmentManager;
+ 
+         public DtoService(
+             ILogger<DtoService> logger,
+@@ -142,9 +144,11 @@ namespace Emby.Server.Implementations.Dto
+             Lazy<ILiveTvManager> livetvManagerFactory,
+             ITrickplayManager trickplayManager,
+             IChapterManager chapterManager,
+-            IMediaStreamRepository mediaStreamRepository)
++            IMediaStreamRepository mediaStreamRepository,
++            IMediaSegmentManager mediaSegmentManager)
+         {
+             _mediaStreamRepository = mediaStreamRepository;
++            _mediaSegmentManager = mediaSegmentManager;
+             _logger = logger;
+             _libraryManager = libraryManager;
+             _userDataRepository = userDataRepository;
+@@ -281,6 +285,15 @@ namespace Emby.Server.Implementations.Dto
+                 ? _mediaStreamRepository.GetItemIdsWithStreamType(audioIds, MediaStreamType.Lyric)
+                 : null;
+ 
++            // Batch-fetch media streams, attachments and has-segments flags for a page of
++            // Video/Audio items: otherwise every item with MediaSources or MediaStreams requested
++            // loads its own streams/attachments/segments one item at a time inside GetVersionInfo
++            // (3 statements per version, e.g. 600 for a 200-item grid). Only Video and Audio route
++            // their versions through that batchable lookup (see MediaSourcePrefetch); other
++            // IHasMediaSources items (a live TV channel) build their sources without touching the
++            // database and are unaffected either way.
++            var mediaSourcePrefetch = BuildMediaSourcePrefetch(accessibleItems, options);
++
+             for (int index = 0; index < accessibleItems.Count; index++)
+             {
+                 var item = accessibleItems[index];
+@@ -297,7 +310,8 @@ namespace Emby.Server.Implementations.Dto
+                     resumeDataBatch?.GetValueOrDefault(item.Id),
+                     peopleBatch,
+                     alternateVersionItemIds,
+-                    lyricItemIds);
++                    lyricItemIds,
++                    mediaSourcePrefetch);
+ 
+                 if (item is LiveTvChannel tvChannel)
+                 {
+@@ -362,7 +376,8 @@ namespace Emby.Server.Implementations.Dto
+             VersionResumeData? resumeData = null,
+             IReadOnlyDictionary<Guid, IReadOnlyList<PersonInfo>>? peopleBatch = null,
+             IReadOnlySet<Guid>? alternateVersionItemIds = null,
+-            IReadOnlySet<Guid>? lyricItemIds = null)
++            IReadOnlySet<Guid>? lyricItemIds = null,
++            MediaSourcePrefetch? mediaSourcePrefetch = null)
+         {
+             var dto = new BaseItemDto
+             {
+@@ -421,7 +436,7 @@ namespace Emby.Server.Implementations.Dto
+             if (item is IHasMediaSources
+                 && options.ContainsField(ItemFields.MediaSources))
+             {
+-                dto.MediaSources = _mediaSourceManager.GetStaticMediaSources(item, true, user).ToArray();
++                dto.MediaSources = _mediaSourceManager.GetStaticMediaSources(item, true, user, mediaSourcePrefetch).ToArray();
+ 
+                 NormalizeMediaSourceContainers(dto);
+             }
+@@ -431,7 +446,7 @@ namespace Emby.Server.Implementations.Dto
+                 AttachStudios(dto, item);
+             }
+ 
+-            AttachBasicFields(dto, item, owner, options, artistsBatch, user, alternateVersionItemIds);
++            AttachBasicFields(dto, item, owner, options, artistsBatch, user, alternateVersionItemIds, mediaSourcePrefetch);
+ 
+             if (options.ContainsField(ItemFields.CanDelete))
+             {
+@@ -558,6 +573,45 @@ namespace Emby.Server.Implementations.Dto
+             return result;
+         }
+ 
++        /// <summary>
++        /// Batch-fetches media streams, media attachments and has-segments flags for every Video/Audio
++        /// item on the page, once, instead of the three single-item queries GetVersionInfo would
++        /// otherwise issue per item's version (600 statements for a 200-item grid). Only Video and Audio
++        /// are included: they are the only IHasMediaSources implementers whose sources route through
++        /// GetVersionInfo, so this is a page-level batch of exactly the ids that method would otherwise
++        /// query one at a time. A version id outside this batch -- an alternate version, which this page
++        /// batch does not enumerate, or one skipped because the batch fetch below failed -- falls back to
++        /// GetVersionInfo's own single-item queries unchanged.
++        /// </summary>
++        private MediaSourcePrefetch? BuildMediaSourcePrefetch(IReadOnlyList<BaseItem> items, DtoOptions options)
++        {
++            if (!options.ContainsField(ItemFields.MediaSources) && !options.ContainsField(ItemFields.MediaStreams))
++            {
++                return null;
++            }
++
++            var versionItemIds = items.Where(i => i is Video or Audio).Select(i => i.Id).ToList();
++            if (versionItemIds.Count == 0)
++            {
++                return null;
++            }
++
++            try
++            {
++                var streams = _mediaSourceManager.GetMediaStreams(versionItemIds);
++                var attachments = _mediaSourceManager.GetMediaAttachments(versionItemIds);
++                var itemIdsWithSegments = _mediaSegmentManager.HasSegments(versionItemIds);
++                return new MediaSourcePrefetch(streams, attachments, itemIdsWithSegments, versionItemIds.ToHashSet());
++            }
++            catch (Exception ex)
++            {
++                // A batch statement failing must not lose MediaSources/MediaStreams for the whole page:
++                // fall back to the single-item queries GetVersionInfo already knows how to run.
++                _logger.LogError(ex, "Batched media source prefetch failed for {Count} items, falling back to per-item queries", versionItemIds.Count);
++                return null;
++            }
++        }
++
+         private void SetItemByNameInfo(BaseItemDto dto, User? user, IReadOnlyDictionary<Guid, ItemCounts>? prefetchedCounts = null)
+         {
+             if (!_relatedItemKinds.TryGetValue(dto.Type, out var relatedItemKinds))
+@@ -1112,7 +1166,8 @@ namespace Emby.Server.Implementations.Dto
+         /// <param name="artistsBatch">Optional pre-fetched artist lookup shared across a batch of items.</param>
+         /// <param name="user">The user, for per-user values such as the accessible media source count.</param>
+         /// <param name="alternateVersionItemIds">Optional pre-fetched set of item IDs that own alternate versions, shared across a batch of items.</param>
+-        private void AttachBasicFields(BaseItemDto dto, BaseItem item, BaseItem? owner, DtoOptions options, IReadOnlyDictionary<string, MusicArtist[]>? artistsBatch = null, User? user = null, IReadOnlySet<Guid>? alternateVersionItemIds = null)
++        /// <param name="mediaSourcePrefetch">Optional page-level batch of media streams/attachments/has-segments, consulted by the MediaStreams-only fallback below when MediaSources was not already requested.</param>
++        private void AttachBasicFields(BaseItemDto dto, BaseItem item, BaseItem? owner, DtoOptions options, IReadOnlyDictionary<string, MusicArtist[]>? artistsBatch = null, User? user = null, IReadOnlySet<Guid>? alternateVersionItemIds = null, MediaSourcePrefetch? mediaSourcePrefetch = null)
+         {
+             if (options.ContainsField(ItemFields.DateCreated))
+             {
+@@ -1491,7 +1546,7 @@ namespace Emby.Server.Implementations.Dto
+                     }
+                     else
+                     {
+-                        mediaStreams = _mediaSourceManager.GetStaticMediaSources(item, true)[0].MediaStreams.ToArray();
++                        mediaStreams = _mediaSourceManager.GetStaticMediaSources(item, true, null, mediaSourcePrefetch)[0].MediaStreams.ToArray();
+                     }
+ 
+                     dto.MediaStreams = mediaStreams;
+diff --git a/Emby.Server.Implementations/Library/MediaSourceManager.cs b/Emby.Server.Implementations/Library/MediaSourceManager.cs
+index e9bba0583..ca66ff39f 100644
+--- a/Emby.Server.Implementations/Library/MediaSourceManager.cs
++++ b/Emby.Server.Implementations/Library/MediaSourceManager.cs
+@@ -23,6 +23,7 @@ using MediaBrowser.Common.Configuration;
+ using MediaBrowser.Common.Extensions;
+ using MediaBrowser.Controller;
+ using MediaBrowser.Controller.Entities;
++using MediaBrowser.Controller.Entities.Audio;
+ using MediaBrowser.Controller.Entities.TV;
+ using MediaBrowser.Controller.IO;
+ using MediaBrowser.Controller.Library;
+@@ -146,6 +147,21 @@ namespace Emby.Server.Implementations.Library
+             return GetMediaStreamsForItem(list);
+         }
+ 
++        /// <inheritdoc />
++        public IReadOnlyDictionary<Guid, IReadOnlyList<MediaStream>> GetMediaStreams(IReadOnlyList<Guid> itemIds)
++        {
++            var byItem = _mediaStreamRepository.GetMediaStreams(itemIds);
++            foreach (var streams in byItem.Values)
++            {
++                foreach (var stream in streams)
++                {
++                    stream.SupportsExternalStream = StreamSupportsExternalStream(stream);
++                }
++            }
++
++            return byItem;
++        }
++
+         private IReadOnlyList<MediaStream> GetMediaStreamsForItem(IReadOnlyList<MediaStream> streams)
+         {
+             foreach (var stream in streams)
+@@ -174,6 +190,12 @@ namespace Emby.Server.Implementations.Library
+             });
+         }
+ 
++        /// <inheritdoc />
++        public IReadOnlyDictionary<Guid, IReadOnlyList<MediaAttachment>> GetMediaAttachments(IReadOnlyList<Guid> itemIds)
++        {
++            return _mediaAttachmentRepository.GetMediaAttachments(itemIds);
++        }
++
+         public async Task<IReadOnlyList<MediaSourceInfo>> GetPlaybackMediaSources(BaseItem item, User user, bool allowMediaProbe, bool enablePathSubstitution, CancellationToken cancellationToken)
+         {
+             var mediaSources = GetStaticMediaSources(item, enablePathSubstitution, user);
+@@ -381,6 +403,30 @@ namespace Emby.Server.Implementations.Library
+         }
+ 
+         public IReadOnlyList<MediaSourceInfo> GetStaticMediaSources(BaseItem item, bool enablePathSubstitution, User user = null)
++        {
++            var hasMediaSources = ValidateHasMediaSources(item);
++            var sources = hasMediaSources.GetMediaSources(enablePathSubstitution);
++            return ApplyUserContext(item, sources, user);
++        }
++
++        /// <inheritdoc />
++        public IReadOnlyList<MediaSourceInfo> GetStaticMediaSources(BaseItem item, bool enablePathSubstitution, User user, MediaSourcePrefetch prefetch)
++        {
++            ValidateHasMediaSources(item);
++
++            // Only Video and Audio route their versions through GetVersionInfo, the batchable per-item
++            // lookup the prefetch was built for; every other IHasMediaSources implementer (a live TV
++            // channel's synthetic, DB-free source) keeps the exact single-item call.
++            if (prefetch is null || item is not (Video or Audio))
++            {
++                return GetStaticMediaSources(item, enablePathSubstitution, user);
++            }
++
++            var sources = item.GetMediaSources(enablePathSubstitution, prefetch);
++            return ApplyUserContext(item, sources, user);
++        }
++
++        private IHasMediaSources ValidateHasMediaSources(BaseItem item)
+         {
+             ArgumentNullException.ThrowIfNull(item);
+ 
+@@ -392,35 +438,38 @@ namespace Emby.Server.Implementations.Library
+                     nameof(item));
+             }
+ 
+-            var sources = hasMediaSources.GetMediaSources(enablePathSubstitution);
++            return hasMediaSources;
++        }
+ 
+-            if (user is not null)
++        private IReadOnlyList<MediaSourceInfo> ApplyUserContext(BaseItem item, IReadOnlyList<MediaSourceInfo> sources, User user)
++        {
++            if (user is null)
+             {
+-                sources = sources
+-                    .Where(source => !Guid.TryParse(source.Id, out var sourceId)
+-                        || sourceId.Equals(item.Id)
+-                        || _libraryManager.GetItemById<BaseItem>(sourceId, user) is not null)
+-                    .ToArray();
++                return sources;
++            }
+ 
+-                foreach (var source in sources)
+-                {
+-                    SetDefaultAudioAndSubtitleStreamIndices(item, source, user);
++            sources = sources
++                .Where(source => !Guid.TryParse(source.Id, out var sourceId)
++                    || sourceId.Equals(item.Id)
++                    || _libraryManager.GetItemById<BaseItem>(sourceId, user) is not null)
++                .ToArray();
+ 
+-                    if (item.MediaType == MediaType.Audio)
+-                    {
+-                        source.SupportsTranscoding = user.HasPermission(PermissionKind.EnableAudioPlaybackTranscoding);
+-                    }
+-                    else if (item.MediaType == MediaType.Video)
+-                    {
+-                        source.SupportsTranscoding = user.HasPermission(PermissionKind.EnableVideoPlaybackTranscoding);
+-                        source.SupportsDirectStream = user.HasPermission(PermissionKind.EnablePlaybackRemuxing);
+-                    }
+-                }
++            foreach (var source in sources)
++            {
++                SetDefaultAudioAndSubtitleStreamIndices(item, source, user);
+ 
+-                sources = SetAlternateVersionResumeStates(item, sources, user);
++                if (item.MediaType == MediaType.Audio)
++                {
++                    source.SupportsTranscoding = user.HasPermission(PermissionKind.EnableAudioPlaybackTranscoding);
++                }
++                else if (item.MediaType == MediaType.Video)
++                {
++                    source.SupportsTranscoding = user.HasPermission(PermissionKind.EnableVideoPlaybackTranscoding);
++                    source.SupportsDirectStream = user.HasPermission(PermissionKind.EnablePlaybackRemuxing);
++                }
+             }
+ 
+-            return sources;
++            return SetAlternateVersionResumeStates(item, sources, user);
+         }
+ 
+         /// <summary>
+diff --git a/Jellyfin.Server.Implementations/Item/MediaAttachmentRepository.cs b/Jellyfin.Server.Implementations/Item/MediaAttachmentRepository.cs
+index e75dda439..fccd7e156 100644
+--- a/Jellyfin.Server.Implementations/Item/MediaAttachmentRepository.cs
++++ b/Jellyfin.Server.Implementations/Item/MediaAttachmentRepository.cs
+@@ -52,6 +52,25 @@ public class MediaAttachmentRepository(IDbContextFactory<JellyfinDbContext> dbPr
+         return query.AsEnumerable().Select(Map).ToArray();
+     }
+ 
++    /// <inheritdoc />
++    public IReadOnlyDictionary<Guid, IReadOnlyList<MediaAttachment>> GetMediaAttachments(IReadOnlyList<Guid> itemIds)
++    {
++        if (itemIds.Count == 0)
++        {
++            return new Dictionary<Guid, IReadOnlyList<MediaAttachment>>();
++        }
++
++        using var context = dbProvider.CreateDbContext();
++        return context.AttachmentStreamInfos
++            .AsNoTracking()
++            .WhereOneOrMany(itemIds, e => e.ItemId)
++            .OrderBy(e => e.ItemId)
++            .ThenBy(e => e.Index)
++            .AsEnumerable()
++            .GroupBy(e => e.ItemId)
++            .ToDictionary(g => g.Key, g => (IReadOnlyList<MediaAttachment>)g.Select(Map).ToArray());
++    }
++
+     private MediaAttachment Map(AttachmentStreamInfo attachment)
+     {
+         return new MediaAttachment()
+diff --git a/Jellyfin.Server.Implementations/Item/MediaStreamRepository.cs b/Jellyfin.Server.Implementations/Item/MediaStreamRepository.cs
+index 5d3be2bcd..5e553aefa 100644
+--- a/Jellyfin.Server.Implementations/Item/MediaStreamRepository.cs
++++ b/Jellyfin.Server.Implementations/Item/MediaStreamRepository.cs
+@@ -85,6 +85,25 @@ public class MediaStreamRepository : IMediaStreamRepository
+             .ToHashSet();
+     }
+ 
++    /// <inheritdoc />
++    public IReadOnlyDictionary<Guid, IReadOnlyList<MediaStream>> GetMediaStreams(IReadOnlyList<Guid> itemIds)
++    {
++        if (itemIds.Count == 0)
++        {
++            return new Dictionary<Guid, IReadOnlyList<MediaStream>>();
++        }
++
++        using var context = _dbProvider.CreateDbContext();
++        return context.MediaStreamInfos
++            .AsNoTracking()
++            .WhereOneOrMany(itemIds, e => e.ItemId)
++            .OrderBy(e => e.ItemId)
++            .ThenBy(e => e.StreamIndex)
++            .AsEnumerable()
++            .GroupBy(e => e.ItemId)
++            .ToDictionary(g => g.Key, g => (IReadOnlyList<MediaStream>)g.Select(Map).ToArray());
++    }
++
+     private string? GetPathToSave(string? path)
+     {
+         if (path is null)
+diff --git a/Jellyfin.Server.Implementations/MediaSegments/MediaSegmentManager.cs b/Jellyfin.Server.Implementations/MediaSegments/MediaSegmentManager.cs
+index be98f93da..425ebdea6 100644
+--- a/Jellyfin.Server.Implementations/MediaSegments/MediaSegmentManager.cs
++++ b/Jellyfin.Server.Implementations/MediaSegments/MediaSegmentManager.cs
+@@ -287,6 +287,23 @@ public class MediaSegmentManager : IMediaSegmentManager
+         return db.MediaSegments.Any(e => e.ItemId.Equals(itemId));
+     }
+ 
++    /// <inheritdoc />
++    public IReadOnlySet<Guid> HasSegments(IReadOnlyList<Guid> itemIds)
++    {
++        if (itemIds.Count == 0)
++        {
++            return new HashSet<Guid>();
++        }
++
++        using var db = _dbProvider.CreateDbContext();
++        return db.MediaSegments
++            .AsNoTracking()
++            .WhereOneOrMany(itemIds, e => e.ItemId)
++            .Select(e => e.ItemId)
++            .Distinct()
++            .ToHashSet();
++    }
++
+     /// <inheritdoc/>
+     public bool IsTypeSupported(BaseItem baseItem)
+     {
+diff --git a/MediaBrowser.Controller/Entities/BaseItem.cs b/MediaBrowser.Controller/Entities/BaseItem.cs
+index 70e7da893..fc0170488 100644
+--- a/MediaBrowser.Controller/Entities/BaseItem.cs
++++ b/MediaBrowser.Controller/Entities/BaseItem.cs
+@@ -1154,6 +1154,24 @@ namespace MediaBrowser.Controller.Entities
+         }
+ 
+         public virtual IReadOnlyList<MediaSourceInfo> GetMediaSources(bool enablePathSubstitution)
++        {
++            return GetMediaSources(enablePathSubstitution, null);
++        }
++
++        /// <summary>
++        /// As <see cref="GetMediaSources(bool)"/>, but for a version id covered by <paramref name="prefetch"/>
++        /// (a page-level batch built once for a page of items, by DtoService.GetBaseItemDtos) uses its
++        /// already-fetched media streams, media attachments and has-segments flag instead of the three
++        /// single-item queries this method would otherwise issue for that version. A version id absent from
++        /// the batch (for example, one skipped by a failed batch fetch) falls back to those single-item
++        /// queries unchanged. Only called for <see cref="MediaBrowser.Controller.Entities.Audio.Audio"/> and
++        /// <see cref="Video"/> items, the only two <see cref="IHasMediaSources"/> implementers whose default
++        /// <see cref="GetAllItemsForMediaSources"/> routes real versions through this method.
++        /// </summary>
++        /// <param name="enablePathSubstitution"><c>true</c> to enable path substitution, <c>false</c> to not.</param>
++        /// <param name="prefetch">The page-level batch to consult, or <c>null</c> for the single-item behavior of <see cref="GetMediaSources(bool)"/>.</param>
++        /// <returns>A list of media sources.</returns>
++        public virtual IReadOnlyList<MediaSourceInfo> GetMediaSources(bool enablePathSubstitution, MediaSourcePrefetch prefetch)
+         {
+             if (SourceType == SourceType.Channel)
+             {
+@@ -1168,7 +1186,7 @@ namespace MediaBrowser.Controller.Entities
+ 
+             var list = GetAllItemsForMediaSources().ToList();
+             var commonPrefix = GetCommonNamePrefix(list);
+-            var result = list.Select(i => GetVersionInfo(enablePathSubstitution, i.Item, i.MediaSourceType, commonPrefix)).ToList();
++            var result = list.Select(i => GetVersionInfo(enablePathSubstitution, i.Item, i.MediaSourceType, prefetch, commonPrefix)).ToList();
+ 
+             if (IsActiveRecording())
+             {
+@@ -1194,28 +1212,42 @@ namespace MediaBrowser.Controller.Entities
+             return Enumerable.Empty<(BaseItem, MediaSourceType)>();
+         }
+ 
+-        private MediaSourceInfo GetVersionInfo(bool enablePathSubstitution, BaseItem item, MediaSourceType type, string commonPrefix = null)
++        private MediaSourceInfo GetVersionInfo(bool enablePathSubstitution, BaseItem item, MediaSourceType type, MediaSourcePrefetch prefetch, string commonPrefix = null)
+         {
+             ArgumentNullException.ThrowIfNull(item);
+ 
+             var protocol = item.PathProtocol;
+             var itemPath = item.Path;
+ 
++            // A miss in prefetch.Streams/Attachments for a queried id means "queried, no rows", not
++            // "not fetched": gate the fallback on QueriedItemIds, not on whether the dictionary has an
++            // entry, or an id with no streams/attachments would be looked up again one at a time.
++            var isQueried = prefetch is not null && prefetch.QueriedItemIds.Contains(item.Id);
++            var streams = isQueried
++                ? prefetch!.Streams.GetValueOrDefault(item.Id, Array.Empty<MediaStream>())
++                : MediaSourceManager.GetMediaStreams(item.Id);
++            var attachments = isQueried
++                ? prefetch!.Attachments.GetValueOrDefault(item.Id, Array.Empty<MediaAttachment>())
++                : MediaSourceManager.GetMediaAttachments(item.Id);
++            var hasSegments = MediaSegmentManager.IsTypeSupported(item)
++                && (protocol is null or MediaProtocol.File)
++                && (isQueried
++                    ? prefetch!.ItemIdsWithSegments.Contains(item.Id)
++                    : MediaSegmentManager.HasSegments(item.Id));
++
+             var info = new MediaSourceInfo
+             {
+                 Id = item.Id.ToString("N", CultureInfo.InvariantCulture),
+                 Protocol = protocol ?? MediaProtocol.File,
+-                MediaStreams = MediaSourceManager.GetMediaStreams(item.Id),
+-                MediaAttachments = MediaSourceManager.GetMediaAttachments(item.Id),
++                MediaStreams = streams,
++                MediaAttachments = attachments,
+                 Name = GetMediaSourceName(item, commonPrefix),
+                 Path = enablePathSubstitution ? GetMappedPath(item, itemPath, protocol) : itemPath,
+                 RunTimeTicks = item.RunTimeTicks,
+                 Container = item.Container,
+                 Size = item.Size,
+                 Type = type,
+-                HasSegments = MediaSegmentManager.IsTypeSupported(item)
+-                    && (protocol is null or MediaProtocol.File)
+-                    && MediaSegmentManager.HasSegments(item.Id)
++                HasSegments = hasSegments
+             };
+ 
+             if (string.IsNullOrEmpty(info.Path))
+diff --git a/MediaBrowser.Controller/Library/IMediaSourceManager.cs b/MediaBrowser.Controller/Library/IMediaSourceManager.cs
+index 2b6781a19..4d5218c77 100644
+--- a/MediaBrowser.Controller/Library/IMediaSourceManager.cs
++++ b/MediaBrowser.Controller/Library/IMediaSourceManager.cs
+@@ -38,6 +38,13 @@ namespace MediaBrowser.Controller.Library
+         /// <returns>IEnumerable&lt;MediaStream&gt;.</returns>
+         IReadOnlyList<MediaStream> GetMediaStreams(MediaStreamQuery query);
+ 
++        /// <summary>
++        /// Gets the media streams of every one of the given items, in one query.
++        /// </summary>
++        /// <param name="itemIds">The item ids.</param>
++        /// <returns>The streams of each id in <paramref name="itemIds"/> that has any, keyed by item id. An id with no streams is omitted, not mapped to an empty list.</returns>
++        IReadOnlyDictionary<Guid, IReadOnlyList<MediaStream>> GetMediaStreams(IReadOnlyList<Guid> itemIds);
++
+         /// <summary>
+         /// Gets the media attachments.
+         /// </summary>
+@@ -45,6 +52,13 @@ namespace MediaBrowser.Controller.Library
+         /// <returns>IEnumerable&lt;MediaAttachment&gt;.</returns>
+         IReadOnlyList<MediaAttachment> GetMediaAttachments(Guid itemId);
+ 
++        /// <summary>
++        /// Gets the media attachments of every one of the given items, in one query.
++        /// </summary>
++        /// <param name="itemIds">The item ids.</param>
++        /// <returns>The attachments of each id in <paramref name="itemIds"/> that has any, keyed by item id. An id with no attachments is omitted, not mapped to an empty list.</returns>
++        IReadOnlyDictionary<Guid, IReadOnlyList<MediaAttachment>> GetMediaAttachments(IReadOnlyList<Guid> itemIds);
++
+         /// <summary>
+         /// Gets the media attachments.
+         /// </summary>
+@@ -72,6 +86,22 @@ namespace MediaBrowser.Controller.Library
+         /// <returns>List of media sources.</returns>
+         IReadOnlyList<MediaSourceInfo> GetStaticMediaSources(BaseItem item, bool enablePathSubstitution, User user = null);
+ 
++        /// <summary>
++        /// As <see cref="GetStaticMediaSources(BaseItem, bool, User)"/>, but consults a page-level
++        /// <see cref="MediaSourcePrefetch"/> instead of issuing per-version media stream, media attachment
++        /// and has-segments queries for a version id it covers. Only Video and Audio items route their
++        /// versions through the batchable per-version lookup; every other
++        /// <see cref="IHasMediaSources"/> implementer (for example a live TV channel) builds its
++        /// sources without touching the database and gets this call's exact single-item behavior regardless
++        /// of <paramref name="prefetch"/>.
++        /// </summary>
++        /// <param name="item">Item to use.</param>
++        /// <param name="enablePathSubstitution">Option to enable path substitution.</param>
++        /// <param name="user">User to use for operation.</param>
++        /// <param name="prefetch">The page-level batch to consult.</param>
++        /// <returns>List of media sources.</returns>
++        IReadOnlyList<MediaSourceInfo> GetStaticMediaSources(BaseItem item, bool enablePathSubstitution, User user, MediaSourcePrefetch prefetch);
++
+         /// <summary>
+         /// Gets the static media source.
+         /// </summary>
+diff --git a/MediaBrowser.Controller/Library/MediaSourcePrefetch.cs b/MediaBrowser.Controller/Library/MediaSourcePrefetch.cs
+new file mode 100644
+index 000000000..c20bf90c5
+--- /dev/null
++++ b/MediaBrowser.Controller/Library/MediaSourcePrefetch.cs
+@@ -0,0 +1,27 @@
++using System;
++using System.Collections.Generic;
++using MediaBrowser.Model.Entities;
++
++namespace MediaBrowser.Controller.Library
++{
++    /// <summary>
++    /// A page-level batch of the per-version data <see cref="Entities.BaseItem.GetVersionInfo"/> would
++    /// otherwise fetch with three separate statements per version (media streams, media attachments,
++    /// whether the version has media segments). Built once for every version id on a page of items and
++    /// consulted instead of the single-item queries; a version id this batch does not cover (for example,
++    /// one skipped by a failed batch fetch) falls back to those single-item queries unchanged.
++    /// </summary>
++    /// <param name="Streams">Media streams by version item id.</param>
++    /// <param name="Attachments">Media attachments by version item id.</param>
++    /// <param name="ItemIdsWithSegments">The subset of <paramref name="QueriedItemIds"/> that have at least one media segment.</param>
++    /// <param name="QueriedItemIds">
++    /// The version item ids this batch was built for. A miss in <see cref="Streams"/> or
++    /// <see cref="Attachments"/> for an id in this set means "queried, no rows" and must not fall back to a
++    /// single-item query; an id absent from this set was never queried and must fall back.
++    /// </param>
++    public sealed record MediaSourcePrefetch(
++        IReadOnlyDictionary<Guid, IReadOnlyList<MediaStream>> Streams,
++        IReadOnlyDictionary<Guid, IReadOnlyList<MediaAttachment>> Attachments,
++        IReadOnlySet<Guid> ItemIdsWithSegments,
++        IReadOnlySet<Guid> QueriedItemIds);
++}
+diff --git a/MediaBrowser.Controller/MediaSegments/IMediaSegmentManager.cs b/MediaBrowser.Controller/MediaSegments/IMediaSegmentManager.cs
+index 4f13a7ecc..587d5e0f1 100644
+--- a/MediaBrowser.Controller/MediaSegments/IMediaSegmentManager.cs
++++ b/MediaBrowser.Controller/MediaSegments/IMediaSegmentManager.cs
+@@ -73,6 +73,13 @@ public interface IMediaSegmentManager
+     /// TODO: this should be async but as the only caller BaseItem.GetVersionInfo isn't async, this is also not. Venson.
+     bool HasSegments(Guid itemId);
+ 
++    /// <summary>
++    /// Gets which of the given items have any media segments stored, in one query.
++    /// </summary>
++    /// <param name="itemIds">The ids of the <see cref="BaseItem"/>s to check.</param>
++    /// <returns>The ids among <paramref name="itemIds"/> that have at least one segment.</returns>
++    IReadOnlySet<Guid> HasSegments(IReadOnlyList<Guid> itemIds);
++
+     /// <summary>
+     /// Gets a list of all registered Segment Providers and their IDs.
+     /// </summary>
+diff --git a/MediaBrowser.Controller/Persistence/IMediaAttachmentRepository.cs b/MediaBrowser.Controller/Persistence/IMediaAttachmentRepository.cs
+index 4773f4058..e0f3426a8 100644
+--- a/MediaBrowser.Controller/Persistence/IMediaAttachmentRepository.cs
++++ b/MediaBrowser.Controller/Persistence/IMediaAttachmentRepository.cs
+@@ -18,6 +18,13 @@ public interface IMediaAttachmentRepository
+     /// <returns>IEnumerable{MediaAttachment}.</returns>
+     IReadOnlyList<MediaAttachment> GetMediaAttachments(MediaAttachmentQuery filter);
+ 
++    /// <summary>
++    /// Gets the media attachments of every one of the given items, in one query.
++    /// </summary>
++    /// <param name="itemIds">The item ids.</param>
++    /// <returns>The attachments of each id in <paramref name="itemIds"/> that has any, keyed by item id. An id with no attachments is omitted, not mapped to an empty list.</returns>
++    IReadOnlyDictionary<Guid, IReadOnlyList<MediaAttachment>> GetMediaAttachments(IReadOnlyList<Guid> itemIds);
++
+     /// <summary>
+     /// Saves the media attachments.
+     /// </summary>
+diff --git a/MediaBrowser.Controller/Persistence/IMediaStreamRepository.cs b/MediaBrowser.Controller/Persistence/IMediaStreamRepository.cs
+index 6d3aa4008..365a122a3 100644
+--- a/MediaBrowser.Controller/Persistence/IMediaStreamRepository.cs
++++ b/MediaBrowser.Controller/Persistence/IMediaStreamRepository.cs
+@@ -36,6 +36,13 @@ public interface IMediaStreamRepository
+     /// <returns>The ids among <paramref name="itemIds"/> that have such a stream.</returns>
+     IReadOnlySet<Guid> GetItemIdsWithStreamType(IReadOnlyList<Guid> itemIds, MediaStreamType mediaStreamType);
+ 
++    /// <summary>
++    /// Gets the media streams of every one of the given items, in one query.
++    /// </summary>
++    /// <param name="itemIds">The item ids.</param>
++    /// <returns>The streams of each id in <paramref name="itemIds"/> that has any, keyed by item id. An id with no streams is omitted, not mapped to an empty list.</returns>
++    IReadOnlyDictionary<Guid, IReadOnlyList<MediaStream>> GetMediaStreams(IReadOnlyList<Guid> itemIds);
++
+     /// <summary>
+     /// Saves the media streams.
+     /// </summary>
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceImageInheritanceTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceImageInheritanceTests.cs
+index 7f670d19c..d03901896 100644
+--- a/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceImageInheritanceTests.cs
++++ b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceImageInheritanceTests.cs
+@@ -12,6 +12,7 @@ using MediaBrowser.Controller.Entities.Audio;
+ using MediaBrowser.Controller.Entities.Movies;
+ using MediaBrowser.Controller.Library;
+ using MediaBrowser.Controller.LiveTv;
++using MediaBrowser.Controller.MediaSegments;
+ using MediaBrowser.Controller.Persistence;
+ using MediaBrowser.Controller.Providers;
+ using MediaBrowser.Controller.Trickplay;
+@@ -184,13 +185,11 @@ public class DtoServiceImageInheritanceTests
+                 [albumTwo.Id] = [new PersonInfo { ItemId = albumTwo.Id, Name = "Some Actor", Type = PersonKind.Actor }]
+             });
+ 
+-        // AttachPeople resolves the distinct names to Person entities in one batch (GetPersons).
++        // AttachPeople still resolves each distinct name to its Person entity to attach images, in one
++        // batched call (GetPersons) rather than one GetPerson(name) lookup per distinct name.
+         libraryManager
+             .Setup(x => x.GetPersons(It.IsAny<IEnumerable<string>>()))
+-            .Returns(new Dictionary<string, Person>
+-            {
+-                ["Some Actor"] = new Person { Id = Guid.NewGuid(), Name = "Some Actor" }
+-            });
++            .Returns(new Dictionary<string, Person> { ["Some Actor"] = new Person { Id = Guid.NewGuid(), Name = "Some Actor" } });
+ 
+         var dtoService = BuildDtoService(libraryManager);
+ 
+@@ -309,6 +308,8 @@ public class DtoServiceImageInheritanceTests
+         var liveTvManager = new Mock<ILiveTvManager>();
+         var trickplayManager = new Mock<ITrickplayManager>();
+         var chapterManager = new Mock<IChapterManager>();
++        var mediaStreamRepository = new Mock<IMediaStreamRepository>();
++        var mediaSegmentManager = new Mock<IMediaSegmentManager>();
+         var logger = new Mock<Microsoft.Extensions.Logging.ILogger<DtoService>>();
+ 
+         imageProcessor
+@@ -331,6 +332,7 @@ public class DtoServiceImageInheritanceTests
+             new Lazy<ILiveTvManager>(() => liveTvManager.Object),
+             trickplayManager.Object,
+             chapterManager.Object,
+-            new Mock<IMediaStreamRepository>().Object);
++            mediaStreamRepository.Object,
++            mediaSegmentManager.Object);
+     }
+ }
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceMediaSourceBatchTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceMediaSourceBatchTests.cs
+new file mode 100644
+index 000000000..bc696dd99
+--- /dev/null
++++ b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceMediaSourceBatchTests.cs
+@@ -0,0 +1,365 @@
++using System;
++using System.Collections.Generic;
++using System.Data.Common;
++using System.Linq;
++using System.Text.Json;
++using Emby.Server.Implementations.Data;
++using Emby.Server.Implementations.Dto;
++using Emby.Server.Implementations.Library;
++using Jellyfin.Data.Enums;
++using Jellyfin.Database.Implementations;
++using Jellyfin.Database.Implementations.Entities;
++using Jellyfin.Database.Implementations.Enums;
++using Jellyfin.Database.Implementations.Locking;
++using Jellyfin.Database.Providers.Sqlite;
++using Jellyfin.Server.Implementations.Item;
++using Jellyfin.Server.Implementations.MediaSegments;
++using MediaBrowser.Common;
++using MediaBrowser.Common.Configuration;
++using MediaBrowser.Controller;
++using MediaBrowser.Controller.Chapters;
++using MediaBrowser.Controller.Drawing;
++using MediaBrowser.Controller.Dto;
++using MediaBrowser.Controller.Entities;
++using MediaBrowser.Controller.IO;
++using MediaBrowser.Controller.Library;
++using MediaBrowser.Controller.LiveTv;
++using MediaBrowser.Controller.MediaEncoding;
++using MediaBrowser.Controller.MediaSegments;
++using MediaBrowser.Controller.Persistence;
++using MediaBrowser.Controller.Providers;
++using MediaBrowser.Controller.Trickplay;
++using MediaBrowser.Model.Dto;
++using MediaBrowser.Model.Entities;
++using MediaBrowser.Model.Globalization;
++using MediaBrowser.Model.IO;
++using MediaBrowser.Model.Querying;
++using Microsoft.Data.Sqlite;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.EntityFrameworkCore.Diagnostics;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.Server.Implementations.Tests.Dto;
++
++/// <summary>
++/// Covers KNOWN ISSUE 6: a page of items with Fields=MediaSources (or MediaStreams) issued three
++/// per-version statements each (media streams, media attachments, has-segments) inside
++/// BaseItem.GetVersionInfo. DtoService.GetBaseItemDtos now batches those for the whole page; the
++/// single-item path (DtoService.GetBaseItemDto, and any version id the batch does not cover) is
++/// unchanged and is used here as the "before" baseline for both the statement count and the parity
++/// comparison.
++/// </summary>
++public sealed class DtoServiceMediaSourceBatchTests : IDisposable
++{
++    private readonly SqliteConnection _connection;
++    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
++    private readonly CommandCounter _counter;
++    private readonly DtoService _dtoService;
++    private readonly Mock<ILibraryManager> _libraryManager;
++    private readonly ILibraryManager? _previousLibraryManager;
++    private readonly IMediaSourceManager? _previousMediaSourceManager;
++    private readonly IMediaSegmentManager? _previousMediaSegmentManager;
++    private readonly IRecordingsManager? _previousRecordingsManager;
++
++    public DtoServiceMediaSourceBatchTests()
++    {
++        _counter = new CommandCounter();
++
++        _connection = new SqliteConnection("Data Source=:memory:");
++        _connection.Open();
++
++        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
++            .UseSqlite(_connection)
++            .AddInterceptors(_counter)
++            .Options;
++
++        using (var context = CreateDbContext())
++        {
++            context.Database.EnsureCreated();
++        }
++
++        var dbProviderFactory = new Mock<IDbContextFactory<JellyfinDbContext>>();
++        dbProviderFactory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
++
++        var mediaStreamRepository = new MediaStreamRepository(dbProviderFactory.Object, Mock.Of<IServerApplicationHost>(), Mock.Of<ILocalizationManager>());
++        var mediaAttachmentRepository = new MediaAttachmentRepository(dbProviderFactory.Object);
++        var mediaSegmentManager = new MediaSegmentManager(NullLogger<MediaSegmentManager>.Instance, dbProviderFactory.Object, []);
++
++        _libraryManager = new Mock<ILibraryManager>();
++
++        // Video.GetAllItemsForMediaSources() (the alternate-version enumeration BaseItem.GetMediaSources
++        // walks before GetVersionInfo) always asks for these; our items have no alternates by default.
++        // A test that needs one overrides these per-instance (Moq's most-recently-added matching setup
++        // wins), so this default only ever covers the videos that don't.
++        _libraryManager.Setup(x => x.GetLinkedAlternateVersions(It.IsAny<Video>())).Returns([]);
++        _libraryManager.Setup(x => x.GetLocalAlternateVersionIds(It.IsAny<Video>())).Returns([]);
++
++        var mediaSourceManager = new MediaSourceManager(
++            Mock.Of<IServerApplicationHost>(),
++            Mock.Of<IItemRepository>(),
++            Mock.Of<IApplicationPaths>(),
++            Mock.Of<ILocalizationManager>(),
++            Mock.Of<IUserManager>(),
++            _libraryManager.Object,
++            NullLogger<MediaSourceManager>.Instance,
++            Mock.Of<IFileSystem>(),
++            Mock.Of<IUserDataManager>(),
++            Mock.Of<IMediaEncoder>(),
++            Mock.Of<IDirectoryService>(),
++            mediaStreamRepository,
++            mediaAttachmentRepository);
++
++        var appHost = new Mock<IApplicationHost>();
++        appHost.Setup(x => x.SystemId).Returns("test-server");
++
++        // BaseItem resolves these through process-wide statics; restored in Dispose so this test
++        // class does not leak a MediaSourceManager/MediaSegmentManager bound to _connection (disposed
++        // below) to whichever test class the runner happens to run next in this process.
++        _previousLibraryManager = BaseItem.LibraryManager;
++        _previousMediaSourceManager = BaseItem.MediaSourceManager;
++        _previousMediaSegmentManager = BaseItem.MediaSegmentManager;
++        _previousRecordingsManager = Video.RecordingsManager;
++
++        BaseItem.LibraryManager = _libraryManager.Object;
++        BaseItem.MediaSourceManager = mediaSourceManager;
++        BaseItem.MediaSegmentManager = mediaSegmentManager;
++        Video.RecordingsManager = Mock.Of<IRecordingsManager>();
++
++        _dtoService = new DtoService(
++            NullLogger<DtoService>.Instance,
++            _libraryManager.Object,
++            Mock.Of<IUserDataManager>(),
++            Mock.Of<IImageProcessor>(),
++            Mock.Of<IProviderManager>(),
++            Mock.Of<IRecordingsManager>(),
++            appHost.Object,
++            mediaSourceManager,
++            new Lazy<ILiveTvManager>(() => Mock.Of<ILiveTvManager>()),
++            Mock.Of<ITrickplayManager>(),
++            Mock.Of<IChapterManager>(),
++            mediaStreamRepository,
++            mediaSegmentManager);
++    }
++
++    public void Dispose()
++    {
++        BaseItem.LibraryManager = _previousLibraryManager!;
++        BaseItem.MediaSourceManager = _previousMediaSourceManager!;
++        BaseItem.MediaSegmentManager = _previousMediaSegmentManager!;
++        Video.RecordingsManager = _previousRecordingsManager!;
++
++        _connection.Dispose();
++    }
++
++    [Theory]
++    [InlineData(10)]
++    [InlineData(50)]
++    public void GetBaseItemDtos_PageWithMediaSources_BatchesInsteadOfPerItemQueries(int itemCount)
++    {
++        var items = SeedVideos(itemCount);
++        var options = new DtoOptions(false) { EnableImages = false, EnableUserData = false, Fields = [ItemFields.MediaSources] };
++
++        // "Before": the single-item path DtoService.GetBaseItemDto (singular) still uses -- it never
++        // builds or threads a prefetch, so this is byte-for-byte the pre-fix per-item behavior.
++        _counter.Reset();
++        var before = items.Select(item => _dtoService.GetBaseItemDto(item, options)).ToList();
++        var statementsBefore = _counter.Count;
++
++        // "After": the page path, which batches the same data once for the whole page.
++        _counter.Reset();
++        var after = _dtoService.GetBaseItemDtos(items, options, skipVisibilityCheck: true);
++        var statementsAfter = _counter.Count;
++
++        // 3 statements per item before (streams, attachments, has-segments) versus 3 statements total
++        // after, regardless of page size.
++        Assert.Equal(itemCount * 3, statementsBefore);
++        Assert.Equal(3, statementsAfter);
++
++        // Parity: identical DTOs (order and content) whichever path built them.
++        Assert.Equal(items.Count, after.Count);
++        for (var i = 0; i < items.Count; i++)
++        {
++            Assert.Equal(Serialize(before[i]), Serialize(after[i]));
++        }
++    }
++
++    [Fact]
++    public void GetBaseItemDtos_MediaStreamsOnlyField_AlsoBatches()
++    {
++        // The second call site (AttachBasicFields' MediaStreams-only fallback, used when a client asks
++        // for Fields=MediaStreams without also asking for MediaSources) must consult the same batch.
++        var items = SeedVideos(4);
++        var options = new DtoOptions(false) { EnableImages = false, EnableUserData = false, Fields = [ItemFields.MediaStreams] };
++
++        _counter.Reset();
++        var before = items.Select(item => _dtoService.GetBaseItemDto(item, options)).ToList();
++        var statementsBefore = _counter.Count;
++
++        _counter.Reset();
++        var after = _dtoService.GetBaseItemDtos(items, options, skipVisibilityCheck: true);
++        var statementsAfter = _counter.Count;
++
++        Assert.Equal(items.Count * 3, statementsBefore);
++        Assert.Equal(3, statementsAfter);
++
++        for (var i = 0; i < items.Count; i++)
++        {
++            Assert.Equal(Serialize(before[i].MediaStreams), Serialize(after[i].MediaStreams));
++            Assert.NotEmpty(after[i].MediaStreams);
++        }
++    }
++
++    [Fact]
++    public void GetBaseItemDtos_ItemWithNoStreamsOrSegments_DoesNotFallBackPerItem()
++    {
++        // A batched miss (an id the page batch covers but that has no rows) must not be mistaken for
++        // "not fetched" and re-queried one at a time -- that would silently undo the fix for exactly the
++        // streamless items (extras, placeholders) a real library also has.
++        var withData = SeedVideos(1)[0];
++        var withoutData = new Video { Id = Guid.NewGuid(), Name = "No Streams" };
++        AddBaseItem(withoutData.Id, "No Streams");
++
++        var options = new DtoOptions(false) { EnableImages = false, EnableUserData = false, Fields = [ItemFields.MediaSources] };
++
++        _counter.Reset();
++        var after = _dtoService.GetBaseItemDtos([withData, withoutData], options, skipVisibilityCheck: true);
++
++        // 1 batch statement each for streams/attachments/segments, still 3 total -- not 3 + 3 for the
++        // streamless item falling back.
++        Assert.Equal(3, _counter.Count);
++        Assert.Empty(after[1].MediaSources[0].MediaStreams);
++        Assert.Empty(after[1].MediaSources[0].MediaAttachments);
++        Assert.False(after[1].MediaSources[0].HasSegments);
++    }
++
++    [Fact]
++    public void GetBaseItemDtos_AlternateVersionNotOnPage_FallsBackForThatVersionOnly()
++    {
++        // The page batch only covers the version ids actually on the page (BuildMediaSourcePrefetch
++        // batches accessibleItems, not their alternate versions). A local alternate version -- common in
++        // this library, e.g. a remux plus a smaller direct-play copy -- is a real version GetVersionInfo
++        // still has to build a MediaSourceInfo for, just not one the batch fetched: it must fall back to
++        // the single-item queries for that one version without losing the batch for the rest of the page.
++        var primary = SeedVideos(1)[0];
++        var alternate = SeedVideos(1)[0];
++        alternate.Name = "Alternate cut";
++
++        _libraryManager.Setup(x => x.GetLocalAlternateVersionIds(primary)).Returns([alternate.Id]);
++        _libraryManager.Setup(x => x.GetItemById(alternate.Id)).Returns(alternate);
++
++        var options = new DtoOptions(false) { EnableImages = false, EnableUserData = false, Fields = [ItemFields.MediaSources] };
++
++        _counter.Reset();
++        var before = _dtoService.GetBaseItemDto(primary, options);
++        var statementsBefore = _counter.Count;
++
++        _counter.Reset();
++        var after = _dtoService.GetBaseItemDtos([primary], options, skipVisibilityCheck: true)[0];
++        var statementsAfter = _counter.Count;
++
++        // Both versions' streams/attachments/segments: 3 for the primary (batched or, in the "before"
++        // case, single-item) plus 3 for the alternate, which is never on the page batch either way.
++        Assert.Equal(6, statementsBefore);
++        Assert.Equal(6, statementsAfter);
++        Assert.Equal(2, after.MediaSources.Length);
++        Assert.Equal(Serialize(before), Serialize(after));
++    }
++
++    private List<Video> SeedVideos(int count)
++    {
++        var items = new List<Video>(count);
++        for (var i = 0; i < count; i++)
++        {
++            var id = Guid.NewGuid();
++            AddBaseItem(id, "Video " + i.ToString(System.Globalization.CultureInfo.InvariantCulture));
++
++            using (var context = CreateDbContext())
++            {
++                context.MediaStreamInfos.Add(new MediaStreamInfo
++                {
++                    ItemId = id,
++                    Item = null!,
++                    StreamIndex = 0,
++                    StreamType = MediaStreamTypeEntity.Video,
++                    Codec = "h264",
++                    Width = 1920,
++                    Height = 1080
++                });
++                context.AttachmentStreamInfos.Add(new AttachmentStreamInfo
++                {
++                    ItemId = id,
++                    Item = null!,
++                    Index = 0,
++                    Codec = "attachment",
++                    Filename = "cover.jpg"
++                });
++
++                // Every other item has a media segment, to exercise both sides of HasSegments.
++                if (i % 2 == 0)
++                {
++                    context.MediaSegments.Add(new MediaSegment
++                    {
++                        ItemId = id,
++                        Type = MediaSegmentType.Intro,
++                        StartTicks = 0,
++                        EndTicks = 1000,
++                        SegmentProviderId = "test"
++                    });
++                }
++
++                context.SaveChanges();
++            }
++
++            items.Add(new Video { Id = id, Name = "Video " + i.ToString(System.Globalization.CultureInfo.InvariantCulture) });
++        }
++
++        return items;
++    }
++
++    private void AddBaseItem(Guid id, string name)
++    {
++        using var context = CreateDbContext();
++        context.BaseItems.Add(new BaseItemEntity
++        {
++            Id = id,
++            Name = name,
++            Type = new ItemTypeLookup().BaseItemKindNames[BaseItemKind.Movie]
++        });
++        context.SaveChanges();
++    }
++
++    private JellyfinDbContext CreateDbContext() => new(
++        _dbOptions,
++        NullLogger<JellyfinDbContext>.Instance,
++        new SqliteDatabaseProvider(Mock.Of<IApplicationPaths>(), NullLogger<SqliteDatabaseProvider>.Instance),
++        new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
++
++    private static string Serialize<T>(T value) => JsonSerializer.Serialize(value);
++
++    private sealed class CommandCounter : DbCommandInterceptor
++    {
++        public int Count { get; private set; }
++
++        public void Reset() => Count = 0;
++
++        public override InterceptionResult<DbDataReader> ReaderExecuting(DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
++        {
++            Count++;
++            return result;
++        }
++
++        public override InterceptionResult<int> NonQueryExecuting(DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
++        {
++            Count++;
++            return result;
++        }
++
++        public override InterceptionResult<object> ScalarExecuting(DbCommand command, CommandEventData eventData, InterceptionResult<object> result)
++        {
++            Count++;
++            return result;
++        }
++    }
++}
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceTests.cs
+index cda6774c4..39cda2ff0 100644
+--- a/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceTests.cs
++++ b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceTests.cs
+@@ -14,6 +14,7 @@ using MediaBrowser.Controller.Entities;
+ using MediaBrowser.Controller.Entities.TV;
+ using MediaBrowser.Controller.Library;
+ using MediaBrowser.Controller.LiveTv;
++using MediaBrowser.Controller.MediaSegments;
+ using MediaBrowser.Controller.Persistence;
+ using MediaBrowser.Controller.Providers;
+ using MediaBrowser.Controller.Trickplay;
+@@ -60,7 +61,8 @@ public class DtoServiceTests
+             new Lazy<ILiveTvManager>(() => new Mock<ILiveTvManager>().Object),
+             new Mock<ITrickplayManager>().Object,
+             new Mock<IChapterManager>().Object,
+-            new Mock<IMediaStreamRepository>().Object);
++            new Mock<IMediaStreamRepository>().Object,
++            new Mock<IMediaSegmentManager>().Object);
+ 
+         // Episode.Series / Episode.Season resolve through the static BaseItem.LibraryManager.
+         BaseItem.LibraryManager = _libraryManagerMock.Object;

@@ -1,0 +1,152 @@
+diff --git a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+index 6f010c024..0f92f2012 100644
+--- a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
++++ b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+@@ -3074,6 +3074,30 @@ namespace MediaBrowser.Controller.MediaEncoding
+                 }
+ 
+                 seekParam += string.Format(CultureInfo.InvariantCulture, "-ss {0}", _mediaEncoder.GetTimeParameter(seekTick));
++
++                if (isHlsRemuxing)
++                {
++                    // The copied video stream can only ever start at the keyframe at-or-before
++                    // the seek target (the 0.5s nudge above exists to make ffmpeg reliably land
++                    // on that keyframe rather than rounding down to the previous one). Left at
++                    // its default, accurate seek then decodes-and-discards the audio stream -
++                    // which for this remux case is usually being transcoded (e.g. DTS/TrueHD to
++                    // AAC) - all the way to the nudged -ss value, so audio starts up to ~0.5s
++                    // after the copied video's keyframe. When the caller's requested time isn't
++                    // itself keyframe-aligned the gap is worse: video is still pinned to the
++                    // keyframe at-or-before the request, but accurate-seeked audio starts at the
++                    // literal (later, and for a copy stream unreachable) request time, so the
++                    // gap grows to the full keyframe-interval distance.
++                    // Disabling accurate seek makes the (typically transcoded) audio track seek
++                    // at the same demuxer/packet level as the copied video track, so both land
++                    // together near the same keyframe instead of audio drifting to a target video
++                    // can't reach. Measured on a synthetic long-GOP source: collapses a ~0.46s
++                    // keyframe-aligned gap and a ~7.8s unaligned-seek gap to the same ~0.12s
++                    // (bounded by audio frame granularity, not by how far into the GOP the
++                    // original request fell). This does not affect fully transcoded video or
++                    // non-HLS output, since isHlsRemuxing is false for both.
++                    seekParam += " -noaccurate_seek";
++                }
+             }
+ 
+             return seekParam;
+diff --git a/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperTests.cs b/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperTests.cs
+index 2b009b467..a778a72f0 100644
+--- a/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperTests.cs
++++ b/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperTests.cs
+@@ -1,5 +1,6 @@
+ using System;
+ using System.Collections.Generic;
++using System.Globalization;
+ using System.IO;
+ using Jellyfin.Data.Enums;
+ using MediaBrowser.Common.Configuration;
+@@ -21,6 +22,10 @@ namespace Jellyfin.Controller.Tests.MediaEncoding;
+ 
+ public class EncodingHelperTests
+ {
++    // HLS copy-video remux restart seek nudge (EncodingHelper.cs's own constant): 0.5s.
++    private const long SeekStartTicks = 100_000_000L; // 10s
++    private const long SeekNudgeTicks = 5_000_000L; // 0.5s
++
+     [Fact]
+     public void GetMapArgs_NoSubtitle_ExcludesAllSubs()
+     {
+@@ -261,6 +266,94 @@ public class EncodingHelperTests
+         Assert.Contains("-ar 48000", args, StringComparison.Ordinal);
+     }
+ 
++    // HLS copy-video remux restart: EncodingHelper.GetFastSeekCommandLineParameter adds a
++    // defensive 0.5s (5,000,000-tick) nudge to -ss so ffmpeg's keyframe-snapped seek for the
++    // copied video stream lands on the intended keyframe rather than rounding down to the
++    // previous one. Left at ffmpeg's default, accurate seek then honors that nudged -ss
++    // literally for the (usually transcoded) audio stream too, producing a real A/V start-time
++    // offset. -noaccurate_seek must be added alongside the existing nudge in that same
++    // isHlsRemuxing branch only -- fully transcoded video and non-HLS remuxing must keep their
++    // exact pre-existing -ss value and must not gain -noaccurate_seek.
++    [Fact]
++    public void GetFastSeekCommandLineParameter_HlsCopyVideoRemux_NudgesSeekAndAddsNoAccurateSeek()
++    {
++        var state = BuildSeekState(TranscodingJobType.Hls, outputVideoCodec: "copy", SeekStartTicks);
++        var result = CreateSeekHelper().GetFastSeekCommandLineParameter(state, new EncodingOptions(), "mp4");
++
++        Assert.Equal(
++            "-ss " + (SeekStartTicks + SeekNudgeTicks).ToString(CultureInfo.InvariantCulture) + " -noaccurate_seek",
++            result,
++            StringComparer.Ordinal);
++    }
++
++    [Fact]
++    public void GetFastSeekCommandLineParameter_HlsTranscodedVideo_UnchangedShapeNoNudgeNoFlag()
++    {
++        // OutputVideoCodec is not "copy" => isHlsRemuxing is false => byte-identical to bh-base:
++        // no seek nudge, no -noaccurate_seek.
++        var state = BuildSeekState(TranscodingJobType.Hls, outputVideoCodec: "libx264", SeekStartTicks);
++        var result = CreateSeekHelper().GetFastSeekCommandLineParameter(state, new EncodingOptions(), "mp4");
++
++        Assert.Equal(
++            "-ss " + SeekStartTicks.ToString(CultureInfo.InvariantCulture),
++            result,
++            StringComparer.Ordinal);
++    }
++
++    [Fact]
++    public void GetFastSeekCommandLineParameter_ProgressiveCopyVideo_UnchangedShapeNoNudgeNoFlag()
++    {
++        // Video-copy, but not an HLS job => isHlsRemuxing is false => byte-identical to bh-base:
++        // no seek nudge, no -noaccurate_seek. Covers direct-stream/progressive remux, which must
++        // not be affected by this HLS-only fix.
++        var state = BuildSeekState(TranscodingJobType.Progressive, outputVideoCodec: "copy", SeekStartTicks);
++        var result = CreateSeekHelper().GetFastSeekCommandLineParameter(state, new EncodingOptions(), "mp4");
++
++        Assert.Equal(
++            "-ss " + SeekStartTicks.ToString(CultureInfo.InvariantCulture),
++            result,
++            StringComparer.Ordinal);
++    }
++
++    [Fact]
++    public void GetFastSeekCommandLineParameter_NoStartTime_EmptyRegardlessOfCodec()
++    {
++        // time <= 0 short-circuits before the isHlsRemuxing branch in both old and new code.
++        var state = BuildSeekState(TranscodingJobType.Hls, outputVideoCodec: "copy", startTimeTicks: 0);
++        var result = CreateSeekHelper().GetFastSeekCommandLineParameter(state, new EncodingOptions(), "mp4");
++
++        Assert.Equal(string.Empty, result);
++    }
++
++    private static EncodingJobInfo BuildSeekState(TranscodingJobType jobType, string outputVideoCodec, long startTimeTicks)
++    {
++        return new EncodingJobInfo(jobType)
++        {
++            IsVideoRequest = true,
++            OutputVideoCodec = outputVideoCodec,
++            BaseRequest = new VideoRequestDto
++            {
++                StartTimeTicks = startTimeTicks,
++            },
++        };
++    }
++
++    private static EncodingHelper CreateSeekHelper()
++    {
++        var mediaEncoder = new Mock<IMediaEncoder>();
++        mediaEncoder
++            .Setup(e => e.GetTimeParameter(It.IsAny<long>()))
++            .Returns((long ticks) => ticks.ToString(CultureInfo.InvariantCulture));
++
++        return new EncodingHelper(
++            Mock.Of<IApplicationPaths>(),
++            mediaEncoder.Object,
++            Mock.Of<ISubtitleEncoder>(),
++            Mock.Of<IConfiguration>(),
++            Mock.Of<IConfigurationManager>(),
++            Mock.Of<IPathManager>());
++    }
++
+     private static EncodingJobInfo BuildAudioState(string audioCodec, int requestedSampleRate, string? outputContainer = null)
+     {
+         var audio = new MediaStream { Index = 0, Type = MediaStreamType.Audio, Codec = "flac", SampleRate = 96000 };

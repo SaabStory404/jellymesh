@@ -11,7 +11,7 @@
 use proptest::prelude::*;
 use std::sync::OnceLock;
 use tcpool_ir::validate::{validate, Policy};
-use tcpool_ir::{render, Backend, TranslateOpts};
+use tcpool_ir::{render, Backend, Shape, TranslateOpts};
 
 /// Jellyfin's logged command lines use double quotes around paths and filter chains (mirrors
 /// `tests/corpus_validate.rs`'s `split`).
@@ -114,14 +114,14 @@ proptest! {
     ) {
         let mutated = mutate(&corpus_get(idx), kind, &word);
         let p = policy();
-        prop_assume!(validate(&mutated, &p).is_ok());
+        prop_assume!(validate(&mutated, &p, Shape::Hls).is_ok());
 
         for backend in [Backend::Cpu, Backend::Qsv, Backend::Nvenc] {
             for gpu_filters in [false, true] {
-                let opts = TranslateOpts { pathmap: vec![], gpu_filters };
+                let opts = TranslateOpts { pathmap: vec![], gpu_filters, ..Default::default() };
                 let out = render(&mutated, backend, &opts);
                 prop_assert!(
-                    validate(&out.args, &p).is_ok(),
+                    validate(&out.args, &p, Shape::Hls).is_ok(),
                     "backend {:?} gpu_filters={} broke validate: {:?} -> {:?}",
                     backend, gpu_filters, mutated, out.args
                 );
@@ -184,7 +184,7 @@ proptest! {
         args.splice(n - 1..n - 1, [flag.to_string(), graph.clone()]);
 
         prop_assert!(
-            validate(&args, &policy()).is_err(),
+            validate(&args, &policy(), Shape::Hls).is_err(),
             "accepted a dangerous filter chain {:?} via {}",
             graph, flag
         );
@@ -218,7 +218,7 @@ proptest! {
         let i = i.unwrap();
         args[i + 1] = bad.clone();
         prop_assert!(
-            validate(&args, &policy()).is_err(),
+            validate(&args, &policy(), Shape::Hls).is_err(),
             "accepted input path outside the roots: {bad}"
         );
     }
@@ -259,7 +259,7 @@ proptest! {
         ins.push(path.clone());
         args.splice(n - 1..n - 1, ins);
         prop_assert!(
-            validate(&args, &policy()).is_err(),
+            validate(&args, &policy(), Shape::Hls).is_err(),
             "accepted an extra output at {path}"
         );
     }

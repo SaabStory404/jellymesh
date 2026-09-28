@@ -1,0 +1,68 @@
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceImageInheritanceTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceImageInheritanceTests.cs
+index 6a3dcab57..7f670d19c 100644
+--- a/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceImageInheritanceTests.cs
++++ b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceImageInheritanceTests.cs
+@@ -12,6 +12,7 @@ using MediaBrowser.Controller.Entities.Audio;
+ using MediaBrowser.Controller.Entities.Movies;
+ using MediaBrowser.Controller.Library;
+ using MediaBrowser.Controller.LiveTv;
++using MediaBrowser.Controller.Persistence;
+ using MediaBrowser.Controller.Providers;
+ using MediaBrowser.Controller.Trickplay;
+ using MediaBrowser.Model.Entities;
+@@ -183,10 +184,13 @@ public class DtoServiceImageInheritanceTests
+                 [albumTwo.Id] = [new PersonInfo { ItemId = albumTwo.Id, Name = "Some Actor", Type = PersonKind.Actor }]
+             });
+ 
+-        // AttachPeople still resolves each distinct name to its Person entity to attach images.
++        // AttachPeople resolves the distinct names to Person entities in one batch (GetPersons).
+         libraryManager
+-            .Setup(x => x.GetPerson("Some Actor"))
+-            .Returns(new Person { Id = Guid.NewGuid(), Name = "Some Actor" });
++            .Setup(x => x.GetPersons(It.IsAny<IEnumerable<string>>()))
++            .Returns(new Dictionary<string, Person>
++            {
++                ["Some Actor"] = new Person { Id = Guid.NewGuid(), Name = "Some Actor" }
++            });
+ 
+         var dtoService = BuildDtoService(libraryManager);
+ 
+@@ -204,6 +208,7 @@ public class DtoServiceImageInheritanceTests
+         // People are batched once for the whole set, never once per item.
+         libraryManager.Verify(x => x.GetPeopleByItems(It.IsAny<IReadOnlyList<Guid>>()), Times.Once);
+         libraryManager.Verify(x => x.GetPeople(It.IsAny<BaseItem>()), Times.Never);
++        libraryManager.Verify(x => x.GetPerson(It.IsAny<string>()), Times.Never);
+     }
+ 
+     [Fact]
+@@ -325,6 +330,7 @@ public class DtoServiceImageInheritanceTests
+             mediaSourceManager.Object,
+             new Lazy<ILiveTvManager>(() => liveTvManager.Object),
+             trickplayManager.Object,
+-            chapterManager.Object);
++            chapterManager.Object,
++            new Mock<IMediaStreamRepository>().Object);
+     }
+ }
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceTests.cs
+index fd84cfb49..cda6774c4 100644
+--- a/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceTests.cs
++++ b/tests/Jellyfin.Server.Implementations.Tests/Dto/DtoServiceTests.cs
+@@ -14,6 +14,7 @@ using MediaBrowser.Controller.Entities;
+ using MediaBrowser.Controller.Entities.TV;
+ using MediaBrowser.Controller.Library;
+ using MediaBrowser.Controller.LiveTv;
++using MediaBrowser.Controller.Persistence;
+ using MediaBrowser.Controller.Providers;
+ using MediaBrowser.Controller.Trickplay;
+ using MediaBrowser.Model.Entities;
+@@ -58,7 +59,8 @@ public class DtoServiceTests
+             new Mock<IMediaSourceManager>().Object,
+             new Lazy<ILiveTvManager>(() => new Mock<ILiveTvManager>().Object),
+             new Mock<ITrickplayManager>().Object,
+-            new Mock<IChapterManager>().Object);
++            new Mock<IChapterManager>().Object,
++            new Mock<IMediaStreamRepository>().Object);
+ 
+         // Episode.Series / Episode.Season resolve through the static BaseItem.LibraryManager.
+         BaseItem.LibraryManager = _libraryManagerMock.Object;

@@ -1,0 +1,13 @@
+card,codec,title,out_res,cap_mbps,mode,bv_kbps,maxrate_kbps,delivered_kbps,pct_of_maxrate,notes
+arc-a380-qsv,h264,sample-b,1080p,60,calibrated,57000,60000,55811,93.0,"pool-r1 render() (P5 + NVENC 90%), 20 s from t=1200 s, 2160p-class source"
+arc-a380-qsv,h264,sample-b,1080p,4,calibrated,3800,4000,3767,94.2,"pool-r1 render() (P5 + NVENC 90%), 20 s from t=1200 s, 2160p-class source"
+arc-a380-qsv,h264,sample-c,1080p,60,calibrated,57000,60000,57431,95.7,"pool-r1 render() (P5 + NVENC 90%), 20 s from t=1200 s, 2160p-class source, HDR10 tone-mapped to SDR"
+arc-a380-qsv,h264,sample-c,1080p,4,calibrated,3800,4000,3843,96.1,"pool-r1 render() (P5 + NVENC 90%), 20 s from t=1200 s, 2160p-class source, HDR10 tone-mapped to SDR"
+arc-a380-qsv,hevc,sample-b,1080p,60,calibrated,57000,60000,55822,93.0,"pool-r1 render() (P5 + NVENC 90%), 20 s from t=1200 s, 2160p-class source"
+arc-a380-qsv,hevc,sample-b,1080p,4,calibrated,3800,4000,3766,94.1,"pool-r1 render() (P5 + NVENC 90%), 20 s from t=1200 s, 2160p-class source"
+tesla-p4-nvenc,h264,sample-b,1080p,60,calibrated,54000,60000,49539,82.6,"pool-r1 render() (P5 + NVENC 90%), 20 s from t=1200 s, 2160p-class source"
+tesla-p4-nvenc,h264,sample-b,1080p,4,calibrated,3600,4000,3865,96.6,"pool-r1 render() (P5 + NVENC 90%), 20 s from t=1200 s, 2160p-class source"
+tesla-p4-nvenc,h264,sample-c,1080p,60,calibrated,54000,60000,48656,81.1,"pool-r1 render() (P5 + NVENC 90%), 20 s from t=1200 s, 2160p-class source, HDR10 tone-mapped to SDR"
+tesla-p4-nvenc,h264,sample-c,1080p,4,calibrated,3600,4000,3740,93.5,"pool-r1 render() (P5 + NVENC 90%), 20 s from t=1200 s, 2160p-class source, HDR10 tone-mapped to SDR"
+tesla-p4-nvenc,hevc,sample-b,1080p,60,calibrated,54000,60000,49314,82.2,"pool-r1 render() (P5 + NVENC 90%), 20 s from t=1200 s, 2160p-class source"
+tesla-p4-nvenc,hevc,sample-b,1080p,4,calibrated,3600,4000,3938,98.4,"pool-r1 render() (P5 + NVENC 90%), 20 s from t=1200 s, 2160p-class source"
