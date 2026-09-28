@@ -63,6 +63,7 @@ fn render_of_every_golden_is_translate_plus_temp_file() {
             pathmap: vec![],
             gpu_filters: true,
             rate_control: RateControl::Legacy,
+            source: None,
         };
         for (n, r) in rows.iter().enumerate() {
             let rendered = render(&r.input, backend, &opts);

@@ -11,7 +11,7 @@
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use tcpool_ir::{render, Backend, RateControl, TranslateOpts};
+use tcpool_ir::{render, Backend, RateControl, SourceVideo, TranslateOpts};
 
 #[derive(Deserialize)]
 struct Row {
@@ -35,6 +35,13 @@ fn rendered() -> BTreeMap<String, Vec<Vec<String>>> {
         pathmap: vec![],
         gpu_filters: true,
         rate_control: RateControl::Calibrated,
+        // P5.1 ladder: every row as if the admission probe saw a 4K 23.976 fps source, so the
+        // corpus's 960..3840 scale bounds land on the 720/1080/1440/2160 rungs.
+        source: Some(SourceVideo {
+            width: 3840,
+            height: 2160,
+            fps: 24000.0 / 1001.0,
+        }),
     };
     spike
         .into_iter()

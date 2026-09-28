@@ -7,7 +7,10 @@
 //! (`corpus/goldens/spike-translate.json`); deliberate improvements come after, as golden updates.
 
 pub mod filters;
+pub mod ladder;
 pub mod validate;
+
+pub use ladder::SourceVideo;
 
 use std::fmt;
 
@@ -119,6 +122,9 @@ pub struct TranslateOpts {
     pub gpu_filters: bool,
     /// Rate-control mapping `render()` applies on top of the parity translation.
     pub rate_control: RateControl,
+    /// The source's video size and rate from the agent's admission ffprobe, for the P5.1
+    /// bitrate ladder (`ladder::rung`). `None` = unknown (the scale filter's bound is used).
+    pub source: Option<SourceVideo>,
 }
 
 /// How `render()` maps Jellyfin's `-crf` + `-maxrate`/`-bufsize` onto a hardware encoder.
@@ -302,7 +308,8 @@ pub fn render(args: &[String], backend: Backend, o: &TranslateOpts) -> Translate
     } else {
         let mut t = translate(args, backend, o);
         if o.rate_control == RateControl::Calibrated {
-            apply_rate_control(&mut t.args, backend);
+            let rung = video_codec_value(&t.args).and_then(|e| ladder::rung(e, args, o.source));
+            apply_rate_control(&mut t.args, backend, rung);
         }
         t
     };
@@ -364,15 +371,23 @@ fn is_opt(a: &str, base: &str) -> bool {
 /// Jellyfin's `-crf N -maxrate cap -bufsize 2cap` became `-global_quality N` (QSV) / `-cq N`
 /// (NVENC) in the parity translation. On the Arc that is CQP, which ignores the cap (MEASURED P0:
 /// 16-22% of the cap, VMAF 87 at 8 Mbps, identical at every rung). This replaces the quality
-/// target with a bitrate target of `RC_TARGET_PCT`% of `-maxrate`, keeps Jellyfin's
-/// `-maxrate`/`-bufsize` exactly (clients depend on them), adds `rc_options`, and sets the
-/// calibrated preset.
+/// target with a bitrate target, adds `rc_options`, and sets the calibrated preset.
+///
+/// Target (P5.1): `RC_TARGET_PCT`% of `min(cap, rung)`, where `rung` is the ladder's
+/// cap-equivalent for the output codec/size/rate (`ladder::rung`). Without the ladder P5 aimed
+/// at 95% of whatever the client allowed: ~58 Mbit/s for a 1080p LAN client capped at 61.6M.
+/// - `-maxrate cap` with cap > 0: Jellyfin's `-maxrate`/`-bufsize` are kept exactly (they are
+///   the client's ceiling).
+/// - `-maxrate 0 -bufsize 0` (Jellyfin with no client bitrate, MEASURED in prod) or no
+///   `-maxrate`: with a rung, both are set to `rung` / `2 x rung`, the exact shape of a
+///   calibrated request at cap = rung (QSV VBR needs a MaxKbps above its target). Before P5.1
+///   this fell back to the quality target, which on the Arc is cap-blind CQP.
 ///
 /// Unchanged: the CPU backend (libx264/libx265 CRF + VBV already honours the cap; the
 /// calibration's `-preset slow` CPU anchor runs 0.18-0.59x realtime, so it is not a playback
-/// setting), commands without `-maxrate` (no cap to track), stream copies, and encoders with no
-/// calibration (AV1). An existing `-b:v` is kept.
-pub fn apply_rate_control(args: &mut Vec<String>, backend: Backend) {
+/// setting), stream copies, encoders with no calibration (AV1), and no cap with no rung. An
+/// existing `-b:v` is kept.
+pub fn apply_rate_control(args: &mut Vec<String>, backend: Backend, rung: Option<u64>) {
     let quality = match backend {
         Backend::Qsv => "-global_quality",
         Backend::Nvenc => "-cq",
@@ -384,19 +399,27 @@ pub fn apply_rate_control(args: &mut Vec<String>, backend: Backend) {
     let Some(opts) = args.get(enc_at + 1).and_then(|e| rc_options(e)) else {
         return;
     };
-    let Some(cap) = args
+    let cap = args
         .iter()
         .position(|a| is_opt(a, "-maxrate"))
         .and_then(|i| args.get(i + 1))
         .and_then(|v| parse_size(v))
-        .filter(|c| *c > 0)
-    else {
-        return;
+        .filter(|c| *c > 0);
+    let eff = match (cap, rung) {
+        (Some(c), Some(r)) => c.min(r),
+        (Some(c), None) => c,
+        (None, Some(r)) => {
+            // No client ceiling: the rung's calibrated VBV.
+            set_opt(args, "-maxrate", r, quality);
+            set_opt(args, "-bufsize", r.saturating_mul(2), quality);
+            r
+        }
+        (None, None) => return,
     };
     let mut set: Vec<String> = Vec::with_capacity(opts.len() + 2);
     if !args.iter().any(|a| is_opt(a, "-b:v") || a == "-vb") {
         set.push("-b:v".into());
-        set.push((cap.saturating_mul(RC_TARGET_PCT) / 100).to_string());
+        set.push((eff.saturating_mul(RC_TARGET_PCT) / 100).to_string());
     }
     set.extend(opts.iter().map(|s| s.to_string()));
     // The quality target goes; the rate-control set takes its slot (else follows -maxrate's value).
@@ -427,6 +450,26 @@ pub fn apply_rate_control(args: &mut Vec<String>, backend: Backend) {
             args.splice(at..at, ["-preset".to_string(), preset.to_string()]);
         }
     }
+}
+
+/// Set option `base` (bare or stream-specified) to `v`, or insert `base v` after `-maxrate`'s
+/// value, else after the `quality` option's value (Jellyfin's order: `-crf N -maxrate ...`),
+/// else after the encoder name.
+fn set_opt(args: &mut Vec<String>, base: &str, v: u64, quality: &str) {
+    if let Some(i) = args.iter().position(|a| is_opt(a, base)) {
+        if let Some(x) = args.get_mut(i + 1) {
+            *x = v.to_string();
+            return;
+        }
+    }
+    let at = args
+        .iter()
+        .position(|a| is_opt(a, "-maxrate"))
+        .or_else(|| args.iter().position(|a| is_opt(a, quality)))
+        .or_else(|| args.iter().position(|a| is_video_codec_flag(a)))
+        .map_or(args.len(), |i| i + 2)
+        .min(args.len());
+    args.splice(at..at, [base.to_string(), v.to_string()]);
 }
 
 /// Add `flag` to `-hls_flags`, or insert `-hls_flags flag` just before the output playlist.
@@ -1398,8 +1441,9 @@ mod tests {
                     "1",
                     "-preset",
                     "medium",
+                    // 1080p hevc rung 6.4M < the 8M cap: 95% of the rung
                     "-b:v",
-                    "7600000",
+                    "6080000",
                     "-extbrc",
                     "1",
                     "-look_ahead_depth",
@@ -1449,7 +1493,7 @@ mod tests {
                     "-preset",
                     "p5",
                     "-b:v",
-                    "7600000",
+                    "6080000",
                     "-rc",
                     "vbr",
                     "-tune",
@@ -1528,23 +1572,103 @@ mod tests {
                 assert_eq!(render_rc(&c, b, rc), render_rc(&c, b, RateControl::Legacy));
             }
         }
-        // No -maxrate (no cap to track), or an uncalibrated encoder (AV1): the parity
-        // translation, including its preset, stands.
-        let mut no_cap = Vec::new();
-        for enc in ["libx264", "libx265"] {
-            let mut a = jf_rc(enc);
-            let i = a.iter().position(|x| x == "-maxrate").unwrap();
-            a.drain(i..i + 4); // -maxrate N -bufsize N
-            no_cap.push((enc, a));
+        // An uncalibrated encoder (AV1): the parity translation, including its preset, stands.
+        let a = jf_rc("libsvtav1");
+        for b in [Backend::Qsv, Backend::Nvenc] {
+            assert_eq!(
+                render_rc(&a, b, RateControl::Calibrated),
+                render_rc(&a, b, RateControl::Legacy),
+                "av1 {b}"
+            );
         }
-        no_cap.push(("libsvtav1", jf_rc("libsvtav1")));
-        for (enc, a) in no_cap {
-            for b in [Backend::Qsv, Backend::Nvenc] {
+    }
+
+    /// `jf_rc` with Jellyfin's `-maxrate`/`-bufsize` values replaced (`None` = both removed).
+    fn jf_cap(enc: &str, cap: Option<u64>) -> Vec<String> {
+        let mut a = jf_rc(enc);
+        let i = a.iter().position(|x| x == "-maxrate").unwrap();
+        match cap {
+            Some(c) => {
+                a[i + 1] = c.to_string();
+                a[i + 3] = (2 * c).to_string();
+            }
+            None => {
+                a.drain(i..i + 4);
+            }
+        }
+        a
+    }
+
+    fn opt(out: &[String], k: &str) -> Option<String> {
+        out.iter().position(|x| x == k).map(|i| out[i + 1].clone())
+    }
+
+    #[test]
+    fn ladder_caps_the_target_but_keeps_jellyfins_ceiling() {
+        // P5.1: a LAN client's 61.6M cap (MEASURED prod) at 1080p no longer targets 58.5M.
+        let src = Some(SourceVideo {
+            width: 3840,
+            height: 2160,
+            fps: 23.976,
+        });
+        for (enc, b, want) in [
+            ("libx264", Backend::Qsv, "7600000"),
+            ("libx264", Backend::Nvenc, "7600000"),
+            ("libx265", Backend::Qsv, "6080000"),
+            ("libx265", Backend::Nvenc, "6080000"),
+        ] {
+            let o = TranslateOpts {
+                source: src,
+                ..Default::default()
+            };
+            let out = render(&jf_cap(enc, Some(61_599_184)), b, &o).args;
+            assert_eq!(opt(&out, "-b:v").as_deref(), Some(want), "{enc} {b}");
+            assert_eq!(opt(&out, "-maxrate").as_deref(), Some("61599184"));
+            assert_eq!(opt(&out, "-bufsize").as_deref(), Some("123198368"));
+            // A remote client below the rung: 95% of its cap, as in P5.
+            let out = render(&jf_cap(enc, Some(4_000_000)), b, &o).args;
+            assert_eq!(opt(&out, "-b:v").as_deref(), Some("3800000"), "{enc} {b}");
+            assert_eq!(opt(&out, "-maxrate").as_deref(), Some("4000000"));
+            // Legacy ignores the ladder.
+            let l = render_rc(&jf_cap(enc, Some(61_599_184)), b, RateControl::Legacy);
+            assert_eq!(opt(&l, "-b:v"), None);
+        }
+    }
+
+    #[test]
+    fn no_client_cap_gets_the_rung_as_a_calibrated_vbv() {
+        // `-maxrate 0 -bufsize 0` (MEASURED prod shape) and no -maxrate at all.
+        for cap in [Some(0), None] {
+            for (enc, b, r) in [
+                ("libx264", Backend::Qsv, 8_000_000u64),
+                ("libx264", Backend::Nvenc, 8_000_000),
+                ("libx265", Backend::Qsv, 6_400_000),
+                ("libx265", Backend::Nvenc, 6_400_000),
+            ] {
+                let a = jf_cap(enc, cap);
+                let out = render_rc(&a, b, RateControl::Calibrated);
+                let t = (r * RC_TARGET_PCT / 100).to_string();
+                assert_eq!(opt(&out, "-b:v"), Some(t), "{enc} {b} {cap:?}");
+                assert_eq!(opt(&out, "-maxrate"), Some(r.to_string()));
+                assert_eq!(opt(&out, "-bufsize"), Some((2 * r).to_string()));
+                assert_eq!(out.iter().filter(|x| *x == "-maxrate").count(), 1);
+                assert!(!out.iter().any(|x| x == "-global_quality" || x == "-cq"));
+                // Identical to a request capped at the rung.
                 assert_eq!(
-                    render_rc(&a, b, RateControl::Calibrated),
-                    render_rc(&a, b, RateControl::Legacy),
-                    "{enc} {b}"
+                    enc_opts(&out),
+                    enc_opts(&render_rc(
+                        &jf_cap(enc, Some(r)),
+                        b,
+                        RateControl::Calibrated
+                    )),
+                    "{enc} {b} {cap:?}"
                 );
+                // Legacy keeps the quality target and Jellyfin's zeros.
+                let l = render_rc(&a, b, RateControl::Legacy);
+                assert!(l.iter().any(|x| x == "-global_quality" || x == "-cq"));
+                if cap.is_some() {
+                    assert_eq!(opt(&l, "-maxrate").as_deref(), Some("0"));
+                }
             }
         }
     }
@@ -1579,12 +1703,15 @@ mod tests {
         let p = validate::Policy::default();
         for enc in ["libx264", "libx265"] {
             for b in [Backend::Qsv, Backend::Nvenc] {
-                let out = render_rc(&jf_rc(enc), b, RateControl::Calibrated);
-                assert_eq!(
-                    validate::validate(&out, &p, Shape::Hls),
-                    Ok(()),
-                    "{enc} {b}"
-                );
+                // P5.1: capped, capped above the rung, `-maxrate 0`, and no -maxrate.
+                for cap in [Some(8_000_000), Some(61_599_184), Some(0), None] {
+                    let out = render_rc(&jf_cap(enc, cap), b, RateControl::Calibrated);
+                    assert_eq!(
+                        validate::validate(&out, &p, Shape::Hls),
+                        Ok(()),
+                        "{enc} {b} {cap:?}"
+                    );
+                }
             }
         }
     }

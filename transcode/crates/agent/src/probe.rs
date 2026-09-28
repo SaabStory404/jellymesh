@@ -7,7 +7,7 @@
 use crate::config::Config;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tcpool_ir::{translate, Backend, TranslateOpts};
+use tcpool_ir::{translate, Backend, SourceVideo, TranslateOpts};
 use tokio::process::Command;
 
 /// Output tokens -> (Jellyfin software encoder, 10-bit).
@@ -200,8 +200,9 @@ async fn ffmpeg_version(ffmpeg: &str) -> String {
     }
 }
 
-/// Height of the job's video input via ffprobe (bounded). `None` if unknown.
-pub async fn source_height(cfg: &Config, input: &str) -> Option<u32> {
+/// Size and frame rate of the job's video input via ffprobe (bounded): the admission weight
+/// (height) and the P5.1 bitrate ladder. `None` if unknown.
+pub async fn source_video(cfg: &Config, input: &str) -> Option<SourceVideo> {
     let out = tokio::time::timeout(
         Duration::from_secs(10),
         Command::new(&cfg.ffprobe)
@@ -211,9 +212,9 @@ pub async fn source_height(cfg: &Config, input: &str) -> Option<u32> {
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=height",
+                "stream=width,height,avg_frame_rate",
                 "-of",
-                "csv=p=0",
+                "default=nw=1",
                 input,
             ])
             .stdin(Stdio::null())
@@ -223,12 +224,21 @@ pub async fn source_height(cfg: &Config, input: &str) -> Option<u32> {
     .await
     .ok()?
     .ok()?;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+    parse_source_video(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pure parse of `source_video`'s `key=value` lines. Needs a height; width/fps may be missing.
+fn parse_source_video(s: &str) -> Option<SourceVideo> {
+    let mut v = SourceVideo::default();
+    for l in s.lines() {
+        match l.trim().split_once('=') {
+            Some(("width", x)) => v.width = x.trim().parse().unwrap_or(0),
+            Some(("height", x)) => v.height = x.trim().parse().unwrap_or(0),
+            Some(("avg_frame_rate", x)) => v.fps = tcpool_ir::ladder::parse_rate(x).unwrap_or(0.0),
+            _ => {}
+        }
+    }
+    (v.height > 0).then_some(v)
 }
 
 /// What the P5 gate needs to know about a source's video track.
@@ -321,6 +331,18 @@ fn parse_source_dovi_json(json: &str) -> Option<SourceDovi> {
 #[cfg(test)]
 mod dv81_tests {
     use super::*;
+
+    #[test]
+    fn parses_source_video_key_values() {
+        let v = parse_source_video("width=3840\nheight=2160\navg_frame_rate=24000/1001\n").unwrap();
+        assert_eq!((v.width, v.height), (3840, 2160));
+        assert!((v.fps - 23.976).abs() < 0.001);
+        // unknown rate (0/0) keeps the size; no height = unknown
+        let v = parse_source_video("width=1920\nheight=1080\navg_frame_rate=0/0\n").unwrap();
+        assert_eq!(v.fps, 0.0);
+        assert_eq!(parse_source_video("width=1920\n"), None);
+        assert_eq!(parse_source_video(""), None);
+    }
 
     #[test]
     fn parses_the_measured_shape() {

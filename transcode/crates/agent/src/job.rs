@@ -1,7 +1,7 @@
 //! One job: admission, ffmpeg lifecycle, heartbeats, fencing, and the CPU-filter re-run.
 
 use crate::config::Config;
-use crate::probe::source_height;
+use crate::probe::source_video;
 use crate::State;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tcpool_ir::{
     add_dv_removal_bsf, first_segment, input_path, is_video_copy, map_path, render,
-    render_trickplay, strip_dv81_signal, wants_dv81, Shape, TranslateOpts,
+    render_trickplay, strip_dv81_signal, wants_dv81, Shape, SourceVideo, TranslateOpts,
 };
 use tcpool_proto::{
     client_msg, server_msg, Accepted, Busy, ClientMsg, Exit, Heartbeat, Job, ServerMsg,
@@ -25,17 +25,18 @@ fn msg(m: server_msg::Msg) -> Result<ServerMsg, Status> {
     Ok(ServerMsg { msg: Some(m) })
 }
 
-/// Units this job costs on this card.
-async fn job_weight(cfg: &Config, args: &[String]) -> f64 {
+/// Units this job costs on this card, and what the (single) admission ffprobe saw of the source
+/// (reused by the P5.1 bitrate ladder in `render()`).
+async fn job_weight(cfg: &Config, args: &[String]) -> (f64, Option<SourceVideo>) {
     if is_video_copy(args) {
-        return cfg.weight_copy;
+        return (cfg.weight_copy, None);
     }
     let input = input_path(args).map(|p| map_path(p, &cfg.pathmap));
-    let height = match input {
-        Some(p) => source_height(cfg, &p).await,
+    let source = match input {
+        Some(p) => source_video(cfg, &p).await,
         None => None,
     };
-    cfg.weight_for_height(height)
+    (cfg.weight_for_height(source.map(|s| s.height)), source)
 }
 
 /// Why the agent ended a job itself (not fencing).
@@ -199,8 +200,8 @@ pub async fn run_job(
         return;
     }
     // A3: BATCH uses a fixed weight and skips job_weight()'s ffprobe before admission.
-    let weight = if batch {
-        cfg.batch_weight
+    let (weight, source) = if batch {
+        (cfg.batch_weight, None)
     } else {
         job_weight(cfg, &job.args).await
     };
@@ -457,6 +458,7 @@ pub async fn run_job(
         pathmap: cfg.pathmap.clone(),
         gpu_filters: cfg.gpu_filters,
         rate_control: cfg.rate_control,
+        source,
     };
     let cwd = map_path(&job.cwd, &cfg.pathmap);
     let render_fn = |o: &TranslateOpts| {
