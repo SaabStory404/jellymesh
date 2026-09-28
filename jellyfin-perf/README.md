@@ -68,3 +68,9 @@ Galera patched, and SQLite stock vs Galera stock.
 
 Not changed, and why: NextUp (3 statements, 8 ms here) and UserViews extras/chapters (24 ms) are
 not worth fork surface on this library.
+
+## Bughunt series
+
+`bughunt/NN-*.patch` (00-13) apply on top of this patch; `build.sh` applies them by default
+(`BUGHUNT=0` for this patch alone) and then also copies `MediaBrowser.Model.dll`, `Jellyfin.Api.dll`
+and `jellyfin.dll`. Findings, evidence and tests: `docs/BUGHUNT.md`.

@@ -1,0 +1,146 @@
+diff --git a/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs b/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
+index 5e985c1a7..8afafc85d 100644
+--- a/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
++++ b/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
+@@ -54,6 +54,30 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+ 
+     private readonly Version _maxFFmpegCkeyPauseSupported = new Version(6, 1);
+ 
++    /// <summary>
++    /// Kill-timer duration, in milliseconds, for a progressive stream playback check-in.
++    /// Unaffected by <see cref="TranscodingJob.IsUserPaused"/>: progressive streams stop reliably on their own.
++    /// </summary>
++    private const int ProgressiveKillTimeoutMs = 10000;
++
++    /// <summary>
++    /// Kill-timer duration, in milliseconds, for a non-progressive (HLS) job whose client has not reported
++    /// itself paused.
++    /// </summary>
++    private const int DefaultKillTimeoutMs = 60000;
++
++    /// <summary>
++    /// Kill-timer duration, in milliseconds, for a non-progressive (HLS) job whose client has reported itself
++    /// paused via Sessions/Playing/Progress (<see cref="TranscodingJob.IsUserPaused"/>).
++    /// A paused-but-connected client should not be killed and cold-restarted (fresh ffmpeg process, reseek,
++    /// re-buffer) just because it stops pinging as often while paused. The grace period is bounded, not
++    /// unlimited: this deployment has only 20 GPU transcode slots, so a client that reports paused and then
++    /// disconnects without ever resuming must still be reaped well before it can starve other viewers of a
++    /// slot. A few minutes covers ordinary pause use (answering the door, a bathroom break) without materially
++    /// reducing effective transcode capacity if a handful of paused sessions overlap.
++    /// </summary>
++    private const int PausedKillTimeoutMs = 180000;
++
+     /// <summary>
+     /// Initializes a new instance of the <see cref="TranscodeManager"/> class.
+     /// </summary>
+@@ -150,12 +174,7 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+             return;
+         }
+ 
+-        var timerDuration = 10000;
+-
+-        if (job.Type != TranscodingJobType.Progressive)
+-        {
+-            timerDuration = 60000;
+-        }
++        var timerDuration = GetKillTimeoutMs(job.Type, job.IsUserPaused);
+ 
+         job.PingTimeout = timerDuration;
+         job.LastPingDate = DateTime.UtcNow;
+@@ -171,6 +190,23 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+         }
+     }
+ 
++    /// <summary>
++    /// Determines the kill-timer duration, in milliseconds, for a transcoding job. Extracted from
++    /// <see cref="PingTimer"/> so it is unit-testable without a live ffmpeg process.
++    /// </summary>
++    /// <param name="type">The transcoding job type.</param>
++    /// <param name="isUserPaused">Whether the client has most recently reported itself paused.</param>
++    /// <returns>The kill-timer duration, in milliseconds.</returns>
++    internal static int GetKillTimeoutMs(TranscodingJobType type, bool isUserPaused)
++    {
++        if (type == TranscodingJobType.Progressive)
++        {
++            return ProgressiveKillTimeoutMs;
++        }
++
++        return isUserPaused ? PausedKillTimeoutMs : DefaultKillTimeoutMs;
++    }
++
+     private async void OnTranscodeKillTimerStopped(object? state)
+     {
+         var job = state as TranscodingJob ?? throw new ArgumentException($"{nameof(state)} is not of type {nameof(TranscodingJob)}", nameof(state));
+diff --git a/tests/Jellyfin.MediaEncoding.Tests/Transcoding/TranscodeManagerPingTimerTests.cs b/tests/Jellyfin.MediaEncoding.Tests/Transcoding/TranscodeManagerPingTimerTests.cs
+new file mode 100644
+index 000000000..7cad3b6ff
+--- /dev/null
++++ b/tests/Jellyfin.MediaEncoding.Tests/Transcoding/TranscodeManagerPingTimerTests.cs
+@@ -0,0 +1,67 @@
++using MediaBrowser.Controller.MediaEncoding;
++using MediaBrowser.MediaEncoding.Transcoding;
++using Xunit;
++
++namespace Jellyfin.MediaEncoding.Tests.Transcoding
++{
++    /// <summary>
++    /// Tests for <see cref="TranscodeManager.GetKillTimeoutMs"/>, the kill-timer duration selection extracted
++    /// from <c>PingTimer</c> so a paused-but-connected HLS client is not killed and cold-restarted on the same
++    /// cadence as an abandoned one.
++    /// </summary>
++    public class TranscodeManagerPingTimerTests
++    {
++        [Theory]
++        [InlineData(TranscodingJobType.Hls)]
++        [InlineData(TranscodingJobType.Dash)]
++        public void GetKillTimeoutMs_PausedNonProgressive_IsLongerThanUnpaused(TranscodingJobType type)
++        {
++            var unpaused = TranscodeManager.GetKillTimeoutMs(type, false);
++            var paused = TranscodeManager.GetKillTimeoutMs(type, true);
++
++            Assert.True(paused > unpaused, "Paused kill timeout must be longer than the unpaused kill timeout.");
++        }
++
++        [Theory]
++        [InlineData(TranscodingJobType.Hls)]
++        [InlineData(TranscodingJobType.Dash)]
++        public void GetKillTimeoutMs_UnpausedNonProgressive_MatchesExistingSixtySecondTimeout(TranscodingJobType type)
++        {
++            Assert.Equal(60000, TranscodeManager.GetKillTimeoutMs(type, false));
++        }
++
++        [Theory]
++        [InlineData(TranscodingJobType.Hls)]
++        [InlineData(TranscodingJobType.Dash)]
++        public void GetKillTimeoutMs_PausedNonProgressive_IsBoundedGracePeriod(TranscodingJobType type)
++        {
++            var paused = TranscodeManager.GetKillTimeoutMs(type, true);
++
++            // Bounded: long enough to cover an ordinary pause, short enough that a client which reports
++            // paused and then vanishes cannot tie up a GPU transcode slot indefinitely (only 20 hardware
++            // encode slots are available in this deployment).
++            Assert.True(paused > 60000, "Paused grace period must exceed the unpaused HLS timeout.");
++            Assert.True(paused <= 300000, "Paused grace period must stay bounded (at most a few minutes).");
++        }
++
++        [Theory]
++        [InlineData(false)]
++        [InlineData(true)]
++        public void GetKillTimeoutMs_Progressive_IsUnaffectedByPauseState(bool isUserPaused)
++        {
++            // Progressive streams stop reliably on their own; pause state must never change their timing.
++            Assert.Equal(10000, TranscodeManager.GetKillTimeoutMs(TranscodingJobType.Progressive, isUserPaused));
++        }
++
++        [Theory]
++        [InlineData(TranscodingJobType.Hls, true)]
++        [InlineData(TranscodingJobType.Dash, true)]
++        public void GetKillTimeoutMs_PausedNonProgressive_ExceedsProgressiveTimeout(TranscodingJobType type, bool isUserPaused)
++        {
++            var paused = TranscodeManager.GetKillTimeoutMs(type, isUserPaused);
++            var progressive = TranscodeManager.GetKillTimeoutMs(TranscodingJobType.Progressive, isUserPaused);
++
++            Assert.True(paused > progressive);
++        }
++    }
++}

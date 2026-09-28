@@ -1,0 +1,27 @@
+# jellymesh-jellyfin 12.1-jm7.1: jm7 + fewer database round trips (Galera provider + bughunt 15 poller).
+#
+#   galera/      Jellyfin.Database.Providers.Galera.dll built from galera/:
+#                  - CanConnect (/health) runs SELECT 1 on the pooled connection instead of Pomelo's
+#                    Exists(), which opened a new unpooled connection on every probe
+#                  - PurgeDatabase turns FOREIGN_KEY_CHECKS back on in a finally on the same connection
+#                    (and clears the pool if even that fails), so the setting cannot leak to the next
+#                    pooled user once the connection string has ConnectionReset=false
+#                install-plugins.sh (initContainer) copies it into /config/data/plugins, so the
+#                initContainer image must be jm7.1 too. jm7's Pomelo + MySqlConnector stay.
+#   overlay/     Emby.Server.Implementations.dll from jellyfin-perf/build.sh (BUGHUNT=1, series 00-15):
+#                  15: the invalidation poll keeps one open connection and reads the clock and the
+#                      change window in one round trip (was: a pool checkout + two queries every 250 ms)
+#
+# Everything else (the other overlay assemblies, shim, tcpool-sync, install-plugins.sh) is jm7's.
+#
+# Build context = a staging dir holding overlay/ and galera/, built from one committed SHA:
+#   podman build -f image/Containerfile.jm7.1 -t ghcr.io/saabstory404/jellymesh-jellyfin:12.1-jm7.1 <ctx>
+FROM ghcr.io/saabstory404/jellymesh-jellyfin:12.1-jm7@sha256:9be1129dbdebd035cae48da8c7223acf21a5ac7870a833fea67842f14c8362e0
+COPY overlay/ /usr/lib/jellyfin/bin/
+COPY ["galera/Jellyfin.Database.Providers.Galera.dll", "/opt/jellymesh/plugins/JellyMesh Galera_1.0.0.0/"]
+# Refresh the replaced plugin DLL's line in /opt/jellymesh/SHA256SUMS.
+RUN cd /opt/jellymesh \
+ && f="plugins/JellyMesh Galera_1.0.0.0/Jellyfin.Database.Providers.Galera.dll" \
+ && grep -v " $f\$" SHA256SUMS > SHA256SUMS.new && sha256sum "$f" >> SHA256SUMS.new && mv SHA256SUMS.new SHA256SUMS
+LABEL org.opencontainers.image.source="https://github.com/SaabStory404/jellymesh" \
+      org.opencontainers.image.description="Jellyfin 12.1 + JellyMesh (shared-database HA, cross-node cache invalidation) + bughunt patches + transcode-pool shim (DV7->8.1)"

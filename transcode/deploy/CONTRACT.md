@@ -58,6 +58,7 @@ to a worker that is shutting down.
 | `TC_OUTPUT_ROOT` | `/transcodes` | allowlist: outputs only under here |
 | `TC_READ_ROOTS` | `/config/data/data/subtitles,/config/data/data/attachments` | subtitle burn-in and attachment fonts, read-only |
 | `TC_HW_FILTERS` | `0` on the CPU worker only | |
+| `TC_RC` | **unset** (= `calibrated`) | P5 per-encoder rate control; `legacy` restores the P1 `-global_quality`/`-cq` mapping on one card without a rebuild. Any other value fails agent startup |
 | `TC_PATHMAP` | **unset** | not needed: the agents mount `/data/media` at `/data/media`, the same path prod Jellyfin uses, so the command line's paths are already valid |
 
 ### Shim (inside Jellyfin, installed as `/usr/lib/jellyfin-ffmpeg/ffmpeg`)
@@ -135,6 +136,16 @@ The scratch `mountOptions` are load-bearing: `nfsvers=4.2, lookupcache=positive,
 the defaults a freshly written segment stayed invisible to other nodes for 12–23 s, which is
 Jellyfin waiting on a segment that already exists.
 
+## Shared transcode directory (optional, `JELLYMESH_SHARED_TRANSCODE_DIR=1`)
+
+Both replicas may instead share **one** `TranscodingTempPath` (still a subdirectory, never the
+root). Jellyfin (bughunt patch 16) then sets `JELLYMESH_KEEPALIVE` on each HLS ffmpeg; the shim
+forwards it and the agent keeps the job running if that replica dies (`TC_DETACH`,
+`TC_ORPHAN_IDLE_SECS`, `TC_ORPHAN_PAUSED_SECS`, `TC_ORPHAN_MAX_SECS`), throttling it against the
+viewer's position (`TC_ORPHAN_LEAD_MAX_SECS`, `TC_ORPHAN_LEAD_RESUME_SECS`, `TC_ORPHAN_POS_STALE_SECS`).
+Roll agents before Jellyfin.
+Details: `transcode/docs/SHARED-TRANSCODE.md`.
+
 ## Two rules about the scratch directory
 
 1. **`TranscodingTempPath` must be a subdirectory**, one per Jellyfin identity (e.g.
@@ -147,6 +158,41 @@ Jellyfin waiting on a segment that already exists.
    delete that marker, so its startup wipe throws, the exception is swallowed, `File.Exists` stays
    true, and the racy marker re-create path — which returned HTTP 500 to two viewers starting at
    once, MEASURED twice — never fires.
+
+## Dolby Vision 7 -> 8.1 (P5, wired on `dv81-wire`)
+
+For the Jellyfin-side decision patch (jellymesh PR #3, bug-hunt patch 13): when your patch decides
+a DV profile-7 source should be remuxed as DV 8.1 for the requesting client, append this exactly
+once, on the output video stream, to the ffmpeg argv you already emit:
+
+```
+-metadata:s:v:0 JELLYMESH_DOVI_P7_TO_81=1
+```
+
+That's the only contract on your side. It's a real, harmless ffmpeg option (arbitrary output
+metadata), so nothing breaks if the pool is unreachable and the shim execs your argv unmodified —
+the output just carries one extra, inert metadata key. Do not gate on whether the pool is present;
+emit the marker whenever your decision says DV7->8.1, unconditionally. `-metadata:s:v:0 TC_DV81=1`
+(the pool's original marker value, from before this patch landed) is still accepted as an alias —
+lab recipes and older builds keep working — but new callers should emit the value above.
+
+**Pool-side behavior (branch `dv81-wire`, not in an image yet).** An agent built from it acts on
+the marker for a video-copy (remux) PLAYBACK job: if ffprobe says the source is DV profile 7 and
+the source's video actually carries its RPU in-band (checked on the first bytes of the stream), it
+remuxes with the RPU rewritten to profile 8.1 and the enhancement layer dropped; the HLS init
+segment then carries a DOVI record `profile: 8 ... compatibility id: 1`. Every other case (a source
+that is not DV7, a DV7 MKV whose RPU sits in a Matroska Block Addition (`hvcE` — a common muxing,
+not converted yet), an argv without `-copyts` or with more than one `-i`, or any failure before the
+first segment) runs your argv **minus the marker and with Dolby Vision stripped**, not unchanged:
+your patch only emits this marker for a client it already confirmed accepts "8.1 or HDR10", never
+raw profile 7, so a fallback that cannot produce a real 8.1 record must not silently copy whatever
+DV the source actually has (an untouched profile-7 dual-layer stream is not decodable by a
+single-layer-only 8.1 client). Output paths, segment naming, stdin keys and stderr progress are
+otherwise the same as the plain remux, and a shim that cannot even reach the pool applies the same
+DV-removal rewrite itself before running ffmpeg locally — the one sanctioned exception to execing
+your argv byte-for-byte. Counted in `tcpool_dv81_total{outcome}`. So the badge changes (to a real
+8.1 record) only for in-band-RPU DV7 titles, and every other signaled title still gets a decodable
+HDR10 stream instead of raw DV7; details and measurements in `transcode/docs/PLAN.md` P5.
 
 ## Rollback
 

@@ -1,0 +1,130 @@
+diff --git a/Emby.Server.Implementations/EntryPoints/UserDataChangeNotifier.cs b/Emby.Server.Implementations/EntryPoints/UserDataChangeNotifier.cs
+index b182e5837..8c5bd4404 100644
+--- a/Emby.Server.Implementations/EntryPoints/UserDataChangeNotifier.cs
++++ b/Emby.Server.Implementations/EntryPoints/UserDataChangeNotifier.cs
+@@ -9,6 +9,7 @@ using MediaBrowser.Controller.Session;
+ using MediaBrowser.Model.Entities;
+ using MediaBrowser.Model.Session;
+ using Microsoft.Extensions.Hosting;
++using Microsoft.Extensions.Logging;
+ 
+ namespace Emby.Server.Implementations.EntryPoints
+ {
+@@ -23,6 +24,7 @@ namespace Emby.Server.Implementations.EntryPoints
+         private readonly ISessionManager _sessionManager;
+         private readonly IUserDataManager _userDataManager;
+         private readonly IUserManager _userManager;
++        private readonly ILogger<UserDataChangeNotifier> _logger;
+ 
+         private readonly Dictionary<Guid, Dictionary<Guid, BaseItem>> _changedItems = [];
+         private readonly Lock _syncLock = new();
+@@ -36,11 +38,14 @@ namespace Emby.Server.Implementations.EntryPoints
+         /// <param name="userDataManager">The <see cref="IUserDataManager"/>.</param>
+         /// <param name="sessionManager">The <see cref="ISessionManager"/>.</param>
+         /// <param name="userManager">The <see cref="IUserManager"/>.</param>
++        /// <param name="logger">The logger.</param>
+         public UserDataChangeNotifier(
+             IUserDataManager userDataManager,
+             ISessionManager sessionManager,
+-            IUserManager userManager)
++            IUserManager userManager,
++            ILogger<UserDataChangeNotifier> logger)
+         {
++            _logger = logger;
+             _userDataManager = userDataManager;
+             _sessionManager = sessionManager;
+             _userManager = userManager;
+@@ -142,13 +147,24 @@ namespace Emby.Server.Implementations.EntryPoints
+                 return;
+             }
+ 
++            // This is an async void timer callback: an escaping exception terminates the process.
++            // Building the message reads the database, so a database failover (the write node going
++            // away for a few seconds) used to take down every replica with pending notifications at
++            // once. A lost "user data changed" push only delays the clients' next refresh.
+             foreach (var (userId, changedItems) in changes)
+             {
+-                await _sessionManager.SendMessageToUserSessions(
+-                    [userId],
+-                    SessionMessageType.UserDataChanged,
+-                    () => GetUserDataChangeInfo(userId, changedItems.Values),
+-                    default).ConfigureAwait(false);
++                try
++                {
++                    await _sessionManager.SendMessageToUserSessions(
++                        [userId],
++                        SessionMessageType.UserDataChanged,
++                        () => GetUserDataChangeInfo(userId, changedItems.Values),
++                        default).ConfigureAwait(false);
++                }
++                catch (Exception ex)
++                {
++                    _logger.LogError(ex, "Error sending user data change notifications for user {UserId}", userId);
++                }
+             }
+         }
+ 
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/EntryPoints/UserDataChangeNotifierTests.cs b/tests/Jellyfin.Server.Implementations.Tests/EntryPoints/UserDataChangeNotifierTests.cs
+index 0274398f8..f835d8da8 100644
+--- a/tests/Jellyfin.Server.Implementations.Tests/EntryPoints/UserDataChangeNotifierTests.cs
++++ b/tests/Jellyfin.Server.Implementations.Tests/EntryPoints/UserDataChangeNotifierTests.cs
+@@ -8,6 +8,7 @@ using MediaBrowser.Controller.Library;
+ using MediaBrowser.Controller.Session;
+ using MediaBrowser.Model.Entities;
+ using MediaBrowser.Model.Session;
++using Microsoft.Extensions.Logging.Abstractions;
+ using Moq;
+ using Xunit;
+ 
+@@ -60,8 +61,50 @@ public class UserDataChangeNotifierTests
+         notifier.Dispose();
+     }
+ 
++    [Fact]
++    public async Task OnUserDataSaved_SendThrows_OtherUsersStillNotifiedAndProcessSurvives()
++    {
++        // The flush is an async void timer callback: an exception escaping it terminates the process.
++        // A database failover makes building the message throw; that must cost one push, not the server.
++        var failing = Guid.NewGuid();
++        var sent = 0;
++        _sessionManager.Reset();
++        _sessionManager
++            .Setup(e => e.SendMessageToUserSessions(
++                It.IsAny<System.Collections.Generic.List<Guid>>(),
++                SessionMessageType.UserDataChanged,
++                It.IsAny<Func<UserDataChangeInfo>>(),
++                It.IsAny<CancellationToken>()))
++            .Returns<System.Collections.Generic.List<Guid>, SessionMessageType, Func<UserDataChangeInfo>, CancellationToken>((ids, _, _, _) =>
++            {
++                if (ids.Contains(failing))
++                {
++                    throw new InvalidOperationException("database unavailable");
++                }
++
++                Interlocked.Increment(ref sent);
++                return Task.CompletedTask;
++            });
++
++        var notifier = CreateNotifier();
++        await notifier.StartAsync(TestContext.Current.CancellationToken);
++        RaiseUserDataSaved(failing);
++        RaiseUserDataSaved(Guid.NewGuid());
++
++        var stopwatch = Stopwatch.StartNew();
++        while (stopwatch.Elapsed < _flushTimeout && Volatile.Read(ref sent) == 0)
++        {
++            await Task.Delay(25, TestContext.Current.CancellationToken);
++        }
++
++        Assert.Equal(1, Volatile.Read(ref sent));
++
++        await notifier.StopAsync(TestContext.Current.CancellationToken);
++        notifier.Dispose();
++    }
++
+     private UserDataChangeNotifier CreateNotifier()
+-        => new(_userDataManager.Object, _sessionManager.Object, _userManager.Object);
++        => new(_userDataManager.Object, _sessionManager.Object, _userManager.Object, NullLogger<UserDataChangeNotifier>.Instance);
+ 
+     // A folder needs none of BaseItem's static services, and PlaybackProgress is the one reason the
+     // notifier ignores outright.

@@ -1,0 +1,532 @@
+diff --git a/Emby.Server.Implementations/Library/LibraryManager.cs b/Emby.Server.Implementations/Library/LibraryManager.cs
+index e2d007dfa..a8a687591 100644
+--- a/Emby.Server.Implementations/Library/LibraryManager.cs
++++ b/Emby.Server.Implementations/Library/LibraryManager.cs
+@@ -21,6 +21,7 @@ using Emby.Server.Implementations.ScheduledTasks.Tasks;
+ using Emby.Server.Implementations.Sorting;
+ using Jellyfin.Data;
+ using Jellyfin.Data.Enums;
++using Jellyfin.Database.Implementations;
+ using Jellyfin.Database.Implementations.Entities;
+ using Jellyfin.Database.Implementations.Enums;
+ using Jellyfin.Extensions;
+@@ -49,6 +50,7 @@ using MediaBrowser.Model.IO;
+ using MediaBrowser.Model.Library;
+ using MediaBrowser.Model.Querying;
+ using MediaBrowser.Model.Tasks;
++using Microsoft.EntityFrameworkCore;
+ using Microsoft.Extensions.Logging;
+ using Episode = MediaBrowser.Controller.Entities.TV.Episode;
+ using EpisodeInfo = Emby.Naming.TV.EpisodeInfo;
+@@ -74,6 +76,10 @@ namespace Emby.Server.Implementations.Library
+         private const long SharedCacheTtlMs = 5000;
+         private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, long> _cachedAt = new();
+ 
++        // Shared mode: other nodes' saves/deletes evict ids from this node's cache within one poll
++        // (SharedItemInvalidation), so a rename on one node shows on the others well inside the TTL.
++        private readonly SharedItemInvalidation? _invalidation;
++
+         private const string ShortcutFileExtension = ".mblink";
+ 
+         private readonly ILogger<LibraryManager> _logger;
+@@ -146,6 +152,7 @@ namespace Emby.Server.Implementations.Library
+         /// <param name="localization">The localization manager.</param>
+         /// <param name="mediaStreamRepository">The media stream repository.</param>
+         /// <param name="externalDataManagerFactory">The external data manager (lazy, to break the DI cycle through ChapterManager).</param>
++        /// <param name="dbProvider">Database context factory; with JELLYFIN_SHARED_DB=1 it carries cross-node item-cache invalidation.</param>
+         public LibraryManager(
+             IServerApplicationHost appHost,
+             ILoggerFactory loggerFactory,
+@@ -170,7 +177,8 @@ namespace Emby.Server.Implementations.Library
+             DotIgnoreIgnoreRule dotIgnoreIgnoreRule,
+             ILocalizationManager localization,
+             IMediaStreamRepository mediaStreamRepository,
+-            Lazy<IExternalDataManager> externalDataManagerFactory)
++            Lazy<IExternalDataManager> externalDataManagerFactory,
++            IDbContextFactory<JellyfinDbContext>? dbProvider = null)
+         {
+             _appHost = appHost;
+             _logger = loggerFactory.CreateLogger<LibraryManager>();
+@@ -190,6 +198,10 @@ namespace Emby.Server.Implementations.Library
+             _imageProcessor = imageProcessor;
+ 
+             _cache = new FastConcurrentLru<Guid, BaseItem>(_configurationManager.Configuration.CacheSize);
++            if (_sharedDatabase && dbProvider is not null && Environment.GetEnvironmentVariable("JELLYFIN_SHARED_INVALIDATION") != "0")
++            {
++                _invalidation = new SharedItemInvalidation(dbProvider, _logger, EvictFromCache);
++            }
+ 
+             _namingOptions = namingOptions;
+             _peopleRepository = peopleRepository;
+@@ -333,6 +345,12 @@ namespace Emby.Server.Implementations.Library
+             }
+         }
+ 
++        private void EvictFromCache(Guid id)
++        {
++            _cache.TryRemove(id, out _);
++            _cachedAt.TryRemove(id, out _);
++        }
++
+         public void RegisterItem(BaseItem item)
+         {
+             ArgumentNullException.ThrowIfNull(item);
+@@ -424,6 +442,7 @@ namespace Emby.Server.Implementations.Library
+             }
+ 
+             _persistenceService.DeleteItem([.. pathMaps.Select(f => f.Item.Id)]);
++            _invalidation?.Publish(pathMaps.Select(f => f.Item.Id));
+ 
+             // Evict the deleted items from the cache and announce each removal.
+             foreach (var (item, _, _) in pathMaps)
+@@ -618,6 +637,7 @@ namespace Emby.Server.Implementations.Library
+             }
+ 
+             _persistenceService.DeleteItem([item.Id, .. children.Select(f => f.Id)]);
++            _invalidation?.Publish([item.Id, parent.Id, .. children.Select(f => f.Id)]);
+             _cache.TryRemove(item.Id, out _);
+             foreach (var child in children)
+             {
+@@ -2737,6 +2757,7 @@ namespace Emby.Server.Implementations.Library
+             item.ValidateImages();
+ 
+             await _persistenceService.SaveImagesAsync(item).ConfigureAwait(false);
++            _invalidation?.Publish([item.Id]);
+ 
+             RegisterItem(item);
+         }
+@@ -2796,6 +2817,7 @@ namespace Emby.Server.Implementations.Library
+             }
+ 
+             _persistenceService.SaveItems(allItems, cancellationToken);
++            _invalidation?.Publish(allItems.Select(i => i.Id).Append(parent?.Id ?? Guid.Empty));
+ 
+             foreach (var item in allItems)
+             {
+diff --git a/Emby.Server.Implementations/Library/SharedItemInvalidation.cs b/Emby.Server.Implementations/Library/SharedItemInvalidation.cs
+new file mode 100644
+index 000000000..0882737b0
+--- /dev/null
++++ b/Emby.Server.Implementations/Library/SharedItemInvalidation.cs
+@@ -0,0 +1,347 @@
++using System;
++using System.Collections.Generic;
++using System.Data;
++using System.Data.Common;
++using System.Globalization;
++using System.Linq;
++using System.Text;
++using System.Threading;
++using System.Threading.Tasks;
++using Jellyfin.Database.Implementations;
++using Jellyfin.Extensions;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.Logging;
++
++namespace Emby.Server.Implementations.Library
++{
++    /// <summary>
++    /// JELLYFIN_SHARED_DB=1: cross-node item-cache invalidation through the shared database itself
++    /// (no second store). A node that saves, re-images or deletes items appends their ids to a small
++    /// change table; every node polls it and evicts those ids from its item cache. The item cache's
++    /// short TTL stays as the safety net for anything written without going through here.
++    /// </summary>
++    /// <remarks>
++    /// Rows are read by time window (not by "Seq &gt; last"): on a multi-writer Galera cluster
++    /// auto-increment values are not committed in order, so a Seq watermark could skip a row that
++    /// commits late. The window overlaps the previous poll by <see cref="Overlap"/> and already-applied
++    /// Seqs are remembered, so every row is applied once. Timestamps come from the database clock
++    /// (UTC_TIMESTAMP), never the node's. MySQL/Galera only; any other provider disables it.
++    /// The poll holds one open connection for as long as it works (it runs every 250 ms on every node, so
++    /// checking one out of the pool per tick cost a pool reset + SET NAMES each time) and reads the clock
++    /// and the window in one round trip. A failed poll drops that connection; the next tick opens a new one.
++    /// Lives as long as the process (owned by the singleton LibraryManager), so it is not disposable.
++    /// </remarks>
++    public sealed class SharedItemInvalidation
++    {
++        /// <summary>Change table name.</summary>
++        public const string Table = "JellyMeshItemInvalidation";
++
++        private static readonly TimeSpan Overlap = TimeSpan.FromSeconds(3);
++        private static readonly TimeSpan Retention = TimeSpan.FromMinutes(10);
++
++        private readonly IDbContextFactory<JellyfinDbContext> _dbProvider;
++        private readonly ILogger _logger;
++        private readonly Action<Guid> _evict;
++        private readonly string _node = Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
++        private readonly Dictionary<long, DateTime> _applied = new();
++        private readonly TimeSpan _interval;
++        private DateTime? _since;
++        private bool _ready;
++        private bool _disabled;
++        private long _lastCleanup;
++        private JellyfinDbContext? _pollContext;
++        private DbConnection? _pollConnection;
++
++        /// <summary>
++        /// Initializes a new instance of the <see cref="SharedItemInvalidation"/> class and starts polling.
++        /// </summary>
++        /// <param name="dbProvider">Database context factory.</param>
++        /// <param name="logger">Logger.</param>
++        /// <param name="evict">Removes one id from this node's item cache.</param>
++        public SharedItemInvalidation(IDbContextFactory<JellyfinDbContext> dbProvider, ILogger logger, Action<Guid> evict)
++        {
++            _dbProvider = dbProvider;
++            _logger = logger;
++            _evict = evict;
++            var ms = int.TryParse(Environment.GetEnvironmentVariable("JELLYFIN_SHARED_INVALIDATION_POLL_MS"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var v) && v >= 50 ? v : 250;
++            _interval = TimeSpan.FromMilliseconds(ms);
++            _ = Task.Run(PollLoop);
++        }
++
++        /// <summary>Gets the number of ids this node evicted because another node changed them.</summary>
++        public long Evicted { get; private set; }
++
++        /// <summary>
++        /// Announces changed item ids to the other nodes. Never throws: on failure the TTL still bounds staleness.
++        /// </summary>
++        /// <param name="ids">Changed item ids.</param>
++        public void Publish(IEnumerable<Guid> ids)
++        {
++            if (_disabled)
++            {
++                return;
++            }
++
++            var list = ids.Where(i => !i.IsEmpty()).Distinct().ToList();
++            if (list.Count == 0)
++            {
++                return;
++            }
++
++            try
++            {
++                using var ctx = _dbProvider.CreateDbContext();
++                if (!EnsureTable(ctx))
++                {
++                    return;
++                }
++
++                var conn = ctx.Database.GetDbConnection();
++                conn.Open();
++                // Chunked multi-row insert: one replicated write-set per chunk, not per item.
++                foreach (var chunk in list.Chunk(500))
++                {
++                    using var cmd = conn.CreateCommand();
++                    var sql = new StringBuilder("INSERT INTO ").Append(Table).Append(" (ItemId, Node) VALUES ");
++                    for (var i = 0; i < chunk.Length; i++)
++                    {
++                        sql.Append(i == 0 ? string.Empty : ",").Append("(@i").Append(i).Append(",@n)");
++                        AddParam(cmd, "@i" + i.ToString(CultureInfo.InvariantCulture), chunk[i].ToString("N", CultureInfo.InvariantCulture));
++                    }
++
++                    AddParam(cmd, "@n", _node);
++                    cmd.CommandText = sql.ToString();
++                    cmd.ExecuteNonQuery();
++                }
++            }
++            catch (Exception ex)
++            {
++                _logger.LogWarning(ex, "Shared item invalidation: publishing {Count} ids failed; other nodes see the change within the cache TTL", list.Count);
++            }
++        }
++
++        /// <summary>
++        /// Applies rows read from the change table: evicts every id another node wrote that was not applied yet.
++        /// </summary>
++        /// <param name="rows">(Seq, ItemId, Node, At) rows.</param>
++        /// <param name="horizon">Rows older than this are forgotten (they can no longer be re-read).</param>
++        /// <returns>Number of ids evicted.</returns>
++        internal int Apply(IEnumerable<(long Seq, Guid ItemId, string Node, DateTime At)> rows, DateTime horizon)
++        {
++            var n = 0;
++            foreach (var (seq, itemId, node, at) in rows)
++            {
++                if (!_applied.TryAdd(seq, at))
++                {
++                    continue;
++                }
++
++                if (!string.Equals(node, _node, StringComparison.Ordinal))
++                {
++                    _evict(itemId);
++                    n++;
++                }
++            }
++
++            foreach (var old in _applied.Where(kv => kv.Value < horizon).Select(kv => kv.Key).ToList())
++            {
++                _applied.Remove(old);
++            }
++
++            Evicted += n;
++            return n;
++        }
++
++        /// <summary>Gets this node's id as written to the change table.</summary>
++        internal string Node => _node;
++
++        private static void AddParam(DbCommand cmd, string name, object value)
++        {
++            var p = cmd.CreateParameter();
++            p.ParameterName = name;
++            p.Value = value;
++            cmd.Parameters.Add(p);
++        }
++
++        private bool EnsureTable(JellyfinDbContext ctx)
++        {
++            if (_ready)
++            {
++                return true;
++            }
++
++            if (_disabled)
++            {
++                return false;
++            }
++
++            var provider = ctx.Database.ProviderName ?? string.Empty;
++            if (!provider.Contains("MySql", StringComparison.OrdinalIgnoreCase))
++            {
++                _disabled = true;
++                _logger.LogWarning("Shared item invalidation needs a MySQL/Galera database (provider {Provider}); relying on the item cache TTL only", provider);
++                return false;
++            }
++
++            ctx.Database.ExecuteSqlRaw(
++                "CREATE TABLE IF NOT EXISTS " + Table + " ("
++                + "Seq BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, "
++                + "ItemId CHAR(32) NOT NULL, "
++                + "Node CHAR(32) NOT NULL, "
++                + "At DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)), "
++                + "KEY IX_" + Table + "_At (At)) ENGINE=InnoDB");
++            _ready = true;
++            _logger.LogInformation("Shared item invalidation active: node {Node}, poll {Interval} ms", _node, _interval.TotalMilliseconds);
++            return true;
++        }
++
++        private async Task PollLoop()
++        {
++            using var timer = new PeriodicTimer(_interval);
++            var failures = 0;
++            try
++            {
++                while (await timer.WaitForNextTickAsync().ConfigureAwait(false))
++                {
++                    if (_disabled)
++                    {
++                        return;
++                    }
++
++                    try
++                    {
++                        Poll();
++                        failures = 0;
++                    }
++                    catch (Exception ex)
++                    {
++                        ClosePollConnection();
++                        // Startup (database not migrated yet) or a node failover: keep trying, log sparsely.
++                        if (failures++ % 40 == 0)
++                        {
++                            _logger.LogWarning(ex, "Shared item invalidation poll failed ({Failures}); item cache TTL still applies", failures);
++                        }
++                    }
++                }
++            }
++            catch (OperationCanceledException)
++            {
++            }
++            finally
++            {
++                ClosePollConnection();
++            }
++        }
++
++        private DbConnection? OpenPollConnection()
++        {
++            if (_pollConnection is { State: ConnectionState.Open })
++            {
++                return _pollConnection;
++            }
++
++            ClosePollConnection();
++            var ctx = _dbProvider.CreateDbContext();
++            try
++            {
++                if (!EnsureTable(ctx))
++                {
++                    ctx.Dispose();
++                    return null;
++                }
++
++                var conn = ctx.Database.GetDbConnection();
++                conn.Open();
++                _pollContext = ctx;
++                _pollConnection = conn;
++                return conn;
++            }
++            catch
++            {
++                ctx.Dispose();
++                throw;
++            }
++        }
++
++        private void ClosePollConnection()
++        {
++            var ctx = _pollContext;
++            _pollContext = null;
++            _pollConnection = null;
++            try
++            {
++                ctx?.Dispose();
++            }
++            catch (Exception ex)
++            {
++                _logger.LogDebug(ex, "Shared item invalidation: closing the poll connection failed");
++            }
++        }
++
++        private void Poll()
++        {
++            var conn = OpenPollConnection();
++            if (conn is null)
++            {
++                return;
++            }
++
++            // One round trip: the database clock, then the window since the last poll. The first poll has
++            // no previous clock reading; nothing before start-up matters (the cache was empty then), so its
++            // window starts at that same clock reading, minus the overlap.
++            DateTime now;
++            var rows = new List<(long, Guid, string, DateTime)>();
++            using (var cmd = conn.CreateCommand())
++            {
++                cmd.CommandText = "SELECT UTC_TIMESTAMP(6); SELECT Seq, ItemId, Node, At FROM " + Table + " WHERE At >= "
++                    + (_since.HasValue ? "@from" : "UTC_TIMESTAMP(6) - INTERVAL " + Overlap.TotalSeconds.ToString(CultureInfo.InvariantCulture) + " SECOND");
++                if (_since.HasValue)
++                {
++                    AddParam(cmd, "@from", _since.Value - Overlap);
++                }
++
++                using var reader = cmd.ExecuteReader();
++                if (!reader.Read())
++                {
++                    throw new InvalidOperationException("UTC_TIMESTAMP(6) returned no row");
++                }
++
++                now = Convert.ToDateTime(reader.GetValue(0), CultureInfo.InvariantCulture);
++                if (!reader.NextResult())
++                {
++                    throw new InvalidOperationException("Shared item invalidation window query returned no result set");
++                }
++
++                while (reader.Read())
++                {
++                    if (Guid.TryParse(reader.GetString(1), out var id))
++                    {
++                        rows.Add((reader.GetInt64(0), id, reader.GetString(2), reader.GetDateTime(3)));
++                    }
++                }
++            }
++
++            var since = _since ?? now;
++            Apply(rows, since - Overlap - Overlap);
++            _since = now;
++
++            var tick = Environment.TickCount64;
++            if (tick - _lastCleanup > 60_000)
++            {
++                _lastCleanup = tick;
++                try
++                {
++                    using var del = conn.CreateCommand();
++                    del.CommandText = "DELETE FROM " + Table + " WHERE At < @old LIMIT 10000";
++                    AddParam(del, "@old", now - Retention);
++                    del.ExecuteNonQuery();
++                }
++                catch (DbException ex)
++                {
++                    // Both nodes clean up; a certification conflict on the same rows is harmless.
++                    _logger.LogDebug(ex, "Shared item invalidation cleanup skipped");
++                }
++            }
++        }
++    }
++}
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Library/SharedItemInvalidationTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Library/SharedItemInvalidationTests.cs
+new file mode 100644
+index 000000000..e2c0afbf7
+--- /dev/null
++++ b/tests/Jellyfin.Server.Implementations.Tests/Library/SharedItemInvalidationTests.cs
+@@ -0,0 +1,68 @@
++using System;
++using System.Collections.Generic;
++using Emby.Server.Implementations.Library;
++using Jellyfin.Database.Implementations;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.Server.Implementations.Tests.Library;
++
++public class SharedItemInvalidationTests
++{
++    private static (SharedItemInvalidation Inv, List<Guid> Evicted) Create()
++    {
++        // The factory is never reached by Apply; the background poll just logs its failures.
++        var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
++        factory.Setup(f => f.CreateDbContext()).Throws(new InvalidOperationException("no database in unit tests"));
++        var evicted = new List<Guid>();
++        return (new SharedItemInvalidation(factory.Object, NullLogger.Instance, evicted.Add), evicted);
++    }
++
++    [Fact]
++    public void Apply_EvictsOtherNodesIds_SkipsOwn()
++    {
++        var (inv, evicted) = Create();
++        var now = DateTime.UtcNow;
++        var a = Guid.NewGuid();
++        var b = Guid.NewGuid();
++
++        var n = inv.Apply(
++            [(1, a, "othernode", now), (2, b, inv.Node, now)],
++            now.AddMinutes(-1));
++
++        Assert.Equal(1, n);
++        Assert.Equal([a], evicted);
++    }
++
++    [Fact]
++    public void Apply_OverlappingWindows_AppliesEachSeqOnce()
++    {
++        var (inv, evicted) = Create();
++        var now = DateTime.UtcNow;
++        var a = Guid.NewGuid();
++        var b = Guid.NewGuid();
++
++        inv.Apply([(5, a, "othernode", now)], now.AddMinutes(-1));
++        // Next poll re-reads seq 5 (overlap) and sees seq 4 that committed late (multi-writer autoinc order).
++        inv.Apply([(4, b, "othernode", now), (5, a, "othernode", now)], now.AddMinutes(-1));
++
++        Assert.Equal([a, b], evicted);
++        Assert.Equal(2, inv.Evicted);
++    }
++
++    [Fact]
++    public void Apply_ForgetsSeqsOlderThanHorizon()
++    {
++        var (inv, evicted) = Create();
++        var old = DateTime.UtcNow.AddMinutes(-5);
++        var a = Guid.NewGuid();
++
++        inv.Apply([(7, a, "othernode", old)], DateTime.UtcNow);
++        // Forgotten, so a re-read (which the time window no longer produces in practice) would apply again.
++        inv.Apply([(7, a, "othernode", old)], DateTime.UtcNow);
++
++        Assert.Equal([a, a], evicted);
++    }
++}

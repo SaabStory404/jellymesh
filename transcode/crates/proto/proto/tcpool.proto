@@ -33,6 +33,10 @@ message Caps {
   string agent_version = 9;
   int64 probed_unix = 10;
   string node = 11;
+  // Units currently held by BATCH (trickplay) reservations, a subset of units_used. PLAYBACK
+  // ranking discounts this from units_used (effective firm load) since a running BATCH job is
+  // preemptible on demand; BATCH's own ranking keeps using raw units_used unchanged.
+  double batch_units_used = 12;
 }
 
 enum Priority {
@@ -44,6 +48,11 @@ message Job {
   repeated string args = 1;        // Jellyfin's software-mode ffmpeg arguments (argv[1..])
   string cwd = 2;
   Priority priority = 3;
+  // Shared transcode dir (docs/SHARED-TRANSCODE.md): the session keepalive file Jellyfin touches
+  // on any replica. Set => the agent keeps this PLAYBACK job running when the shim goes away
+  // ("detached") for as long as the keepalive stays fresh, heartbeats the output lease itself,
+  // and honours takeover requests. Empty (old shims) => today's fence-on-shim-loss behaviour.
+  string keepalive_path = 4;
 }
 
 message Heartbeat {}
@@ -74,6 +83,13 @@ message Exit {
   int32 code = 1;
   bool fenced = 2;
   bool gpu_filters = 3;
+  // Set when this BATCH job was ended by a PLAYBACK admission preempting it (before or after it
+  // produced any output). The shim's contract for a preempted job is the same as for a lost
+  // worker or any other non-zero exit: rerun it locally (see shim/src/main.rs run_batch).
+  bool preempted = 4;
+  // Set when another replica's shim took this output over (a seek on the other replica): the
+  // shim exits 0 without touching the output (it now belongs to the new writer).
+  bool taken_over = 5;
 }
 
 message ServerMsg {
