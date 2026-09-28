@@ -390,8 +390,8 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
       `stream_side_data`.
 
       **Two source muxings, one of them not handled yet — MEASURED 2026-09-27 by earlier sessions
-      (jellyfin-ffmpeg 8.1.2; not re-measured on `dv81-wire`):** (a) some DV7 MKVs (e.g. our offline-converted Romulus and
-      Spider-Verse sources) carry RPU in-band: `-c copy -bsf:v hevc_mp4toannexb -f hevc` output has
+      (jellyfin-ffmpeg 8.1.2; not re-measured on `dv81-wire`):** (a) some DV7 MKVs (e.g. our offline-converted sources, a DV7 FEL
+      title and a second DV7 title) carry RPU in-band: `-c copy -bsf:v hevc_mp4toannexb -f hevc` output has
       NAL 62s and dovi_tool extract-rpu/convert worked on it — the agent path above converts these.
       (b) others carry EL+RPU in a Matroska Block Addition, mapping type `hvcE` (ffmpeg: `Invalid Block
       Addition value 0x0 for unknown Block Addition Mapping type 68766345`); a stream copy of those has
