@@ -324,6 +324,10 @@ pub const NVENC_PRESET: &str = "p5";
 /// - `h264_qsv` gets **no `-look_ahead_depth`**: it SIGSEGVs jellyfin-ffmpeg on the Arc every time.
 /// - `-adaptive_i`/`-adaptive_b` are silently dropped by QSV, so they are never emitted.
 /// - `hevc_nvenc` on Pascal rejects `-temporal-aq` and `-b_ref_mode middle`.
+/// - NVENC gets **no `-spatial-aq`/`-temporal-aq`** (P5 lab, MEASURED): with AQ the P4 scored
+///   0.7-1.8 VMAF lower at the same delivered bitrate on the 4K SDR title and missed the ±1.5
+///   cross-card target there (h264 3M +2.66, hevc 8M +1.93); without AQ every SDR rung is within
+///   ±1.26 of the Arc.
 fn rc_options(encoder: &str) -> Option<&'static [&'static str]> {
     Some(match encoder {
         "h264_qsv" => &["-extbrc", "1"],
@@ -342,23 +346,10 @@ fn rc_options(encoder: &str) -> Option<&'static [&'static str]> {
             "hq",
             "-multipass",
             "fullres",
-            "-spatial-aq",
-            "1",
-            "-temporal-aq",
-            "1",
             "-b_ref_mode",
             "middle",
         ],
-        "hevc_nvenc" => &[
-            "-rc",
-            "vbr",
-            "-tune",
-            "hq",
-            "-multipass",
-            "fullres",
-            "-spatial-aq",
-            "1",
-        ],
+        "hevc_nvenc" => &["-rc", "vbr", "-tune", "hq", "-multipass", "fullres"],
         _ => return None,
     })
 }
@@ -1439,10 +1430,6 @@ mod tests {
                     "hq",
                     "-multipass",
                     "fullres",
-                    "-spatial-aq",
-                    "1",
-                    "-temporal-aq",
-                    "1",
                     "-b_ref_mode",
                     "middle",
                     "-maxrate",
@@ -1469,8 +1456,6 @@ mod tests {
                     "hq",
                     "-multipass",
                     "fullres",
-                    "-spatial-aq",
-                    "1",
                     "-maxrate",
                     "8000000",
                     "-bufsize",
@@ -1507,6 +1492,11 @@ mod tests {
             );
             for out in [&q, &n] {
                 assert!(!out.iter().any(|x| x == "-adaptive_i" || x == "-adaptive_b"));
+            }
+            // AQ measured worse on VMAF and cross-card consistency (rc_options' doc).
+            let h = render_rc(&jf_rc("libx264"), Backend::Nvenc, rc);
+            for out in [&n, &h] {
+                assert!(!out.iter().any(|x| x.ends_with("-aq")), "{out:?}");
             }
         }
     }

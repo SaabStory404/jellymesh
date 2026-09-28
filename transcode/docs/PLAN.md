@@ -423,10 +423,21 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
 - [x] Baseline measured (P0, calibration/README.md): Arc delivers 16-22% of the cap, VMAF 87.1/87.5 @8M
       (h264/hevc); P4 94.8/93.2; Arc-vs-P4 gap 5.4-7.8 (a failover is visible). Calibrated settings
       measured Arc 93.5/97.6, P4 93.5/96.9, gap +0.04/+0.72
-- [ ] **Next session, step 1** (docs/tcpool-next-session.md): calibrated rate control + presets in render()
-- [ ] Rate-control mapping per encoder from the calibration (fix the bitrate undershoot)
-- [ ] Preset scaling by headroom; tone-map choice per card (vaapi/cuda/opencl/libplacebo by metrics)
-- [ ] HEVC 10-bit end-to-end through both GPU chains; VMAF consistency ±1.5 across cards
+- [x] **Next session, step 1** (docs/tcpool-next-session.md): calibrated rate control + presets in render()
+      (branch `p5-ratecontrol`, 2026-09-27; `apply_rate_control`, agent `TC_RC=calibrated|legacy`,
+      golden `corpus/goldens/render-calibrated.json`). Lab-measured in calibration/README.md "P5 applied".
+      Not yet deployed to tc-lab agents or prod.
+- [x] Rate-control mapping per encoder from the calibration (fix the bitrate undershoot): MEASURED
+      delivered Arc 94.1-96.6% of the cap (never over; was 7-22%), P4 93.7-102.4%; Arc +0.83..+1.49
+      VMAF over today's mapping at equal bitrate. NVENC `-cq` hybrid rejected (25-60% of the cap) and
+      NVENC AQ dropped (lower VMAF, missed ±1.5).
+- [ ] Preset scaling by headroom (concurrency at `medium`/`p5` not yet measured); tone-map choice per
+      card (vaapi/cuda/opencl/libplacebo by metrics) -- P5 run: sample-c Arc-P4 gap -2.3..-2.8 VMAF
+      with Arc PSNR ~8 dB lower at equal bitrate = `tonemap_vaapi`
+- [~] VMAF consistency ±1.5 across cards: SDR sample-b within ±1.26 at 3/8/15M on h264 and hevc;
+      sample-a P4 rows for the shipped config unmeasured (source left the library mid-run; AQ-variant
+      proxy +0.33..+1.26); HDR sample-c fails on the tone mapper (above)
+- [ ] HEVC 10-bit end-to-end through both GPU chains
 
 ### P6 Latency
 - [x] Probe clamp: Jellyfin's `-probesize 1G` cost 8-12 s over the tower's 1 GbE link; clamped to 50M/5M
