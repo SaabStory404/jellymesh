@@ -1,0 +1,852 @@
+diff --git a/Emby.Server.Implementations/Library/UserDataManager.cs b/Emby.Server.Implementations/Library/UserDataManager.cs
+index e4557be35..9a85e5516 100644
+--- a/Emby.Server.Implementations/Library/UserDataManager.cs
++++ b/Emby.Server.Implementations/Library/UserDataManager.cs
+@@ -1,10 +1,12 @@
+ #pragma warning disable RS0030 // Do not use banned APIs
+ 
+ using System;
++using System.Collections.Concurrent;
+ using System.Collections.Generic;
+ using System.Globalization;
+ using System.Linq;
+ using System.Threading;
++using System.Threading.Tasks;
+ using BitFaster.Caching.Lru;
+ using Jellyfin.Database.Implementations;
+ using Jellyfin.Database.Implementations.Entities;
+@@ -14,9 +16,11 @@ using MediaBrowser.Controller.Entities;
+ using MediaBrowser.Controller.Library;
+ using MediaBrowser.Model.Dto;
+ using MediaBrowser.Model.Entities;
++using Microsoft.Data.Sqlite;
+ using Microsoft.EntityFrameworkCore;
+ using AudioBook = MediaBrowser.Controller.Entities.AudioBook;
+ using Book = MediaBrowser.Controller.Entities.Book;
++using DbException = System.Data.Common.DbException;
+ 
+ namespace Emby.Server.Implementations.Library
+ {
+@@ -34,6 +38,24 @@ namespace Emby.Server.Implementations.Library
+         // the database (one batched query per page).
+         private static readonly bool _sharedDatabase = Environment.GetEnvironmentVariable("JELLYFIN_SHARED_DB") == "1";
+ 
++        // SaveUserDataAsync(..., PlaybackProgress) only: bounds one save end-to-end, all retries
++        // included, so a stuck write fails fast instead of blocking the caller for as long as the
++        // underlying database stalls. Deliberately NOT per-attempt -- a per-attempt timeout would be
++        // multiplied by MaxAttempts, turning a bound into a bigger stall. Every other
++        // UserDataSaveReason never uses this: PlaybackStart/PlaybackFinished/manual edits always run
++        // the unbounded, always-retried SaveUserData(...) overload.
++        private static readonly TimeSpan ProgressWriteBound = TimeSpan.FromSeconds(3);
++
++        // Coalescing for PlaybackProgress only: the highest generation number requested so far for
++        // each (user, item). A save whose own generation has been superseded by a newer one for the
++        // same row drops out of its retry loop instead of adding another writer queued behind the
++        // same contended row (see SaveUserDataAsync / IsSuperseded). Never consulted for any other
++        // UserDataSaveReason. Entries are never removed (see SaveUserDataAsync for why removing one
++        // would let a stale writer win); this grows with the number of distinct (user, item) pairs
++        // ever progress-reported in the process's lifetime, not with request volume.
++        private static long _progressGenerationSeq;
++        private readonly ConcurrentDictionary<(long UserInternalId, Guid ItemId), long> _latestProgressGeneration = new();
++
+         /// <summary>
+         /// Initializes a new instance of the <see cref="UserDataManager"/> class.
+         /// </summary>
+@@ -98,9 +120,90 @@ namespace Emby.Server.Implementations.Library
+             });
+         }
+ 
++        /// <summary>
++        /// The perf patch's original, broad write-conflict predicate: true for any
++        /// <see cref="DbUpdateException"/> or <see cref="DbException"/> (including one wrapped a
++        /// single level deep in an <see cref="InvalidOperationException"/>, the shape a provider
++        /// without a retrying execution strategy configured uses). Used by every write that is
++        /// unbounded and must not be silently dropped: the synchronous
++        /// <see cref="SaveUserData(User, BaseItem, UserItemData, UserDataSaveReason, CancellationToken)"/>
++        /// path (PlaybackStart/PlaybackFinished/manual edits, and the progress tick that flips
++        /// <c>Played</c> -- SessionManager deliberately routes that one through this synchronous,
++        /// unbounded overload rather than <see cref="SaveUserDataAsync"/>), and every
++        /// non-<see cref="UserDataSaveReason.PlaybackProgress"/> reason on the async path. This is
++        /// deliberately broader than a genuine write conflict -- it also retries a lost connection
++        /// during a Galera/PXC node flap or any other transient <see cref="DbException"/> -- because
++        /// none of these writes are bounded, so failing to retry would lose data instead of merely
++        /// costing an extra attempt. Only <see cref="IsProgressWriteConflict"/>, used solely by the
++        /// bounded PlaybackProgress path, narrows further.
++        /// </summary>
++        /// <param name="ex">The exception <see cref="WriteUserData"/> or <see cref="WriteUserDataAsync"/> threw.</param>
++        /// <returns><c>true</c> if a fresh attempt might resolve <paramref name="ex"/>.</returns>
+         private static bool IsWriteConflict(Exception ex)
+-            => ex is DbUpdateException or System.Data.Common.DbException
+-                || ex is InvalidOperationException { InnerException: DbUpdateException or System.Data.Common.DbException };
++            => ex is DbUpdateException or DbException
++                || ex is InvalidOperationException { InnerException: DbUpdateException or DbException };
++
++        /// <summary>
++        /// True only for a genuine write conflict that a fresh attempt can resolve: a duplicate-key
++        /// insert race (MySQL/MariaDB 1062, SQLSTATE 23000) or a deadlock/certification abort (MySQL
++        /// 1213, SQLSTATE 40001 -- Galera reuses 1213/40001 for a wsrep certification failure by
++        /// design, specifically so ordinary deadlock-retry logic like this one already handles it,
++        /// and its own message names "WSREP"), or the SQLite-serialized-writer equivalent
++        /// (SQLITE_CONSTRAINT). Used ONLY by the bounded async PlaybackProgress path (see
++        /// <see cref="SaveUserDataAsync"/>): a dropped progress tick is harmless (the client's next
++        /// report a few seconds later supersedes it), so that path can afford to fail fast on
++        /// anything that isn't a conflict certain to clear on retry -- in particular a bare timeout
++        /// (from <see cref="ProgressWriteBound"/> or any other cause), a lock-wait timeout (MySQL
++        /// 1205, SQLSTATE HY000), or an unrelated connection error. That is a policy choice for a
++        /// bounded, droppable write, not a claim that those are unresolvable in general: every other
++        /// write path uses the broader <see cref="IsWriteConflict"/> above and retries them too,
++        /// because dropping an unbounded write (a play start/finish, a manual edit, a completed-
++        /// playback flag) would lose data instead of merely costing an extra attempt.
++        /// </summary>
++        /// <param name="ex">The exception <see cref="WriteUserDataAsync"/> threw.</param>
++        /// <returns><c>true</c> if a fresh attempt can resolve <paramref name="ex"/>.</returns>
++        private static bool IsProgressWriteConflict(Exception ex)
++        {
++            // EF Core wraps a SaveChanges failure in DbUpdateException; a provider without a
++            // retrying execution strategy configured additionally wraps THAT in
++            // InvalidOperationException ("... likely due to a transient failure ..."), so the real
++            // ADO.NET exception can sit two wrappers deep: InvalidOperationException ->
++            // DbUpdateException -> the provider's own DbException. DbUpdateException does not itself
++            // derive from DbException, so an unwrap that only checks a fixed number of
++            // InnerException hops can miss that middle layer and land on null. Walk the whole
++            // InnerException chain to the first DbException instead, so matching below is always on
++            // the actual database error regardless of how many wrappers EF or the provider added.
++            DbException? dbEx = null;
++            for (var cur = ex; cur is not null; cur = cur.InnerException)
++            {
++                if (cur is DbException candidate)
++                {
++                    dbEx = candidate;
++                    break;
++                }
++            }
++
++            if (dbEx is null)
++            {
++                return false;
++            }
++
++            if (dbEx is SqliteException { SqliteErrorCode: 19 })
++            {
++                return true;
++            }
++
++            if (dbEx.SqlState is "23000" or "40001")
++            {
++                return true;
++            }
++
++            // Fallback for a provider/version that doesn't populate SqlState: match the same
++            // conditions by the server's own message text.
++            return dbEx.Message.Contains("WSREP", StringComparison.OrdinalIgnoreCase)
++                || dbEx.Message.Contains("Deadlock found", StringComparison.OrdinalIgnoreCase)
++                || dbEx.Message.Contains("Duplicate entry", StringComparison.OrdinalIgnoreCase);
++        }
+ 
+         private void WriteUserData(User user, BaseItem item, UserItemData userData, List<string> keys)
+         {
+@@ -126,6 +229,132 @@ namespace Emby.Server.Implementations.Library
+             item.UserData = dbContext.UserData.Where(e => e.ItemId == item.Id).AsNoTracking().ToArray(); // rehydrate the cached userdata
+         }
+ 
++        /// <inheritdoc />
++        public async Task SaveUserDataAsync(User user, BaseItem item, UserItemData userData, UserDataSaveReason reason, CancellationToken cancellationToken)
++        {
++            ArgumentNullException.ThrowIfNull(userData);
++
++            ArgumentNullException.ThrowIfNull(item);
++
++            cancellationToken.ThrowIfCancellationRequested();
++
++            var keys = item.GetUserDataKeys();
++            var isProgress = reason == UserDataSaveReason.PlaybackProgress;
++            var progressKey = (user.InternalId, item.Id);
++            var myGeneration = isProgress ? NextProgressGeneration(progressKey) : 0;
++
++            using var timeoutCts = isProgress ? new CancellationTokenSource(ProgressWriteBound) : null;
++            using var linkedCts = timeoutCts is null ? null : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
++            var writeToken = linkedCts?.Token ?? cancellationToken;
++
++            try
++            {
++                const int MaxAttempts = 6;
++                for (var attempt = 1; ; attempt++)
++                {
++                    if (isProgress && IsSuperseded(progressKey, myGeneration))
++                    {
++                        // A newer progress report for the same user+item has already landed or is
++                        // itself retrying; drop this stale one instead of queuing another writer
++                        // behind the same contended row.
++                        return;
++                    }
++
++                    try
++                    {
++                        await WriteUserDataAsync(user, item, userData, keys, writeToken).ConfigureAwait(false);
++                        break;
++                    }
++                    catch (Exception ex) when (attempt < MaxAttempts && (isProgress ? IsProgressWriteConflict(ex) : IsWriteConflict(ex)))
++                    {
++                        // Fresh context and transaction; jitter so racing writers stop colliding.
++                        await Task.Delay(Random.Shared.Next(5, 20) * attempt, writeToken).ConfigureAwait(false);
++                    }
++                }
++            }
++            catch (OperationCanceledException) when (isProgress && timeoutCts is not null && timeoutCts.IsCancellationRequested)
++            {
++                // Bounded, fail-fast: this progress tick didn't land inside ProgressWriteBound.
++                // Only ever reached for PlaybackProgress -- every other reason has no timeoutCts, so
++                // this catch can't apply and the exception (if any) always propagates normally.
++                return;
++            }
++
++            // Deliberately no cleanup of _latestProgressGeneration here: removing this key's entry
++            // once this save finishes would make it indistinguishable from "never registered", so a
++            // stale attempt still sleeping in the retry loop above would read IsSuperseded as false
++            // and write its OLDER data over whatever this (newer) save just landed -- coalescing
++            // would then pick the wrong writer instead of the latest one. The entry is retained for
++            // the lifetime of the process; it is bounded by the number of distinct (user, item) pairs
++            // ever progress-reported, not by request volume.
++            var userId = user.InternalId;
++            var cacheKey = GetCacheKey(userId, item.Id);
++            _cache.AddOrUpdate(cacheKey, userData);
++
++            UserDataSaved?.Invoke(this, new UserDataSaveEventArgs
++            {
++                Keys = keys,
++                UserData = userData,
++                SaveReason = reason,
++                UserId = user.Id,
++                Item = item
++            });
++        }
++
++        /// <summary>
++        /// Registers a new PlaybackProgress attempt for <paramref name="key"/> and returns its
++        /// generation number. Internal (rather than private) only so tests can exercise the
++        /// coalescing race-safety guarantee -- the stored value is the max ever seen for the key,
++        /// so a late-arriving lower generation number can never make <see cref="IsSuperseded"/>
++        /// incorrectly report the true latest write as superseded -- directly, without a real
++        /// concurrent database write.
++        /// </summary>
++        /// <param name="key">The (user, item) pair the progress write is for.</param>
++        /// <returns>The generation number this attempt was assigned.</returns>
++        internal long NextProgressGeneration((long UserInternalId, Guid ItemId) key)
++        {
++            var generation = Interlocked.Increment(ref _progressGenerationSeq);
++            _latestProgressGeneration.AddOrUpdate(key, generation, (_, existing) => Math.Max(existing, generation));
++            return generation;
++        }
++
++        /// <summary>
++        /// True when a newer PlaybackProgress attempt has been registered for <paramref name="key"/>
++        /// since <paramref name="myGeneration"/> was issued.
++        /// </summary>
++        /// <param name="key">The (user, item) pair the progress write is for.</param>
++        /// <param name="myGeneration">The generation number to check.</param>
++        /// <returns><c>true</c> if <paramref name="myGeneration"/> is no longer the latest for <paramref name="key"/>.</returns>
++        internal bool IsSuperseded((long UserInternalId, Guid ItemId) key, long myGeneration)
++            => _latestProgressGeneration.TryGetValue(key, out var latest) && latest != myGeneration;
++
++        private async Task WriteUserDataAsync(User user, BaseItem item, UserItemData userData, List<string> keys, CancellationToken cancellationToken)
++        {
++            using var dbContext = _repository.CreateDbContext();
++            await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
++
++            foreach (var key in keys)
++            {
++                userData.Key = key;
++                var userDataEntry = Map(userData, user.Id, item.Id);
++                var exists = await dbContext.UserData.AnyAsync(
++                    f => f.ItemId == userDataEntry.ItemId && f.UserId == userDataEntry.UserId && f.CustomDataKey == userDataEntry.CustomDataKey,
++                    cancellationToken).ConfigureAwait(false);
++                if (exists)
++                {
++                    dbContext.UserData.Attach(userDataEntry).State = EntityState.Modified;
++                }
++                else
++                {
++                    dbContext.UserData.Add(userDataEntry);
++                }
++            }
++
++            await dbContext.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
++            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
++            item.UserData = await dbContext.UserData.Where(e => e.ItemId == item.Id).AsNoTracking().ToArrayAsync(cancellationToken).ConfigureAwait(false); // rehydrate the cached userdata
++        }
++
+         /// <inheritdoc />
+         public void SaveUserData(User user, BaseItem item, UpdateUserItemDataDto userDataDto, UserDataSaveReason reason)
+         {
+diff --git a/Emby.Server.Implementations/Session/SessionManager.cs b/Emby.Server.Implementations/Session/SessionManager.cs
+index 08e257886..bf0061ef0 100644
+--- a/Emby.Server.Implementations/Session/SessionManager.cs
++++ b/Emby.Server.Implementations/Session/SessionManager.cs
+@@ -925,7 +925,7 @@ namespace Emby.Server.Implementations.Session
+                 var progressItem = GetProgressItem(libraryItem, info.MediaSourceId);
+                 foreach (var user in users)
+                 {
+-                    OnPlaybackProgress(user, progressItem, info);
++                    await OnPlaybackProgressAsync(user, progressItem, info).ConfigureAwait(false);
+                 }
+             }
+ 
+@@ -962,17 +962,20 @@ namespace Emby.Server.Implementations.Session
+             StartCheckTimers();
+         }
+ 
+-        private void OnPlaybackProgress(User user, BaseItem item, PlaybackProgressInfo info)
++        private async Task OnPlaybackProgressAsync(User user, BaseItem item, PlaybackProgressInfo info)
+         {
+             var data = _userDataManager.GetUserData(user, item);
+ 
+             var positionTicks = info.PositionTicks;
+ 
+             var changed = false;
++            var justCompleted = false;
+ 
+             if (positionTicks.HasValue)
+             {
++                var wasPlayed = data.Played;
+                 _userDataManager.UpdatePlayState(item, data, positionTicks.Value);
++                justCompleted = !wasPlayed && data.Played;
+                 changed = true;
+             }
+ 
+@@ -984,7 +987,22 @@ namespace Emby.Server.Implementations.Session
+ 
+             if (changed)
+             {
+-                _userDataManager.SaveUserData(user, item, data, UserDataSaveReason.PlaybackProgress, CancellationToken.None);
++                if (justCompleted)
++                {
++                    // This tick just crossed into "played" (reached the end, or a seek past
++                    // MaxResumePct): treat it like PlaybackFinished rather than an ordinary
++                    // progress tick -- always retried, never dropped, even under contention.
++                    // Deliberately the synchronous, unbounded overload, not SaveUserDataAsync:
++                    // this is the rare tick that must never be dropped, so a would-be-blocking
++                    // wait here is the correct tradeoff.
++#pragma warning disable CA1849
++                    _userDataManager.SaveUserData(user, item, data, UserDataSaveReason.PlaybackProgress, CancellationToken.None);
++#pragma warning restore CA1849
++                }
++                else
++                {
++                    await _userDataManager.SaveUserDataAsync(user, item, data, UserDataSaveReason.PlaybackProgress, CancellationToken.None).ConfigureAwait(false);
++                }
+ 
+                 // A completed version marks every alternate version played and clears their resume points, so the
+                 // whole movie leaves Continue Watching and reads as watched everywhere. (Per-version resume positions
+diff --git a/MediaBrowser.Controller/Library/IUserDataManager.cs b/MediaBrowser.Controller/Library/IUserDataManager.cs
+index 2ee884534..b3646dd38 100644
+--- a/MediaBrowser.Controller/Library/IUserDataManager.cs
++++ b/MediaBrowser.Controller/Library/IUserDataManager.cs
+@@ -1,6 +1,7 @@
+ using System;
+ using System.Collections.Generic;
+ using System.Threading;
++using System.Threading.Tasks;
+ using Jellyfin.Database.Implementations.Entities;
+ using MediaBrowser.Controller.Dto;
+ using MediaBrowser.Controller.Entities;
+@@ -29,6 +30,30 @@ namespace MediaBrowser.Controller.Library
+         /// <param name="cancellationToken">The cancellation token.</param>
+         void SaveUserData(User user, BaseItem item, UserItemData userData, UserDataSaveReason reason, CancellationToken cancellationToken);
+ 
++        /// <summary>
++        /// Saves the user data without blocking the calling thread on a write-conflict retry.
++        /// For <see cref="UserDataSaveReason.PlaybackProgress"/> only, the save is additionally
++        /// bounded: if it can't land inside the implementation's fail-fast window (for example
++        /// because a database write is stalled under contention), the save is silently dropped
++        /// instead of blocking the caller, since a client's next progress report a few seconds
++        /// later supersedes it. Every other <see cref="UserDataSaveReason"/> is never dropped.
++        /// The default implementation simply delegates to
++        /// <see cref="SaveUserData(User, BaseItem, UserItemData, UserDataSaveReason, CancellationToken)"/>
++        /// so existing implementers keep compiling; override it to get the non-blocking/bounded
++        /// behavior.
++        /// </summary>
++        /// <param name="user">The user.</param>
++        /// <param name="item">The item.</param>
++        /// <param name="userData">The user data.</param>
++        /// <param name="reason">The reason.</param>
++        /// <param name="cancellationToken">The cancellation token.</param>
++        /// <returns>A task that completes when the save finishes or -- for <see cref="UserDataSaveReason.PlaybackProgress"/> only -- is dropped.</returns>
++        Task SaveUserDataAsync(User user, BaseItem item, UserItemData userData, UserDataSaveReason reason, CancellationToken cancellationToken)
++        {
++            SaveUserData(user, item, userData, reason, cancellationToken);
++            return Task.CompletedTask;
++        }
++
+         /// <summary>
+         /// Save the provided user data for the given user.
+         /// </summary>
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataManagerTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataManagerTests.cs
+index ba3127bc0..65360e82b 100644
+--- a/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataManagerTests.cs
++++ b/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataManagerTests.cs
+@@ -1,5 +1,10 @@
+ using System;
+ using System.Collections.Generic;
++using System.Data.Common;
++using System.Diagnostics;
++using System.Linq;
++using System.Threading;
++using System.Threading.Tasks;
+ using Emby.Server.Implementations.Library;
+ using Jellyfin.Database.Implementations;
+ using Jellyfin.Database.Implementations.Entities;
+@@ -8,8 +13,10 @@ using Jellyfin.Database.Providers.Sqlite;
+ using MediaBrowser.Controller.Configuration;
+ using MediaBrowser.Controller.Entities;
+ using MediaBrowser.Model.Configuration;
++using MediaBrowser.Model.Entities;
+ using Microsoft.Data.Sqlite;
+ using Microsoft.EntityFrameworkCore;
++using Microsoft.EntityFrameworkCore.Diagnostics;
+ using Microsoft.Extensions.Logging.Abstractions;
+ using Moq;
+ using Xunit;
+@@ -65,6 +72,41 @@ public sealed class UserDataManagerTests : IDisposable
+             new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
+     }
+ 
++    /// <summary>
++    /// A <see cref="JellyfinDbContext"/> on the same in-memory database as <see cref="CreateDbContext()"/>,
++    /// with <paramref name="interceptor"/> wired in so a test can make a specific attempt fail (or hang)
++    /// deterministically, the same way a real write conflict or a stalled Galera commit would.
++    /// </summary>
++    private JellyfinDbContext CreateDbContext(SaveChangesInterceptor interceptor)
++    {
++        var options = new DbContextOptionsBuilder<JellyfinDbContext>()
++            .UseSqlite(_connection)
++            .AddInterceptors(interceptor)
++            .Options;
++
++        return new JellyfinDbContext(
++            options,
++            NullLogger<JellyfinDbContext>.Instance,
++            new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
++            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
++    }
++
++    /// <summary>
++    /// A standalone <see cref="UserDataManager"/> (separate from <see cref="_userDataManager"/>) whose
++    /// <see cref="IDbContextFactory{TContext}.CreateDbContext"/> always returns a context wired with
++    /// <paramref name="interceptor"/>, so every attempt in a retry loop observes it.
++    /// </summary>
++    private UserDataManager CreateManagerWithInterceptor(SaveChangesInterceptor interceptor)
++    {
++        var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
++        factory.Setup(f => f.CreateDbContext()).Returns(() => CreateDbContext(interceptor));
++
++        var config = new Mock<IServerConfigurationManager>();
++        config.SetupGet(c => c.Configuration).Returns(new ServerConfiguration());
++
++        return new UserDataManager(config.Object, factory.Object);
++    }
++
+     private AudioBook CreateAudioBook()
+     {
+         // GetUserDataKeys(): ["Author-Series-0001Book Title", "<item id N>"]
+@@ -78,6 +120,15 @@ public sealed class UserDataManagerTests : IDisposable
+         };
+     }
+ 
++    /// <summary>Persists <see cref="_user"/> and <paramref name="item"/> so a UserData row referencing them satisfies the foreign-key constraints a real (non-intercepted) SaveChanges enforces.</summary>
++    private void SeedUserAndItem(BaseItem item)
++    {
++        using var ctx = CreateDbContext();
++        ctx.Users.Add(_user);
++        ctx.BaseItems.Add(new BaseItemEntity { Id = item.Id, Type = item.GetType().FullName! });
++        ctx.SaveChanges();
++    }
++
+     private UserData CreateUserDataRow(AudioBook item, string key, long positionTicks)
+     {
+         return new UserData
+@@ -213,4 +264,385 @@ public sealed class UserDataManagerTests : IDisposable
+         var item = CreateAudioBook();
+         Assert.Throws<ArgumentNullException>(() => _userDataManager.GetUserData(null!, item));
+     }
++
++    // --- IsWriteConflict (sync + non-progress async): broad, retries any DbException -----------
++
++    [Fact]
++    public void SaveUserData_Finished_ConnectionError_IsRetried()
++    {
++        var item = CreateAudioBook();
++        SeedUserAndItem(item);
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 111 };
++
++        // A lost connection during a Galera/PXC node flap: not a duplicate-key/deadlock/
++        // certification conflict, just a dropped connection -- but the sync path (and every
++        // non-PlaybackProgress reason on the async path) is unbounded and must not drop an
++        // unbounded write, so it retries any DbException, exactly like the perf patch's original
++        // broad predicate.
++        var interceptor = new ThrowNTimesInterceptor(1, () => new FakeDbException("Lost connection to MySQL server during query", "08S01"));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        manager.SaveUserData(_user, item, userData, UserDataSaveReason.PlaybackFinished, CancellationToken.None);
++
++        Assert.Equal(2, interceptor.Invocations);
++    }
++
++    [Fact]
++    public void SaveUserData_ProgressTickThatFlipsPlayed_ConnectionError_IsRetried()
++    {
++        var item = CreateAudioBook();
++        SeedUserAndItem(item);
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 0, Played = true };
++
++        // SessionManager deliberately routes the progress tick that crosses MaxResumePct (flips
++        // Played) through this synchronous, unbounded overload -- with reason PlaybackProgress --
++        // rather than SaveUserDataAsync. The sync overload never branches on reason, so this must
++        // retry a connection error exactly like every other sync write.
++        var interceptor = new ThrowNTimesInterceptor(1, () => new FakeDbException("Lost connection to MySQL server during query", "08S01"));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        manager.SaveUserData(_user, item, userData, UserDataSaveReason.PlaybackProgress, CancellationToken.None);
++
++        Assert.Equal(2, interceptor.Invocations);
++    }
++
++    [Fact]
++    public async Task SaveUserDataAsync_Progress_ConnectionError_IsNotRetried_FailsFast()
++    {
++        var item = CreateAudioBook();
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 111 };
++
++        // Same connection error as above, but on the bounded PlaybackProgress path: a dropped
++        // progress tick is harmless (the client's next report supersedes it), so this path fails
++        // fast on anything short of a conflict certain to clear on retry, instead of retrying
++        // every DbException like the sync/non-progress path does.
++        var interceptor = new ThrowNTimesInterceptor(6, () => new FakeDbException("Lost connection to MySQL server during query", "08S01"));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        await Assert.ThrowsAnyAsync<Exception>(() => manager.SaveUserDataAsync(_user, item, userData, UserDataSaveReason.PlaybackProgress, CancellationToken.None));
++
++        Assert.Equal(1, interceptor.Invocations);
++    }
++
++    [Fact]
++    public async Task SaveUserDataAsync_Start_ConnectionError_IsRetried()
++    {
++        var item = CreateAudioBook();
++        SeedUserAndItem(item);
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlayCount = 1 };
++
++        // Non-PlaybackProgress reason on the ASYNC path must use the same broad predicate as the
++        // sync path, not the narrowed PlaybackProgress-only one.
++        var interceptor = new ThrowNTimesInterceptor(1, () => new FakeDbException("Lost connection to MySQL server during query", "08S01"));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        await manager.SaveUserDataAsync(_user, item, userData, UserDataSaveReason.PlaybackStart, CancellationToken.None);
++
++        Assert.Equal(2, interceptor.Invocations);
++    }
++
++    [Fact]
++    public void SaveUserData_Finished_RealConflict_RetriesAndSucceeds()
++    {
++        var item = CreateAudioBook();
++        SeedUserAndItem(item);
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 222, Played = true };
++
++        // MySQL 1213 / SQLSTATE 40001: a deadlock, or a Galera wsrep certification failure (Galera
++        // reuses 1213/40001 for the latter by design). Both are safe -- and expected -- to retry.
++        var interceptor = new ThrowNTimesInterceptor(1, () => new FakeDbException("Deadlock found when trying to get lock; try restarting transaction", "40001"));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        // Proves Stopped/Finished writes still retry under a real conflict, exactly like before
++        // IsWriteConflict was narrowed.
++        manager.SaveUserData(_user, item, userData, UserDataSaveReason.PlaybackFinished, CancellationToken.None);
++
++        Assert.Equal(2, interceptor.Invocations);
++        using var ctx = CreateDbContext();
++        // An AudioBook has two GetUserDataKeys() rows (see CreateAudioBook); both get the same position.
++        var rows = ctx.UserData.Where(e => e.ItemId.Equals(item.Id)).ToList();
++        Assert.NotEmpty(rows);
++        Assert.All(rows, row => Assert.Equal(222, row.PlaybackPositionTicks));
++    }
++
++    [Fact]
++    public void SaveUserData_Start_RealConflict_RetriesAndSucceeds()
++    {
++        var item = CreateAudioBook();
++        SeedUserAndItem(item);
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlayCount = 1 };
++        var interceptor = new ThrowNTimesInterceptor(1, () => new FakeDbException("Deadlock found when trying to get lock; try restarting transaction", "40001"));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        // PlaybackStart must never be dropped either -- same guarantee as Finished, different reason.
++        manager.SaveUserData(_user, item, userData, UserDataSaveReason.PlaybackStart, CancellationToken.None);
++
++        Assert.Equal(2, interceptor.Invocations);
++    }
++
++    [Fact]
++    public void SaveUserData_Finished_RealConflict_WrappedInInvalidOperationException_RetriesAndSucceeds()
++    {
++        var item = CreateAudioBook();
++        SeedUserAndItem(item);
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 666, Played = true };
++
++        // The exact shape this file's own comment on IsWriteConflict describes: a provider without a
++        // retrying execution strategy configured wraps the already-EF-wrapped DbUpdateException in a
++        // further InvalidOperationException, so the real conflict sits two InnerException hops down --
++        // InvalidOperationException -> DbUpdateException -> the provider's own DbException -- not one.
++        // DbUpdateException does not itself derive from DbException, so a fixed-depth unwrap that only
++        // checks "InvalidOperationException.InnerException as DbException" lands on null here and
++        // wrongly treats a real wsrep/deadlock conflict as non-retryable.
++        var interceptor = new ThrowNTimesInterceptor(
++            1,
++            () => new InvalidOperationException(
++                "An exception has been raised that is likely due to a transient failure. Consider enabling transient error resiliency.",
++                new DbUpdateException(
++                    "An error occurred while saving the entity changes.",
++                    new FakeDbException("Deadlock found when trying to get lock; try restarting transaction (WSREP detected deadlock)", "40001"))));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        // Must still retry and land the write -- dropping this would drop a Finished report on a real
++        // Galera certification failure delivered via this exact wrapper shape.
++        manager.SaveUserData(_user, item, userData, UserDataSaveReason.PlaybackFinished, CancellationToken.None);
++
++        Assert.Equal(2, interceptor.Invocations);
++        using var ctx = CreateDbContext();
++        var rows = ctx.UserData.Where(e => e.ItemId.Equals(item.Id)).ToList();
++        Assert.NotEmpty(rows);
++        Assert.All(rows, row => Assert.Equal(666, row.PlaybackPositionTicks));
++    }
++
++    [Fact]
++    public void SaveUserData_Finished_NonConflict_WrappedInInvalidOperationException_IsRetried()
++    {
++        var item = CreateAudioBook();
++        SeedUserAndItem(item);
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 777, Played = true };
++
++        // Same two-wrapper depth as the RealConflict test above, but the innermost exception is a
++        // lock-wait timeout (SQLSTATE HY000), not a conflict. The broad predicate used by this
++        // (unbounded) path matches on the wrapper shape alone -- InvalidOperationException wrapping
++        // a DbUpdateException -- exactly like the perf patch's original predicate did, so this still
++        // retries. Only the narrowed, PlaybackProgress-only predicate walks the chain to distinguish
++        // this from a real conflict (see SaveUserDataAsync_Progress_NonConflict_... below).
++        var interceptor = new ThrowNTimesInterceptor(
++            1,
++            () => new InvalidOperationException(
++                "An exception has been raised that is likely due to a transient failure. Consider enabling transient error resiliency.",
++                new DbUpdateException(
++                    "An error occurred while saving the entity changes.",
++                    new FakeDbException("Lock wait timeout exceeded; try restarting transaction", "HY000"))));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        manager.SaveUserData(_user, item, userData, UserDataSaveReason.PlaybackFinished, CancellationToken.None);
++
++        Assert.Equal(2, interceptor.Invocations);
++    }
++
++    [Fact]
++    public async Task SaveUserDataAsync_Progress_NonConflict_WrappedInInvalidOperationException_IsNotRetried_FailsFast()
++    {
++        var item = CreateAudioBook();
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 777 };
++
++        // Same wrapped shape, but on the bounded PlaybackProgress path: its narrowed predicate walks
++        // the whole InnerException chain (past the InvalidOperationException and DbUpdateException
++        // wrappers) to the real HY000 lock-wait timeout underneath and correctly does not retry it,
++        // unlike the wrapper-shape-only broad predicate the sync path uses above.
++        var interceptor = new ThrowNTimesInterceptor(
++            6,
++            () => new InvalidOperationException(
++                "An exception has been raised that is likely due to a transient failure. Consider enabling transient error resiliency.",
++                new DbUpdateException(
++                    "An error occurred while saving the entity changes.",
++                    new FakeDbException("Lock wait timeout exceeded; try restarting transaction", "HY000"))));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        await Assert.ThrowsAnyAsync<Exception>(() => manager.SaveUserDataAsync(_user, item, userData, UserDataSaveReason.PlaybackProgress, CancellationToken.None));
++
++        Assert.Equal(1, interceptor.Invocations);
++    }
++
++    [Fact]
++    public async Task SaveUserDataAsync_Progress_RealConflict_RetriesAndSucceedsQuickly()
++    {
++        var item = CreateAudioBook();
++        SeedUserAndItem(item);
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 333 };
++
++        // The SQLite-serialized-writer equivalent of the same race (SQLITE_CONSTRAINT):
++        // tests run on SQLite, so the retry path needs to work here too, not just for MySQL.
++        var interceptor = new ThrowNTimesInterceptor(1, () => new SqliteException("UNIQUE constraint failed", 19));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        var stopwatch = Stopwatch.StartNew();
++        await manager.SaveUserDataAsync(_user, item, userData, UserDataSaveReason.PlaybackProgress, CancellationToken.None);
++        stopwatch.Stop();
++
++        Assert.Equal(2, interceptor.Invocations);
++        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(1), $"an ordinary retry should resolve well under ProgressWriteBound, took {stopwatch.Elapsed}");
++        using var ctx = CreateDbContext();
++        // An AudioBook has two GetUserDataKeys() rows (see CreateAudioBook); both get the same position.
++        var rows = ctx.UserData.Where(e => e.ItemId.Equals(item.Id)).ToList();
++        Assert.NotEmpty(rows);
++        Assert.All(rows, row => Assert.Equal(333, row.PlaybackPositionTicks));
++    }
++
++    // --- PlaybackProgress-only bound ------------------------------------------------------------
++
++    [Fact]
++    public async Task SaveUserDataAsync_Progress_StuckWrite_ReturnsBoundedAndDropsTheWrite()
++    {
++        var item = CreateAudioBook();
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 444 };
++        using var interceptor = new HangingInterceptor();
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        var stopwatch = Stopwatch.StartNew();
++
++        // Never throws and never blocks past the bound: a stuck PlaybackProgress write is dropped,
++        // not surfaced as an error, since the client's next tick a few seconds later supersedes it.
++        await manager.SaveUserDataAsync(_user, item, userData, UserDataSaveReason.PlaybackProgress, CancellationToken.None);
++        stopwatch.Stop();
++
++        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(5), $"expected a bounded return well under 5s, took {stopwatch.Elapsed}");
++        using var ctx = CreateDbContext();
++        Assert.Empty(ctx.UserData.Where(e => e.ItemId.Equals(item.Id)));
++    }
++
++    [Fact]
++    public async Task SaveUserData_Finished_StuckWrite_IsNeverBounded()
++    {
++        var item = CreateAudioBook();
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 555, Played = true };
++        var interceptor = new HangingInterceptor();
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        // Mirrors the real call site: SessionManager always passes CancellationToken.None for
++        // PlaybackFinished, so there is genuinely nothing to bound this with. (TestContext's token
++        // below is only this test's own cooperative-cancellation hook, not part of what's tested.)
++        var saveTask = Task.Run(
++            () => manager.SaveUserData(_user, item, userData, UserDataSaveReason.PlaybackFinished, CancellationToken.None),
++            TestContext.Current.CancellationToken);
++
++        var winner = await Task.WhenAny(saveTask, Task.Delay(TimeSpan.FromSeconds(1), TestContext.Current.CancellationToken));
++
++        // Still running after 1s -- i.e. NOT bounded, unlike the Progress-only case above.
++        Assert.NotEqual(saveTask, winner);
++
++        interceptor.Dispose(); // let the blocked background thread unwind before the test ends
++        await Assert.ThrowsAnyAsync<Exception>(() => saveTask);
++    }
++
++    // --- Coalescing (superseded PlaybackProgress writes) ---------------------------------------
++
++    [Fact]
++    public void IsSuperseded_NeverTrueForTheGenerationThatIsCurrentlyLatest()
++    {
++        var item = CreateAudioBook();
++        var key = (_user.InternalId, item.Id);
++
++        var gen1 = _userDataManager.NextProgressGeneration(key);
++        Assert.False(_userDataManager.IsSuperseded(key, gen1));
++
++        var gen2 = _userDataManager.NextProgressGeneration(key);
++
++        // gen1 has been superseded by the newer gen2 for the same (user, item) key ...
++        Assert.True(_userDataManager.IsSuperseded(key, gen1));
++
++        // ... but gen2 itself, being the latest, is never superseded by its own registration.
++        Assert.False(_userDataManager.IsSuperseded(key, gen2));
++    }
++
++    [Fact]
++    public void IsSuperseded_IsUnaffectedByOtherUsersOrItems()
++    {
++        var itemA = CreateAudioBook();
++        var itemB = CreateAudioBook();
++        var otherUser = new User("other", "auth-provider", "reset-provider") { Id = Guid.NewGuid(), InternalId = _user.InternalId + 1 };
++
++        var genForItemA = _userDataManager.NextProgressGeneration((_user.InternalId, itemA.Id));
++        _userDataManager.NextProgressGeneration((_user.InternalId, itemB.Id));
++        _userDataManager.NextProgressGeneration((otherUser.InternalId, itemA.Id));
++
++        Assert.False(_userDataManager.IsSuperseded((_user.InternalId, itemA.Id), genForItemA));
++    }
++
++    /// <summary>A <see cref="DbException"/> whose <see cref="SqlState"/> a test controls directly, standing in for a real provider's (e.g. MySqlConnector's) exception without depending on that provider.</summary>
++    private sealed class FakeDbException : DbException
++    {
++        public FakeDbException(string message, string? sqlState)
++            : base(message)
++        {
++            SqlState = sqlState;
++        }
++
++        public override string? SqlState { get; }
++    }
++
++    /// <summary>Throws a fresh exception (from <paramref name="exception"/>) from the first <paramref name="throwCount"/> SaveChanges/SaveChangesAsync calls, then lets subsequent calls proceed normally.</summary>
++    private sealed class ThrowNTimesInterceptor : SaveChangesInterceptor
++    {
++        private readonly int _throwCount;
++        private readonly Func<Exception> _exception;
++        private int _invocations;
++
++        public ThrowNTimesInterceptor(int throwCount, Func<Exception> exception)
++        {
++            _throwCount = throwCount;
++            _exception = exception;
++        }
++
++        public int Invocations => _invocations;
++
++        public override InterceptionResult<int> SavingChanges(DbContextEventData eventData, InterceptionResult<int> result)
++        {
++            var attempt = Interlocked.Increment(ref _invocations);
++            if (attempt <= _throwCount)
++            {
++                throw _exception();
++            }
++
++            return result;
++        }
++
++        public override ValueTask<InterceptionResult<int>> SavingChangesAsync(DbContextEventData eventData, InterceptionResult<int> result, CancellationToken cancellationToken = default)
++        {
++            var attempt = Interlocked.Increment(ref _invocations);
++            if (attempt <= _throwCount)
++            {
++                throw _exception();
++            }
++
++            return ValueTask.FromResult(result);
++        }
++    }
++
++    /// <summary>
++    /// Simulates a write stuck on the database (e.g. a Galera commit blocked behind flow control):
++    /// SaveChanges/SaveChangesAsync never complete on their own. The async side honors the caller's
++    /// CancellationToken exactly like a real provider would; the sync side is unstuck only by
++    /// disposing this interceptor, since production's own sync call site has no token to cancel it
++    /// with either -- that gap is the point of the test that uses it.
++    /// </summary>
++    private sealed class HangingInterceptor : SaveChangesInterceptor, IDisposable
++    {
++        private readonly CancellationTokenSource _teardown = new();
++
++        public override InterceptionResult<int> SavingChanges(DbContextEventData eventData, InterceptionResult<int> result)
++        {
++            Task.Delay(Timeout.InfiniteTimeSpan, _teardown.Token).GetAwaiter().GetResult();
++            return result;
++        }
++
++        public override async ValueTask<InterceptionResult<int>> SavingChangesAsync(DbContextEventData eventData, InterceptionResult<int> result, CancellationToken cancellationToken = default)
++        {
++            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
++            return result;
++        }
++
++        public void Dispose() => _teardown.Cancel();
++    }
+ }
