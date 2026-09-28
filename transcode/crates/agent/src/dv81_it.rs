@@ -687,3 +687,205 @@ async fn a_detached_dv81_job_sees_segment_progress_and_its_keys_reach_the_hls_wr
     assert_eq!(read("keys-demux"), "", "ffmpeg#1 must not get the keys");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// One sample entry of an fMP4 init segment: its fourcc, its child box fourccs, and the
+/// (profile, BL signal compatibility id, EL present) of a `dvcC`/`dvvC` child if it has one.
+#[derive(Debug)]
+struct SampleEntry {
+    fourcc: String,
+    children: Vec<String>,
+    dovi: Option<(u8, u8, bool)>,
+}
+
+/// Walk `moov/trak/mdia/minf/stbl/stsd` of an init segment (enough ISO BMFF for the checks
+/// below; not a general parser).
+fn sample_entries(init: &[u8]) -> Vec<SampleEntry> {
+    fn boxes(buf: &[u8]) -> Vec<(String, &[u8])> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off + 8 <= buf.len() {
+            let size = u32::from_be_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+            let name = String::from_utf8_lossy(&buf[off + 4..off + 8]).into_owned();
+            if size < 8 || off + size > buf.len() {
+                break;
+            }
+            out.push((name, &buf[off + 8..off + size]));
+            off += size;
+        }
+        out
+    }
+    fn find<'a>(buf: &'a [u8], path: &[&str]) -> Vec<&'a [u8]> {
+        let Some((first, rest)) = path.split_first() else {
+            return vec![buf];
+        };
+        boxes(buf)
+            .into_iter()
+            .filter(|(n, _)| n == first)
+            .flat_map(|(_, b)| find(b, rest))
+            .collect()
+    }
+    let mut out = Vec::new();
+    for stsd in find(init, &["moov", "trak", "mdia", "minf", "stbl", "stsd"]) {
+        for (fourcc, body) in boxes(stsd.get(8..).unwrap_or_default()) {
+            // Visual sample entries have 78 bytes before their child boxes, audio ones 28.
+            let skip = if matches!(fourcc.as_str(), "hvc1" | "hev1" | "dvh1" | "dvhe") {
+                78
+            } else {
+                28
+            };
+            let kids = boxes(body.get(skip..).unwrap_or_default());
+            let dovi = kids
+                .iter()
+                .find(|(n, b)| (n == "dvcC" || n == "dvvC") && b.len() >= 5)
+                .map(|(_, b)| (b[2] >> 1, b[4] >> 4, (b[3] >> 1) & 1 == 1));
+            out.push(SampleEntry {
+                fourcc,
+                children: kids.into_iter().map(|(n, _)| n).collect(),
+                dovi,
+            });
+        }
+    }
+    out
+}
+
+/// Bughunt 17's argv shape: Jellyfin serves a converted profile-7 source as fMP4, tags the video
+/// `hvc1 -strict -2` (`EncodingHelper.GetDoviP7ToP81CodecTagArgs`) and copies a declared TrueHD
+/// track (`-codec:a:0 copy -strict -2`). Derived from `remux_args`.
+fn remux_args_fmp4_copy(input: &Path, out: &Path) -> Vec<String> {
+    let src = remux_args(input, out, None);
+    let mut a = Vec::with_capacity(src.len() + 4);
+    let mut i = 0;
+    while i < src.len() {
+        match (src[i].as_str(), src.get(i + 1).map(String::as_str)) {
+            ("-tag:v:0", Some(_)) => {
+                a.extend(["-tag:v:0", "hvc1", "-strict", "-2"].map(String::from));
+                i += 2;
+            }
+            ("-codec:a:0", Some(_)) => {
+                a.extend(["-codec:a:0", "copy", "-strict", "-2"].map(String::from));
+                i += 2;
+            }
+            ("-ac", Some(_)) => i += 2,
+            _ => {
+                a.push(src[i].clone());
+                i += 1;
+            }
+        }
+    }
+    a
+}
+
+/// What the Android TV app (media3) and AVPlayer need from a converted fMP4 output: an `hvc1`
+/// sample entry with a `dvvC` box for profile 8 / BL compatibility 1 / no EL (media3's
+/// `BoxParser` turns that into `video/dolby-vision`; its TS extractor only ever reports
+/// `video/hevc`), and the TrueHD track copied as `mlpa`.
+fn assert_dv81_fmp4_init(dir: &Path, tag: &str) {
+    let entries = sample_entries(&std::fs::read(dir.join("init.mp4")).unwrap());
+    let video = entries
+        .iter()
+        .find(|e| e.fourcc.starts_with("hv") || e.fourcc.starts_with("dvh"))
+        .unwrap_or_else(|| panic!("[{tag}] no video sample entry: {entries:?}"));
+    assert_eq!(video.fourcc, "hvc1", "[{tag}] {entries:?}");
+    assert!(
+        video.children.iter().any(|c| c == "dvvC") && !video.children.iter().any(|c| c == "dvcC"),
+        "[{tag}] profile 8 needs dvvC, not dvcC: {entries:?}"
+    );
+    assert_eq!(video.dovi, Some((8, 1, false)), "[{tag}] {entries:?}");
+    assert!(
+        entries.iter().any(|e| e.fourcc == "mlpa"),
+        "[{tag}] TrueHD not copied as mlpa: {entries:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn converted_fmp4_is_hvc1_with_dvvc_and_keeps_truehd() {
+    if !have_tools() {
+        eprintln!(
+            "SKIP converted_fmp4_is_hvc1_with_dvvc_and_keeps_truehd: ffmpeg/ffprobe/libx265 missing"
+        );
+        return;
+    }
+    let dir = tmpdir("fmp4thd");
+    let fixture = build_fixture(&dir, true);
+    // Same profile-7 video; audio re-encoded to TrueHD (ffmpeg's encoder is experimental).
+    let src = dir.join("fixture-truehd.mkv");
+    ffmpeg(&[
+        "-i",
+        p(&fixture),
+        "-map",
+        "0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "truehd",
+        "-strict",
+        "-2",
+        p(&src),
+    ]);
+    let h = harness();
+    let out = dir.join("dv");
+    std::fs::create_dir_all(&out).unwrap();
+    let code = run_signaled(&h, &remux_args_fmp4_copy(&src, &out)).await;
+    let stderr = h.stderr.lock().unwrap().clone();
+    assert_eq!(code, 0, "converting pipeline failed:\n{stderr}");
+    assert_eq!(dv81_count(&h, crate::metrics::Dv81Outcome::Converted), 1);
+    assert_dv81_fmp4_init(&out, "synthetic");
+
+    // Every RPU is profile 8 now, and every TrueHD packet made it through.
+    let rpus: Vec<_> = output_nals(&out)
+        .into_iter()
+        .filter(|n| n.nal_unit_type == RPU_NAL_UNIT_TYPE)
+        .collect();
+    assert!(!rpus.is_empty());
+    for r in &rpus {
+        let rpu = DoviRpu::parse_unspec62_nalu(&r.data[2..]).expect("RPU parses");
+        assert_eq!(rpu.dovi_profile, 8);
+    }
+    let audio = |f: &Path| {
+        ffprobe(&[
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-count_packets",
+            "-show_entries",
+            "stream=codec_name,nb_read_packets",
+            "-of",
+            "csv=p=0",
+            p(f),
+        ])
+    };
+    let got = audio(&concat_hls(&out));
+    assert!(got.starts_with("truehd,"), "audio: {got}");
+    assert_eq!(got, audio(&src), "TrueHD packets lost");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same init-segment check on a real profile-7 file with in-band RPU, video on stream 0 and
+/// TrueHD on stream 1: `DV81_SOURCE=/path/to/file.mkv cargo test -p tcpool-agent
+/// converted_fmp4_real_source_from_env -- --nocapture`. Skipped when the variable is unset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn converted_fmp4_real_source_from_env() {
+    let Some(src) = std::env::var_os("DV81_SOURCE").map(PathBuf::from) else {
+        eprintln!("SKIP converted_fmp4_real_source_from_env: DV81_SOURCE not set");
+        return;
+    };
+    if !have_tools() {
+        eprintln!("SKIP converted_fmp4_real_source_from_env: ffmpeg/ffprobe missing");
+        return;
+    }
+    let dir = tmpdir("fmp4real");
+    let h = harness();
+    let out = dir.join("dv");
+    std::fs::create_dir_all(&out).unwrap();
+    let code = run_signaled(&h, &remux_args_fmp4_copy(&src, &out)).await;
+    let stderr = h.stderr.lock().unwrap().clone();
+    assert_eq!(code, 0, "converting pipeline failed:\n{stderr}");
+    assert_eq!(dv81_count(&h, crate::metrics::Dv81Outcome::Converted), 1);
+    assert_dv81_fmp4_init(&out, "real");
+    eprintln!(
+        "real source init: {:?}",
+        sample_entries(&std::fs::read(out.join("init.mp4")).unwrap())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
