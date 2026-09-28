@@ -399,15 +399,52 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
       The agent detects (b) on the first bytes and runs the DV-removed fallback. Never trust a
       `dovi_rpu`-bsf recipe on (b): on a stream with no config record it prints `No Dolby Vision
       configuration record found? Generating one, but results may be invalid` and fabricates one.
+      **(b) not reproduced by the 2026-09-27 census (below):** the `hvcE` mapping warning is present
+      on 117 of 122 DV7 files, and all 122 still have NAL 62 in ffmpeg's `-c copy` output — the
+      warning alone does not mean out-of-band RPU. The earlier 301-NAL/zero-RPU trace is unexplained.
+
+      **Library census — MEASURED 2026-09-27 on prod (jellyfin-qsv, `ffmpeg version 8.1.2-Jellyfin`):**
+      336 video files under the movies library; 165 carry a DOVI record (header-only ffprobe,
+      `stream_side_data`, `-probesize 5M`): 122 profile 7, 43 profile 8 (includes the in-library
+      offline DV81 conversions). (The "124 of 329" above is an earlier session's count; method not recorded.)
+      Per DV7 title, a 3 s `-ss 0 -t 3 -map 0:v:0 -c copy -bsf:v hevc_mp4toannexb -f hevc` scanned
+      for NAL types: **in-band RPU 122, HVCE (warning + 0 NAL 62) 0, other 0**; 73-75 NAL 62 per
+      3 s on every title; EL carried as NAL 63 on every title. EL type (dovi_tool 2.3.4 `info -s`
+      on the same 3 s): **FEL 76, MEL 46**. hvcE BlockAddition mapping in the header: 117 of 122.
+      HVCE class: 0 of 122 in this library. hvcE BlockAddition reader required for the HVCE class —
+      tracked in SaabStory404/jellymesh#4.
+
+      **Real-title proof — MEASURED 2026-09-27 on prod jellyfin-qsv (jellyfin-ffmpeg 8.1.2), one
+      in-band DV7 FEL title (level 6, 23.976 fps), `examples/dv81_filter` (static musl, the agent's
+      `dv81`/`dv81_ts` code) between ffmpeg#1 and ffmpeg#2 with the argvs `dv81_plan::plan`
+      produces for a Jellyfin MKV HLS-fmp4 remux (`-ss 600 -noaccurate_seek -t 30`, `-copyts
+      -start_at_zero`, `-bsf:v hevc_mp4toannexb -tag:v:0 hvc1`, TrueHD -> libfdk_aac 2ch), ffmpeg#2
+      reading `pipe:3`, all `nice -n 19`:**
+        - init segment DOVI record: `dv_profile=8 dv_level=6 rpu 1 el 0 bl 1 compatibility id 1`;
+          plain remux of the same argv: profile 7, el 1, compat 6. No "Generating one" in ffmpeg#2's
+          stderr (0 hits).
+        - filter: 729 video frames, 729 RPUs rewritten, 2459 EL NALs dropped. dovi_tool 2.3.4
+          (official musl, tarball sha256 `1844258e…32b3f` = GitHub asset digest): source window
+          `Frames: 729, Profile: 7 (FEL)` -> output `Frames: 729, Profile: 8`; L1/L2/L5/L6 unchanged.
+          Output video NALs: 729 NAL 62, 0 NAL 63.
+        - Real bytes settle the two INHERITED points: EL is NAL type 63 and the RPU is `nuh_layer_id`
+          0 (source window: (62,0)=729, (63,0)=2459; no other layer ids).
+        - A/V start: first video packet pts 599.724 / dts 599.599, first audio 599.681 — identical
+          in the DV81 output and the plain remux (0 frames apart); 729 video / 1408 audio packets in
+          both; 6 segments each.
+        - Time for the 30.4 s window: plain remux real 1.217 s (user+sys 2.24 s); DV81 pipeline
+          real 1.772 s (user+sys 3.88 s) = ~17x realtime. The plain remux ran first, so the DV81 run's
+          two source reads were likely page-cache warm — cold NFS double-read cost still unmeasured.
+        - DV-removed fallback (`-bsf:v hevc_mp4toannexb,hevc_metadata=remove_dovi=1`, the chain
+          `add_dv_removal_bsf` builds from this argv) on the same title: no DOVI record in init,
+          `color_transfer=smpte2084`, bt2020, mastering-display + CLL frame side data intact; seg0 has
+          0 NAL 62 and EL payload 6.16 MB -> 3437 B, but 336 small NAL 63 remain (~10 B each), so
+          `remove_dovi` does not delete every EL NAL. Same frame/packet counts and A/V start.
+        - The `fallback_no_rpu` gate could not be exercised on a real title: the library has none.
 
       **Open:**
-        - Lab proof against a real in-band DV7 title with the built agent (or `examples/dv81_filter`
-          between the two ffmpegs) on jellyfin-ffmpeg 8.1.2 — blocked this session (cluster exec
-          denied by the session's permission classifier); the synthetic proof above is ffmpeg 8.1.3.
-          Also unverified on real bytes: EL as type 63 (INHERITED from dovi_tool's demux) and the
-          RPU's layer id (either is handled).
-        - Library census: how many of the 124 DV7 titles are (a) in-band vs (b) `hvcE` — decides
-          whether (b) is worth a reader.
+        - [x] Lab proof against a real in-band DV7 title (above, 2026-09-27).
+        - [x] Library census (above): 122 in-band, 0 `hvcE`-only.
         - (b) reader: a Matroska Block-Addition-aware extractor (Rust, in the agent) that yields the
           RPU per frame so the same rewrite applies.
         - [x] Jellyfin decision patch adopting the marker (jellymesh PR #3, bug-hunt patch 13):
