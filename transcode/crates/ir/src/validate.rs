@@ -624,4 +624,14 @@ mod tests {
         );
         assert_eq!(validate(&a, &Policy::default(), Shape::Hls), Ok(()));
     }
+
+    #[test]
+    fn dv81_signal_alias_is_also_opaque_to_the_allowlist() {
+        let mut a = base();
+        a.splice(
+            4..4,
+            s(&[crate::DV81_SIGNAL_FLAG, crate::DV81_SIGNAL_VALUE_ALIAS]),
+        );
+        assert_eq!(validate(&a, &Policy::default(), Shape::Hls), Ok(()));
+    }
 }

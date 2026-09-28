@@ -291,18 +291,53 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
       pool's execution (agent/IR) — this entry.
 
       **Signal contract (`crates/ir/src/lib.rs` `wants_dv81`/`strip_dv81_signal`):** Jellyfin's
-      decision patch appends `-metadata:s:v:0 TC_DV81=1` once, on the output video stream. A real,
-      harmless ffmpeg option, so any path that execs the argv unmodified (older agent, the shim's
-      `exec_real`) still runs, just with one inert metadata key. `validate()` is opaque to it
-      (`validate::tests::dv81_signal_is_already_opaque_to_the_allowlist`). The agent strips it from
-      whatever argv it runs.
+      decision patch (jellymesh PR #3, bug-hunt patch 13) appends `-metadata:s:v:0
+      JELLYMESH_DOVI_P7_TO_81=1` once, on the output video stream (`DV81_SIGNAL_VALUE`; the pool's
+      original `TC_DV81=1` still works as `DV81_SIGNAL_VALUE_ALIAS`, for lab use and older argvs).
+      A real, harmless ffmpeg option, so any path that execs the argv unmodified (older agent, the
+      shim's `exec_real`) still runs, just with one inert metadata key. `validate()` is opaque to
+      it (`validate::tests::dv81_signal_is_already_opaque_to_the_allowlist` and its `_alias`
+      sibling). The agent strips it from whatever argv it runs, and matches the pair anywhere in
+      argv (not by position) — MEASURED against a Jellyfin-shaped argv carrying `-copyts`, a
+      non-zero `-map 0:<N>` for video and `-bsf:v hevc_mp4toannexb`
+      (`strip_dv81_signal_leaves_a_jellyfin_shaped_argv_otherwise_untouched`).
+
+      **`hevc_mp4toannexb` in Jellyfin's own argv (PR #3's shape) is harmless to ffmpeg#2.**
+      MEASURED 2026-09-27 on ffmpeg 8.1.3: copying an HEVC stream already read out of MPEG-TS (as
+      ffmpeg#2's fd-3 input always is) into an mp4/fmp4 output with `-bsf:v hevc_mp4toannexb`
+      applied produces a byte-identical file to the same copy without it — the filter no-ops on
+      input that is already Annex-B. `dv81_plan::without_dovi_strip` only strips `dovi_rpu*`/
+      `remove_dovi` filters from a `-bsf:v` chain, so this bsf already passes through unchanged;
+      `dv81_plan::tests::mux_keeps_hevc_mp4toannexb_bsf_untouched_and_repoints_a_nonzero_video_map`
+      and `job::dv81_it`'s fixtures (now built with this bsf + the marker in Jellyfin's shape) cover
+      it end to end.
+
+      **A fallback must remove DV, not just the marker (`tcpool_ir::add_dv_removal_bsf`).**
+      Jellyfin's decision patch only emits the marker for a client it already confirmed accepts "DV
+      8.1 or HDR10" — never raw profile 7. Every path that does not produce a real 8.1 record (the
+      agent's three non-convert outcomes below, and the shim's `exec_real` when the pool cannot be
+      reached at all) merges `hevc_metadata=remove_dovi=1` (`DV_REMOVAL_BSF`) into the argv's
+      `-bsf:v` chain (comma-joined into an existing chain, e.g. Jellyfin's own `hevc_mp4toannexb`,
+      never a second `-bsf:v` flag) so the client gets plain HDR10 instead of an untouched,
+      mislabeled DV7 (or whatever DV, if any, the source actually has — `fallback_not_p7` can't
+      assume). This is the one sanctioned exception to "exec_real preserves argv exactly".
+      CONFIRMED from source: `remove_dovi` is a jellyfin-ffmpeg-only Debian patch
+      (`debian/patches/0061-add-remove-dovi-hdr10plus-bsf.patch`, present at tag `v8.1.2-5`) on the
+      `h265_metadata` bsf ("hevc_metadata" in ffmpeg CLI naming) — the same bsf/option already
+      named "Jellyfin's HDR10 fallback" in `dv81_plan::without_dovi_strip`'s doc comment. It deletes
+      the trailing RPU/EL NAL units per access unit *and* removes the `AV_PKT_DATA_DOVI_CONF` coded
+      side data on init, so the output carries no DOVI record at all. Not in stock ffmpeg — MEASURED
+      2026-09-27, this workstation's stock Fedora ffmpeg 8.1.3 errors `Option 'remove_dovi' not
+      found` — so `job::dv81_it`'s two non-converting fallback tests probe for the option
+      (`have_dv_removal_bsf`) and skip with a note on this workstation, same convention as
+      `have_tools()`; the converting test never takes this path and always runs.
 
       **Agent path (`crates/agent/src/job.rs` `run_dv81`, shipped on `dv81-wire`):** for a PLAYBACK job
       carrying the marker:
         1. Gate: video stream copy (`is_video_copy`) AND `probe::source_dovi` says DV profile 7
            (ffprobe `stream_side_data`, fails closed) AND `dv81_plan::plan` accepts the argv shape
            (exactly one `-i`, `-copyts` present — Jellyfin's remux shape; no `-itsoffset`/`-sseof`/
-           output `-ss`). Otherwise: plain remux, `fallback_not_p7` / `fallback_error`.
+           output `-ss`). Otherwise: DV-removed fallback, `fallback_not_p7` / `fallback_error`.
         2. ffmpeg#1 (`dv81_plan`): Jellyfin's input options (same `-ss`/`-noaccurate_seek`/probe
            limits) + `-map 0:v:0 -c:v copy -copyts -output_ts_offset 10 -muxdelay 0 -muxpreload 0
            -f mpegts pipe:1`. TS, not raw `-f hevc`: it carries PTS/DTS, so B-frame order and the
@@ -314,8 +349,8 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
            EL, replacing any ffmpeg#1 wrote. **Decision on the first bytes:** if no RPU has been
            seen within 32 MB (or 10 s — kept inside the 45 s first-progress grace, which also covers
            the ffprobe and whatever ffmpeg runs next — or ffmpeg#1's whole output) the source's RPU is out-of-band
-           (`hvcE`, below): kill ffmpeg#1, plain remux, `fallback_no_rpu`. Nothing has been written
-           to Jellyfin's output at that point.
+           (`hvcE`, below): kill ffmpeg#1, DV-removed fallback (`add_dv_removal_bsf`), `fallback_no_rpu`.
+           Nothing has been written to Jellyfin's output at that point.
         4. ffmpeg#2: input 0 = the rewritten TS on **fd 3** (`pipe:3`, dup2 in `pre_exec`) — not
            stdin, which stays Jellyfin's `p`/`u`/`q` key channel, so throttling and quit work
            unchanged; input 1 = the source with Jellyfin's input options (audio/subs); Jellyfin's
@@ -330,7 +365,7 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
            1.003 s instead of the plain remux's 0.811 s).
         6. Failure after ffmpeg#2 started: a conversion error mid-stream kills ffmpeg#2 (nonzero
            exit, never a clean-looking truncated playlist); a nonzero exit before the first segment
-           re-runs the plain remux (`fallback_error`), mirroring the GPU-filter fallback.
+           re-runs the DV-removed fallback (`fallback_error`), mirroring the GPU-filter fallback.
       Metric: `tcpool_dv81_total{outcome=converted|fallback_no_rpu|fallback_not_p7|fallback_error}`,
       one per signaled job (`fallback_not_p7` added beyond the original three labels so a Jellyfin
       signal on a non-DV7 source is visible separately from an agent error).
@@ -347,8 +382,8 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
         - A/V vs the plain remux of the same argv: no seek — video 0.021 / audio −0.021333 on both;
           `-ss 1.5 -noaccurate_seek` — video 0.939011 vs 0.939063 (52 µs, the ms→90 kHz rounding),
           audio 0.810 vs 0.810; same frame count (96 / 75);
-        - a DV7 source without in-band RPU → `fallback_no_rpu`, plain remux output; a non-DV
-          source → `fallback_not_p7`.
+        - a DV7 source without in-band RPU → `fallback_no_rpu`, DV-removed output (no DOVI record,
+          MEASURED via `ffprobe`); a non-DV source → `fallback_not_p7`.
       The same probe finding changed the gate: `-show_entries stream=index:side_data=dv_profile` (the
       earlier `source_dovi_profile`) also selects packet/frame side data and read all 96 packets of a
       4 s clip — on a 70 GB remux it would time out and fail closed on every job; `source_dovi` uses
@@ -361,7 +396,7 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
       (b) others carry EL+RPU in a Matroska Block Addition, mapping type `hvcE` (ffmpeg: `Invalid Block
       Addition value 0x0 for unknown Block Addition Mapping type 68766345`); a stream copy of those has
       zero NAL 62s (301 NALs traced over 3 s), and ffprobe still shows the static profile-7 record.
-      The agent detects (b) on the first bytes and runs the plain remux. Never trust a
+      The agent detects (b) on the first bytes and runs the DV-removed fallback. Never trust a
       `dovi_rpu`-bsf recipe on (b): on a stream with no config record it prints `No Dolby Vision
       configuration record found? Generating one, but results may be invalid` and fabricates one.
 
@@ -375,7 +410,10 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
           whether (b) is worth a reader.
         - (b) reader: a Matroska Block-Addition-aware extractor (Rust, in the agent) that yields the
           RPU per frame so the same rewrite applies.
-        - Jellyfin decision patch adopting the marker (bug-hunt session, brief item 5).
+        - [x] Jellyfin decision patch adopting the marker (jellymesh PR #3, bug-hunt patch 13):
+              emits `-metadata:s:v:0 JELLYMESH_DOVI_P7_TO_81=1`, `-bsf:v hevc_mp4toannexb` and a
+              `-map 0:<N>` for video; the pool's marker/fallback/bsf handling above was updated to
+              match (2026-09-27).
         - Cost: a converting job reads the source twice (ffmpeg#1 for video, ffmpeg#2 for audio,
           same file, same seek) — ~2x NFS read per DV81 session on a link P6 already flags as
           saturating on remux probes. Not measured yet.

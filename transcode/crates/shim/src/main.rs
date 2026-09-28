@@ -46,7 +46,9 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tcpool_ir::{first_segment, playlist, required_output};
+use tcpool_ir::{
+    add_dv_removal_bsf, first_segment, playlist, required_output, strip_dv81_signal, wants_dv81,
+};
 use tcpool_proto::worker_client::WorkerClient;
 use tcpool_proto::{
     client_msg, server_msg, Caps, ClientMsg, Heartbeat, HelloRequest, Job, Priority,
@@ -88,9 +90,43 @@ fn log(msg: &str) {
     }
 }
 
+/// If `raw` carries the P5 DV7->8.1 marker, returns it with the marker pair removed and
+/// `tcpool_ir::DV_REMOVAL_BSF` merged into the (possibly absent) `-bsf:v` chain on the single
+/// output (`tcpool_ir::add_dv_removal_bsf`). Otherwise returns `raw` unchanged.
+///
+/// Why: this function only ever runs when the pool could not be reached (or panicked, or this
+/// process is not even a pool-eligible shape) -- nothing here does the agent's RPU-to-8.1
+/// rewrite. Jellyfin's decision patch picked "8.1" because the *client* only asked for "DV 8.1 or
+/// HDR10", never raw profile 7; execing Jellyfin's argv unmodified would copy raw dual-layer DV7
+/// (or whatever DV the source actually has) under a stream the client believes is single-layer
+/// 8.1, which such a client cannot decode correctly. Removing DV entirely instead yields plain
+/// HDR10 -- exactly the fallback Jellyfin's own decision already treats as acceptable for this
+/// client -- so this is the one sanctioned exception to "exec_real preserves argv exactly": every
+/// other local fallback in this codebase still execs Jellyfin's argv byte-for-byte. The agent's
+/// own non-convert fallbacks (`crates/agent/src/job.rs` `run_dv81`) apply the same rewrite for the
+/// same reason.
+fn dv81_local_fallback_args(raw: &[OsString]) -> Vec<OsString> {
+    let args: Vec<String> = raw
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if !wants_dv81(&args) {
+        return raw.to_vec();
+    }
+    log(
+        "dv81: no pool available for a signaled job; removing DV (not copying raw profile 7) \
+         before the local exec -- exec_real's one sanctioned argv rewrite",
+    );
+    add_dv_removal_bsf(&strip_dv81_signal(&args))
+        .into_iter()
+        .map(OsString::from)
+        .collect()
+}
+
 fn exec_real(raw: &[OsString]) -> ! {
+    let raw = dv81_local_fallback_args(raw);
     let real = real_ffmpeg();
-    let err = std::process::Command::new(&real).args(raw).exec();
+    let err = std::process::Command::new(&real).args(&raw).exec();
     eprintln!("tcpool-shim: exec {real}: {err}");
     std::process::exit(127);
 }

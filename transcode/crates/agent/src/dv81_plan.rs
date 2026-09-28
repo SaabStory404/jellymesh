@@ -361,6 +361,66 @@ mod tests {
         v
     }
 
+    /// The Jellyfin-side decision patch's actual argv shape (jellymesh PR #3, bug-hunt patch 13):
+    /// a TS-sourced HLS fmp4 remux with `-bsf:v hevc_mp4toannexb` already present in the output
+    /// options (unrelated to the DV-strip bsfs `without_dovi_strip` targets) and the P5 marker
+    /// pair alongside it. `video_index` need not be 0.
+    fn remux_annexb_bsf() -> Vec<String> {
+        a(&[
+            "-analyzeduration",
+            "200M",
+            "-probesize",
+            "50M",
+            "-copyts",
+            "-f",
+            "mpegts",
+            "-i",
+            "file:/data/media/movies/X/X.ts",
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-map",
+            "0:2",
+            "-map",
+            "0:1",
+            "-map",
+            "-0:s",
+            "-codec:v:0",
+            "copy",
+            "-bsf:v",
+            "hevc_mp4toannexb",
+            "-tag:v:0",
+            "hvc1",
+            "-codec:a:0",
+            "libfdk_aac",
+            "-ac",
+            "2",
+            "-avoid_negative_ts",
+            "disabled",
+            "-max_muxing_queue_size",
+            "2048",
+            "-f",
+            "hls",
+            "-hls_segment_type",
+            "fmp4",
+            "-hls_fmp4_init_filename",
+            "abc-1.mp4",
+            "-start_number",
+            "0",
+            "-hls_segment_filename",
+            "/transcodes/jf/abc%d.mp4",
+            "-hls_playlist_type",
+            "vod",
+            "-hls_list_size",
+            "0",
+            "-hls_flags",
+            "temp_file",
+            "-y",
+            "/transcodes/jf/abc.m3u8",
+        ])
+    }
+
     const SRC: Source = Source {
         video_index: 0,
         start_time: 0.0,
@@ -497,6 +557,35 @@ mod tests {
         let i = pos(&other_video, "0:0");
         other_video[i] = "0:5".into();
         assert!(plan(&other_video, &SRC, 3).is_err(), "no map selects video");
+    }
+
+    #[test]
+    fn mux_keeps_hevc_mp4toannexb_bsf_untouched_and_repoints_a_nonzero_video_map() {
+        // `-bsf:v hevc_mp4toannexb` is not a DV-stripping filter (`without_dovi_strip` only
+        // targets `dovi_rpu*`/`remove_dovi`), so it must survive into ffmpeg#2's argv exactly as
+        // Jellyfin wrote it -- MEASURED 2026-09-27 on ffmpeg 8.1.3: applying it to an
+        // already-Annex-B HEVC stream (as ffmpeg#2's TS input always is) copied into an mp4/fmp4
+        // output produced a byte-identical file to the same copy without the bsf, so keeping it in
+        // the mux argv is harmless.
+        let src = Source {
+            video_index: 2,
+            start_time: 0.0,
+        };
+        let p = plan(&remux_annexb_bsf(), &src, 3).unwrap();
+        let m = &p.mux;
+        assert!(
+            m.windows(2).any(|w| w == ["-bsf:v", "hevc_mp4toannexb"]),
+            "hevc_mp4toannexb must survive into the mux argv: {m:?}"
+        );
+        let maps: Vec<&str> = m
+            .windows(2)
+            .filter(|w| w[0] == "-map")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(maps, ["0:v:0", "1:1", "-1:s"]);
+        assert!(m.windows(2).any(|w| w == ["-tag:v:0", "hvc1"]));
+        assert_eq!(m.last().unwrap(), "/transcodes/jf/abc.m3u8");
+        assert!(m.windows(2).any(|w| w == ["-hls_segment_type", "fmp4"]));
     }
 
     #[test]

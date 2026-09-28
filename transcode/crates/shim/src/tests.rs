@@ -479,3 +479,89 @@ fn trickplay_frame_count_is_zero_when_the_directory_does_not_exist() {
     let args = trickplay_args(&t.path("nope"), None);
     assert_eq!(trickplay_frame_count(&args), 0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// P5: the local (no-pool) fallback must never copy raw DV profile 7 under a marker that told
+// Jellyfin's client it would get 8.1 -- `dv81_local_fallback_args` is the one sanctioned rewrite
+// of `exec_real`'s otherwise-unmodified argv.
+// ---------------------------------------------------------------------------------------------
+
+fn osv(v: &[&str]) -> Vec<OsString> {
+    v.iter().map(OsString::from).collect()
+}
+
+/// A minimal Jellyfin-shaped HLS remux argv carrying the P5 marker and (optionally) an existing
+/// `-bsf:v` chain, ending in the output `.m3u8`.
+fn dv81_signaled_args(existing_bsf: Option<&str>) -> Vec<OsString> {
+    let mut v = vec![
+        "-f".to_string(),
+        "matroska,webm".to_string(),
+        "-i".to_string(),
+        "file:/data/media/movies/X/X.mkv".to_string(),
+        "-map".to_string(),
+        "0:0".to_string(),
+        "-codec:v:0".to_string(),
+        "copy".to_string(),
+    ];
+    if let Some(chain) = existing_bsf {
+        v.extend(["-bsf:v".to_string(), chain.to_string()]);
+    }
+    v.extend([
+        "-metadata:s:v:0".to_string(),
+        "JELLYMESH_DOVI_P7_TO_81=1".to_string(),
+        "-copyts".to_string(),
+        "-f".to_string(),
+        "hls".to_string(),
+        "-y".to_string(),
+        "/transcodes/jf/abc.m3u8".to_string(),
+    ]);
+    v.into_iter().map(OsString::from).collect()
+}
+
+#[test]
+fn dv81_local_fallback_leaves_an_unsignaled_argv_byte_for_byte_unchanged() {
+    let raw = osv(&[
+        "-i",
+        "file:/data/media/movies/X/X.mkv",
+        "-codec:v:0",
+        "copy",
+        "-y",
+        "/transcodes/jf/abc.m3u8",
+    ]);
+    assert_eq!(dv81_local_fallback_args(&raw), raw);
+}
+
+#[test]
+fn dv81_local_fallback_strips_the_marker_and_adds_a_dv_removal_bsf_when_none_exists() {
+    let raw = dv81_signaled_args(None);
+    let out = dv81_local_fallback_args(&raw);
+    let s: Vec<String> = out
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(!wants_dv81(&s), "marker must be gone: {s:?}");
+    assert!(
+        s.windows(2)
+            .any(|w| w == ["-bsf:v", tcpool_ir::DV_REMOVAL_BSF]),
+        "DV-removal bsf missing: {s:?}"
+    );
+    assert_eq!(s.last().unwrap(), "/transcodes/jf/abc.m3u8");
+}
+
+#[test]
+fn dv81_local_fallback_merges_into_an_existing_bsf_chain_not_a_second_flag() {
+    let raw = dv81_signaled_args(Some("hevc_mp4toannexb"));
+    let out = dv81_local_fallback_args(&raw);
+    let s: Vec<String> = out
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(!wants_dv81(&s));
+    let bsf_count = s.iter().filter(|a| a.as_str() == "-bsf:v").count();
+    assert_eq!(bsf_count, 1, "must merge, not add a second -bsf:v: {s:?}");
+    let i = s.iter().position(|a| a == "-bsf:v").unwrap();
+    assert_eq!(
+        s[i + 1],
+        format!("hevc_mp4toannexb,{}", tcpool_ir::DV_REMOVAL_BSF)
+    );
+}

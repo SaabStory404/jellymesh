@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tcpool_ir::{
-    first_segment, input_path, is_video_copy, map_path, render, render_trickplay,
-    strip_dv81_signal, wants_dv81, Shape, TranslateOpts,
+    add_dv_removal_bsf, first_segment, input_path, is_video_copy, map_path, render,
+    render_trickplay, strip_dv81_signal, wants_dv81, Shape, TranslateOpts,
 };
 use tcpool_proto::{
     client_msg, server_msg, Accepted, Busy, ClientMsg, Exit, Heartbeat, Job, ServerMsg,
@@ -841,8 +841,10 @@ async fn dv81_feed(
     Ok(feed.rewriter.stats)
 }
 
-/// A signaled (DV7 -> 8.1) PLAYBACK job: convert if the gate passes, else run `args` (Jellyfin's
-/// plain remux, marker already stripped). Counts exactly one `tcpool_dv81_total` outcome.
+/// A signaled (DV7 -> 8.1) PLAYBACK job: convert if the gate passes, else run an HDR10-safe
+/// fallback of `args` (Jellyfin's plain remux, marker stripped, `add_dv_removal_bsf` applied --
+/// see that function's doc comment for why a fallback must not just copy whatever DV the source
+/// actually has). Counts exactly one `tcpool_dv81_total` outcome.
 #[allow(clippy::too_many_arguments)]
 async fn run_dv81(
     cfg: &Config,
@@ -855,9 +857,20 @@ async fn run_dv81(
     stdin_rx: Arc<Mutex<mpsc::Receiver<Option<Vec<u8>>>>>,
 ) -> i32 {
     use crate::metrics::Dv81Outcome as O;
+    // Defense in depth: `run_job`'s `render_fn` already strips the marker before calling here, so
+    // this is normally a no-op. Stripping again (idempotent) means `run_dv81` never depends on its
+    // caller having done it -- the fixture tests in `dv81_it.rs` call this directly with the
+    // marker still present, and neither ffmpeg#1/#2's argv nor the fallback below should ever
+    // carry it.
+    let stripped = strip_dv81_signal(args);
+    let args = &stripped;
+    // Every fallback below runs this, never bare `args`: none of them produced a real 8.1 record,
+    // so the client (which only ever asked for "8.1 or HDR10") must get DV removed rather than
+    // whatever DV the source actually carries -- see `add_dv_removal_bsf`'s doc comment.
+    let fallback_args = add_dv_removal_bsf(args);
     let fallback = |outcome: O, why: String| {
         crate::log(format_args!(
-            "dv81: {}: {why}; running the plain remux",
+            "dv81: {}: {why}; running the plain remux with DV removed",
             outcome.as_str()
         ));
         state.metrics.inc_dv81(outcome);
@@ -866,14 +879,14 @@ async fn run_dv81(
         Ok(p) => p,
         Err((o, why)) => {
             fallback(o, why);
-            return run_ffmpeg(cfg, args, cwd, tx, ctl, kill_rx, stdin_rx, None).await;
+            return run_ffmpeg(cfg, &fallback_args, cwd, tx, ctl, kill_rx, stdin_rx, None).await;
         }
     };
     let feed = match dv81_scan(cfg, &plan.demux, cwd, desc, &mut kill_rx).await {
         Dv81Scan::Ready(f) => f,
         Dv81Scan::Fallback(o, why) => {
             fallback(o, why);
-            return run_ffmpeg(cfg, args, cwd, tx, ctl, kill_rx, stdin_rx, None).await;
+            return run_ffmpeg(cfg, &fallback_args, cwd, tx, ctl, kill_rx, stdin_rx, None).await;
         }
         Dv81Scan::Killed => {
             // Fenced/drained/stalled while deciding: nothing ran for Jellyfin, nothing to fall
@@ -908,7 +921,7 @@ async fn run_dv81(
             O::FallbackError,
             format!("converting pipeline exited {code} before the first segment"),
         );
-        return run_ffmpeg(cfg, args, cwd, tx, ctl, kill_rx, stdin_rx, None).await;
+        return run_ffmpeg(cfg, &fallback_args, cwd, tx, ctl, kill_rx, stdin_rx, None).await;
     }
     state.metrics.inc_dv81(O::Converted);
     code

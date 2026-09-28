@@ -577,35 +577,109 @@ pub fn required_output(args: &[String]) -> Option<&'static str> {
 /// literal, adjacent-pair match, not a prefix/substring match, so no other stream-metadata tag can
 /// collide with it by accident.
 pub const DV81_SIGNAL_FLAG: &str = "-metadata:s:v:0";
-pub const DV81_SIGNAL_VALUE: &str = "TC_DV81=1";
+/// The canonical marker value: what the Jellyfin-side decision patch actually emits (jellymesh PR
+/// #3, bug-hunt patch 13).
+pub const DV81_SIGNAL_VALUE: &str = "JELLYMESH_DOVI_P7_TO_81=1";
+/// An accepted alias for `DV81_SIGNAL_VALUE`: the pool's own original marker value, from before
+/// the Jellyfin-side patch settled on its own name. Kept so lab recipes and older argvs built
+/// against the earlier contract keep working; not the value new callers should emit.
+pub const DV81_SIGNAL_VALUE_ALIAS: &str = "TC_DV81=1";
+
+fn is_dv81_signal_value(v: &str) -> bool {
+    v == DV81_SIGNAL_VALUE || v == DV81_SIGNAL_VALUE_ALIAS
+}
 
 /// `true` when the Jellyfin-side decision patch asked for an on-the-fly DV7 -> 8.1 remux (see
-/// `DV81_SIGNAL_FLAG`).
+/// `DV81_SIGNAL_FLAG`; accepts either `DV81_SIGNAL_VALUE` or the `DV81_SIGNAL_VALUE_ALIAS`).
 ///
 /// `render()` passes the signal through untouched; the agent (`job.rs`) acts on it, and must
 /// still confirm the *source* really is DV profile 7 (an ffprobe check -- `probe::source_dovi` --
 /// not this signal alone) before doing anything different: the signal only says what Jellyfin
-/// *wants*, never what the source *is*, so a signal on a DV5/DV8/non-DV source falls through to
-/// the plain remux rather than mislabel it.
+/// *wants*, never what the source *is*, so a signal on a DV5/DV8/non-DV source falls through to a
+/// DV-removed fallback rather than mislabel it (see `add_dv_removal_bsf`).
 pub fn wants_dv81(args: &[String]) -> bool {
     args.windows(2)
-        .any(|w| w[0] == DV81_SIGNAL_FLAG && w[1] == DV81_SIGNAL_VALUE)
+        .any(|w| w[0] == DV81_SIGNAL_FLAG && is_dv81_signal_value(&w[1]))
 }
 
-/// `args` with every `DV81_SIGNAL_FLAG DV81_SIGNAL_VALUE` pair removed (other `-metadata:s:v:0`
-/// values are kept). The agent runs this argv whenever it does not convert, so the fallback is
-/// exactly Jellyfin's plain remux.
+/// `args` with every `DV81_SIGNAL_FLAG <value>` pair removed, for `<value>` either
+/// `DV81_SIGNAL_VALUE` or `DV81_SIGNAL_VALUE_ALIAS` (other `-metadata:s:v:0` values are kept).
+/// Every caller of this also needs `add_dv_removal_bsf` on whatever it runs instead of converting
+/// (see that function's doc comment for why): stripping the marker alone is not enough to make a
+/// fallback safe for the client Jellyfin built this argv for.
 pub fn strip_dv81_signal(args: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
-        if args[i] == DV81_SIGNAL_FLAG && args.get(i + 1).is_some_and(|v| v == DV81_SIGNAL_VALUE) {
+        if args[i] == DV81_SIGNAL_FLAG && args.get(i + 1).is_some_and(|v| is_dv81_signal_value(v)) {
             i += 2;
             continue;
         }
         out.push(args[i].clone());
         i += 1;
     }
+    out
+}
+
+/// ffmpeg's `dovi_rpu` bitstream filter option that strips every Dolby Vision RPU NAL and
+/// configuration record, leaving plain HDR10 (the base layer, which a profile-7/8 source's BL
+/// compatibility guarantees is a valid HDR10 stream on its own). CONFIRMED from source: jellyfin's
+/// own `debian/patches/0061-add-remove-dovi-hdr10plus-bsf.patch` (present at jellyfin-ffmpeg tag
+/// `v8.1.2-5`) adds `remove_dovi` to the `h265_metadata` bsf (ffmpeg's "hevc_metadata"); it deletes
+/// the trailing RPU (`HEVC_NAL_UNSPEC62`) and EL (`HEVC_NAL_UNSPEC63`) units per access unit *and*
+/// removes the `AV_PKT_DATA_DOVI_CONF` coded side data in `h265_metadata_init`, so the output
+/// carries no DOVI record at all -- matching `dv81_plan::without_dovi_strip`'s long-standing
+/// "Jellyfin's HDR10 fallback" bsf. This is a jellyfin-ffmpeg-only Debian patch, not in stock
+/// ffmpeg: MEASURED 2026-09-27, this workstation's stock Fedora ffmpeg 8.1.3 has no such option
+/// (`ffmpeg -h bsf=hevc_metadata` lists none; using it errors `Option 'remove_dovi' not found`).
+/// `job::dv81_it`'s fallback tests probe for the option and skip (not fail) when it is absent, the
+/// same way they skip when `ffmpeg`/`ffprobe`/libx265 are missing.
+pub const DV_REMOVAL_BSF: &str = "hevc_metadata=remove_dovi=1";
+
+/// `args` (a single-output ffmpeg argv, marker already stripped) with `DV_REMOVAL_BSF` merged into
+/// the video bitstream filter chain: appended (comma-joined, never a second `-bsf:v`) to an
+/// existing `-bsf:v`/`-bsf:v:N` value, or inserted as a new `-bsf:v` immediately before the output
+/// path if none exists.
+///
+/// Why every P5 fallback needs this, not just the marker stripped: Jellyfin's decision patch only
+/// emits the marker for a client it already confirmed accepts DV 8.1 *or* HDR10 -- never raw
+/// profile 7. Any path that cannot actually produce a real 8.1 record (the RPU rewrite never ran,
+/// or the source turned out not to be profile 7 at all) must not silently copy whatever DV the
+/// source happens to carry: an untouched profile-7 dual-layer stream is not decodable by a
+/// single-layer-only 8.1 client, and a non-P7 mismatch between Jellyfin's decision and this
+/// agent's own ffprobe is exactly the case a fail-closed policy should not guess about either.
+/// Stripping DV outright always yields the one thing every such client already accepts. Callers:
+/// `job.rs`'s `run_dv81` fallbacks (`dv81_local_fallback_args`-equivalent for the agent) and the
+/// shim's `exec_real` when the pool cannot be reached at all (`crates/shim/src/main.rs`).
+pub fn add_dv_removal_bsf(args: &[String]) -> Vec<String> {
+    let Some((out_path, body)) = args.split_last() else {
+        return args.to_vec();
+    };
+    let mut out: Vec<String> = Vec::with_capacity(args.len() + 2);
+    let mut merged = false;
+    let mut i = 0;
+    while i < body.len() {
+        let a = &body[i];
+        if !merged && (a == "-bsf:v" || a.starts_with("-bsf:v:")) {
+            out.push(a.clone());
+            let existing = body.get(i + 1).cloned().unwrap_or_default();
+            out.push(if existing.is_empty() {
+                DV_REMOVAL_BSF.to_string()
+            } else {
+                format!("{existing},{DV_REMOVAL_BSF}")
+            });
+            merged = true;
+            i += 2;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    if !merged {
+        out.push("-bsf:v".to_string());
+        out.push(DV_REMOVAL_BSF.to_string());
+    }
+    out.push(out_path.clone());
     out
 }
 
@@ -884,6 +958,21 @@ mod tests {
             "-i",
             "file:/media/movies/x.mkv",
             "-metadata:s:v:0",
+            "JELLYMESH_DOVI_P7_TO_81=1",
+            "-codec:v:0",
+            "libx264",
+        ]);
+        assert!(wants_dv81(&a));
+    }
+
+    #[test]
+    fn wants_dv81_also_accepts_the_tc_dv81_alias() {
+        // The pool's original marker value, from before the Jellyfin-side patch settled on its
+        // own name (`DV81_SIGNAL_VALUE_ALIAS`). Lab recipes and older argvs still use it.
+        let a = s(&[
+            "-i",
+            "file:/media/movies/x.mkv",
+            "-metadata:s:v:0",
             "TC_DV81=1",
             "-codec:v:0",
             "libx264",
@@ -894,17 +983,27 @@ mod tests {
     #[test]
     fn wants_dv81_ignores_absence_and_near_misses() {
         assert!(!wants_dv81(&s(&["-i", "x", "-codec:v:0", "libx264"])));
-        // wrong value
+        // wrong value (both the canonical marker and its alias)
+        assert!(!wants_dv81(&s(&[
+            "-metadata:s:v:0",
+            "JELLYMESH_DOVI_P7_TO_81=0"
+        ])));
         assert!(!wants_dv81(&s(&["-metadata:s:v:0", "TC_DV81=0"])));
         // wrong stream index
-        assert!(!wants_dv81(&s(&["-metadata:s:v:1", "TC_DV81=1"])));
+        assert!(!wants_dv81(&s(&[
+            "-metadata:s:v:1",
+            "JELLYMESH_DOVI_P7_TO_81=1"
+        ])));
         // a different metadata key that happens to contain the value string
-        assert!(!wants_dv81(&s(&["-metadata:s:v:0", "title=TC_DV81=1"])));
+        assert!(!wants_dv81(&s(&[
+            "-metadata:s:v:0",
+            "title=JELLYMESH_DOVI_P7_TO_81=1"
+        ])));
         // the two tokens present but not adjacent
         assert!(!wants_dv81(&s(&[
             "-metadata:s:v:0",
             "title=x",
-            "TC_DV81=1"
+            "JELLYMESH_DOVI_P7_TO_81=1"
         ])));
     }
 
@@ -914,7 +1013,7 @@ mod tests {
             "-i",
             "x",
             "-metadata:s:v:0",
-            "TC_DV81=1",
+            "JELLYMESH_DOVI_P7_TO_81=1",
             "-metadata:s:v:0",
             "title=keep",
             "-y",
@@ -938,6 +1037,14 @@ mod tests {
     }
 
     #[test]
+    fn strip_dv81_signal_removes_the_alias_too() {
+        let a = s(&["-i", "x", "-metadata:s:v:0", "TC_DV81=1", "-y", "/t/a.m3u8"]);
+        let stripped = strip_dv81_signal(&a);
+        assert!(!wants_dv81(&stripped));
+        assert_eq!(stripped, s(&["-i", "x", "-y", "/t/a.m3u8"]));
+    }
+
+    #[test]
     fn render_does_not_touch_the_dv81_signal() {
         // render() passes the signal through byte-for-byte like any other metadata option; the
         // agent decides (and strips it) in job.rs.
@@ -945,7 +1052,7 @@ mod tests {
             "-i",
             "x",
             "-metadata:s:v:0",
-            "TC_DV81=1",
+            "JELLYMESH_DOVI_P7_TO_81=1",
             "-codec:v:0",
             "libx264",
             "-f",
@@ -961,5 +1068,108 @@ mod tests {
             wants_dv81(&r.args),
             "the signal must survive render() unchanged"
         );
+    }
+
+    /// A realistic shape of the Jellyfin-side decision patch's actual argv (jellymesh PR #3,
+    /// bug-hunt patch 13): the marker pair can appear anywhere relative to the other output
+    /// options (never assume position), and the argv still carries `-bsf:v hevc_mp4toannexb` and
+    /// a `-map 0:<N>` for video that isn't necessarily stream 0. Stripping must remove only the
+    /// marker pair and leave everything else -- including the bsf and the map -- byte-for-byte.
+    #[test]
+    fn strip_dv81_signal_leaves_a_jellyfin_shaped_argv_otherwise_untouched() {
+        let a = s(&[
+            "-analyzeduration",
+            "200M",
+            "-probesize",
+            "50M",
+            "-f",
+            "mpegts",
+            "-i",
+            "file:/data/media/movies/X/X.ts",
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-map",
+            "0:2",
+            "-map",
+            "0:1",
+            "-codec:v:0",
+            "copy",
+            "-bsf:v",
+            "hevc_mp4toannexb",
+            "-metadata:s:v:0",
+            "JELLYMESH_DOVI_P7_TO_81=1",
+            "-tag:v:0",
+            "hvc1",
+            "-codec:a:0",
+            "libfdk_aac",
+            "-copyts",
+            "-avoid_negative_ts",
+            "disabled",
+            "-f",
+            "hls",
+            "-hls_segment_type",
+            "fmp4",
+            "-hls_fmp4_init_filename",
+            "abc-1.mp4",
+            "-hls_segment_filename",
+            "/transcodes/jf/abc%d.mp4",
+            "-y",
+            "/transcodes/jf/abc.m3u8",
+        ]);
+        assert!(wants_dv81(&a));
+        assert!(is_video_copy(&a));
+        let stripped = strip_dv81_signal(&a);
+        assert!(!wants_dv81(&stripped));
+        let mut expected = a.clone();
+        let i = expected
+            .windows(2)
+            .position(|w| w == ["-metadata:s:v:0", "JELLYMESH_DOVI_P7_TO_81=1"])
+            .unwrap();
+        expected.drain(i..i + 2);
+        assert_eq!(stripped, expected);
+        // The bsf and the non-zero video map both survive stripping unchanged.
+        assert!(stripped
+            .windows(2)
+            .any(|w| w == ["-bsf:v", "hevc_mp4toannexb"]));
+        assert!(stripped.windows(2).any(|w| w == ["-map", "0:2"]));
+    }
+
+    #[test]
+    fn add_dv_removal_bsf_inserts_a_new_flag_before_the_output_when_none_exists() {
+        let a = s(&["-i", "x", "-codec:v:0", "copy", "-y", "/t/a.m3u8"]);
+        let out = add_dv_removal_bsf(&a);
+        assert_eq!(
+            out,
+            s(&[
+                "-i",
+                "x",
+                "-codec:v:0",
+                "copy",
+                "-y",
+                "-bsf:v",
+                DV_REMOVAL_BSF,
+                "/t/a.m3u8"
+            ])
+        );
+    }
+
+    #[test]
+    fn add_dv_removal_bsf_merges_into_an_existing_chain_not_a_second_flag() {
+        let a = s(&["-i", "x", "-bsf:v", "hevc_mp4toannexb", "-y", "/t/a.m3u8"]);
+        let out = add_dv_removal_bsf(&a);
+        assert_eq!(out.iter().filter(|x| *x == "-bsf:v").count(), 1);
+        let i = out.iter().position(|x| x == "-bsf:v").unwrap();
+        assert_eq!(out[i + 1], format!("hevc_mp4toannexb,{DV_REMOVAL_BSF}"));
+        assert_eq!(out.last().unwrap(), "/t/a.m3u8");
+    }
+
+    #[test]
+    fn add_dv_removal_bsf_also_merges_into_a_stream_indexed_chain() {
+        let a = s(&["-i", "x", "-bsf:v:0", "hevc_mp4toannexb", "-y", "/t/a.m3u8"]);
+        let out = add_dv_removal_bsf(&a);
+        let i = out.iter().position(|x| x == "-bsf:v:0").unwrap();
+        assert_eq!(out[i + 1], format!("hevc_mp4toannexb,{DV_REMOVAL_BSF}"));
     }
 }

@@ -26,6 +26,20 @@ fn have_tools() -> bool {
         if p.status.success() && String::from_utf8_lossy(&e.stdout).contains("libx265"))
 }
 
+/// Whether the local `ffmpeg` supports `tcpool_ir::DV_REMOVAL_BSF`
+/// (`hevc_metadata=remove_dovi=1`): a jellyfin-ffmpeg-only Debian patch
+/// (`debian/patches/0061-add-remove-dovi-hdr10plus-bsf.patch`, confirmed present at tag
+/// `v8.1.2-5`), not in stock ffmpeg. The two non-converting fallback tests below exec real ffmpeg
+/// through it, so on a stock build (this workstation's Fedora ffmpeg, MEASURED 2026-09-27: `ffmpeg
+/// -h bsf=hevc_metadata` lists no such option) they skip with a note rather than fail -- same
+/// convention as `have_tools()`. The converting test never takes this path.
+fn have_dv_removal_bsf() -> bool {
+    StdCommand::new("ffmpeg")
+        .args(["-hide_banner", "-h", "bsf=hevc_metadata"])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("remove_dovi"))
+}
+
 fn tmpdir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -129,7 +143,10 @@ fn build_fixture(dir: &Path, inject: bool) -> PathBuf {
     mkv
 }
 
-/// Jellyfin's HLS fmp4 remux shape (video copy, audio transcode, -copyts -start_at_zero).
+/// Jellyfin's HLS fmp4 remux shape (video copy, audio transcode, -copyts -start_at_zero), carrying
+/// the P5 marker pair and `-bsf:v hevc_mp4toannexb` -- the jellymesh PR #3 (bug-hunt patch 13)
+/// argv shape. `run_dv81`/`run_signaled` must strip the marker before running anything, whichever
+/// path (convert or fallback) it takes, and the bsf must survive unstripped.
 fn remux_args(input: &Path, out: &Path, ss: Option<&str>) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     if let Some(t) = ss {
@@ -155,6 +172,10 @@ fn remux_args(input: &Path, out: &Path, ss: Option<&str>) -> Vec<String> {
             "-0:s",
             "-codec:v:0",
             "copy",
+            "-bsf:v",
+            "hevc_mp4toannexb",
+            "-metadata:s:v:0",
+            "JELLYMESH_DOVI_P7_TO_81=1",
             "-tag:v:0",
             "hvc1",
             "-start_at_zero",
@@ -470,21 +491,36 @@ async fn a_dv7_source_without_in_band_rpu_falls_back_to_the_plain_remux() {
         );
         return;
     }
+    if !have_dv_removal_bsf() {
+        eprintln!(
+            "SKIP a_dv7_source_without_in_band_rpu_falls_back: local ffmpeg lacks \
+             hevc_metadata's remove_dovi (jellyfin-ffmpeg only, not stock ffmpeg)"
+        );
+        return;
+    }
     let dir = tmpdir("norpu");
     let src = build_fixture(&dir, false);
     let h = harness();
     let out = dir.join("out");
     std::fs::create_dir_all(&out).unwrap();
     let code = run_signaled(&h, &remux_args(&src, &out, None)).await;
-    assert_eq!(code, 0);
+    let stderr = h.stderr.lock().unwrap().clone();
+    assert_eq!(code, 0, "fallback pipeline failed:\n{stderr}");
     assert_eq!(
         dv81_count(&h, crate::metrics::Dv81Outcome::FallbackNoRpu),
         1
     );
     assert_eq!(dv81_count(&h, crate::metrics::Dv81Outcome::Converted), 0);
-    // The plain remux ran: output exists, still describes the source (profile 7), no RPUs.
+    // The fallback ran with DV removed (`add_dv_removal_bsf`), not a byte-for-byte plain remux:
+    // this client was only ever told "8.1 or HDR10", and the source's real elementary stream has
+    // no in-band RPU to serve as a genuine 8.1 -- so the output must carry no DOVI record at all
+    // (neither the source's stale profile-7 tag nor a fabricated profile 8), and no RPU NAL. Also
+    // no fabricated-config-record warning (the `dovi_rpu`-bsf failure mode PLAN.md warns about on
+    // an `hvcE` source with no in-band RPU -- `add_dv_removal_bsf` doesn't use that bsf, but this
+    // is cheap, real regression coverage that removal, not fabrication, happened).
+    assert!(!stderr.contains("Generating one"), "{stderr}");
     let init = ffprobe(&[p(&out.join("init.mp4"))]);
-    assert!(!init.contains("profile: 8"), "{init}");
+    assert!(!init.contains("DOVI configuration record"), "{init}");
     assert!(!output_nals(&out)
         .iter()
         .any(|n| n.nal_unit_type == RPU_NAL_UNIT_TYPE));
@@ -495,6 +531,13 @@ async fn a_dv7_source_without_in_band_rpu_falls_back_to_the_plain_remux() {
 async fn a_non_dv_source_falls_back_as_not_p7() {
     if !have_tools() {
         eprintln!("SKIP a_non_dv_source_falls_back_as_not_p7: ffmpeg/ffprobe/libx265 missing");
+        return;
+    }
+    if !have_dv_removal_bsf() {
+        eprintln!(
+            "SKIP a_non_dv_source_falls_back_as_not_p7: local ffmpeg lacks hevc_metadata's \
+             remove_dovi (jellyfin-ffmpeg only, not stock ffmpeg)"
+        );
         return;
     }
     let dir = tmpdir("notp7");
@@ -520,11 +563,21 @@ async fn a_non_dv_source_falls_back_as_not_p7() {
     let out = dir.join("out");
     std::fs::create_dir_all(&out).unwrap();
     let code = run_signaled(&h, &remux_args(&src, &out, None)).await;
-    assert_eq!(code, 0);
+    let stderr = h.stderr.lock().unwrap().clone();
+    assert_eq!(code, 0, "fallback failed:\n{stderr}");
     assert_eq!(
         dv81_count(&h, crate::metrics::Dv81Outcome::FallbackNotP7),
         1
     );
     assert!(out.join("init.mp4").exists());
+    // This source has no Dolby Vision configuration record at all (PLAN.md's "(b)" warning:
+    // `dovi_rpu`-bsf on a stream with no config record can fabricate one, "Generating one, but
+    // results may be invalid"). `strip=1` must not trigger that -- it removes rather than reads.
+    assert!(
+        !stderr.contains("Generating one"),
+        "dovi_rpu fabricated a DV config record on a non-DV source:\n{stderr}"
+    );
+    let init = ffprobe(&[p(&out.join("init.mp4"))]);
+    assert!(!init.contains("DOVI configuration record"), "{init}");
     let _ = std::fs::remove_dir_all(&dir);
 }
