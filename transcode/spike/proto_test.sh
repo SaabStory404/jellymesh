@@ -513,6 +513,83 @@ if [ -n "$NATIVE" ]; then
   kill -CONT $(encaff) 2>/dev/null # safety net; the watchdog's SIGKILL should already be gone
 
   kill "$AGAFFA" "$AGAFFB" 2>/dev/null
+
+  # 21: shared transcode dir (docs/SHARED-TRANSCODE.md). A shim that carries JELLYMESH_KEEPALIVE
+  # (patched Jellyfin in shared mode) makes its job detachable: the agent keeps ffmpeg running
+  # when the shim dies with its replica, heartbeats the lease itself, honours a takeover from
+  # another replica's shim (a seek there), and ends + cleans up once the keepalive goes stale.
+  STEM=0123456789abcdef0123456789abcdef
+  STEM2=fedcba9876543210fedcba9876543210
+  mkdir -p "$T/outsh/.jellymesh-alive"
+  KA="$T/outsh/.jellymesh-alive/sess1"
+  KA2="$T/outsh/.jellymesh-alive/sess2"
+  echo playing > "$KA"; echo playing > "$KA2"
+  TC_KIND=cpu TC_NAME=shared TC_FFMPEG=ffmpeg TC_LOG="$T/agent.log" TC_PORT=19921 TC_ORPHAN_IDLE_SECS=4 \
+    $AGENT >> "$T/agent.log" 2>&1 &
+  AGSH=$!
+  listening 19921
+  SH_ARGS=(-re -i "$T/src.mkv" -c:v libx264 -preset ultrafast -force_key_frames "expr:gte(t,n_forced*3)" -f hls
+           -hls_time 3 -hls_list_size 0 -hls_segment_filename "$T/outsh/${STEM}%d.ts" "$T/outsh/${STEM}.m3u8")
+  SH_SEEK=(-re -i "$T/src.mkv" -c:v libx264 -preset ultrafast -force_key_frames "expr:gte(t,n_forced*3)" -f hls
+           -hls_time 3 -hls_list_size 0 -start_number 12 -hls_segment_filename "$T/outsh/${STEM}%d.ts" "$T/outsh/${STEM}.m3u8")
+  SH_ARGS2=(-re -i "$T/src.mkv" -c:v libx264 -preset ultrafast -force_key_frames "expr:gte(t,n_forced*3)" -f hls
+           -hls_time 3 -hls_list_size 0 -hls_segment_filename "$T/outsh/${STEM2}%d.ts" "$T/outsh/${STEM2}.m3u8")
+  encsh() { pgrep -f "ffmpeg -re -i $T/src.mkv.*outsh/$1"; }
+  segs() { ls "$T/outsh" | grep -c "^$1[0-9]*\.ts$"; }
+  lease_age() { echo $(( $(date +%s) - $(stat -c %Y "$T/outsh/$1.tcpool.lock" 2>/dev/null || echo 0) )); }
+  ( while :; do touch "$KA"; sleep 1; done ) &
+  TOUCH=$!
+
+  echo "== 21a: the shim dies mid-stream; its detachable job keeps the same ffmpeg writing"
+  sleep 60 | TC_WORKERS=shared=127.0.0.1:19921 JELLYMESH_KEEPALIVE="$KA" $SHIM "${SH_ARGS[@]}" 2>/dev/null &
+  SHA=$!
+  until [ -e "$T/outsh/${STEM}1.ts" ]; do sleep 0.2; done
+  pid1=$(encsh "$STEM")
+  kill -9 "$SHA"; wait "$SHA" 2>/dev/null
+  sleep 7
+  pid2=$(encsh "$STEM"); n1=$(segs "$STEM"); sleep 4; n2=$(segs "$STEM")
+  same=no; [ -n "$pid1" ] && [ "$pid1" = "$pid2" ] && same=yes
+  grow=no; [ "$n2" -gt "$n1" ] && grow=yes
+  fresh=no; [ "$(lease_age "$STEM")" -le 3 ] && fresh=yes
+  echo "shared: detached same_ffmpeg=$same growing=$grow lease_fresh=$fresh"
+
+  echo "== 21b: another replica's shim seeks the same output: takes it over from the orphan"
+  ( sleep 6; printf q ) | TC_WORKERS=shared=127.0.0.1:19921 JELLYMESH_KEEPALIVE="$KA" timeout 40 $SHIM "${SH_SEEK[@]}" 2>/dev/null
+  code=$?
+  old=gone; kill -0 "$pid1" 2>/dev/null && old=running
+  seek=no; [ -e "$T/outsh/${STEM}12.ts" ] && seek=yes
+  took=$(grep -c "took output .*${STEM}.m3u8 over from another replica" "$T/shim.log")
+  echo "shared: takeover exit=$code old_ffmpeg=$old seek_segment=$seek took_over_logged=$took"
+  kill "$TOUCH" 2>/dev/null
+
+  echo "== 21c: attached holder taken over: the old shim exits 0 and leaves the new writer's files"
+  rm -f "$T/outsh/${STEM}"*
+  ( while :; do touch "$KA"; sleep 1; done ) &
+  TOUCH=$!
+  sleep 60 | TC_WORKERS=shared=127.0.0.1:19921 JELLYMESH_KEEPALIVE="$KA" timeout 50 $SHIM "${SH_ARGS[@]}" 2>/dev/null &
+  SHA=$!
+  until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done
+  ( sleep 6; printf q ) | TC_WORKERS=shared=127.0.0.1:19921 JELLYMESH_KEEPALIVE="$KA" timeout 40 $SHIM "${SH_SEEK[@]}" 2>/dev/null &
+  SHB=$!
+  wait "$SHA"; codea=$?
+  wait "$SHB"; codeb=$?
+  kept=no; [ -e "$T/outsh/${STEM}12.ts" ] && kept=yes
+  echo "shared: attached-takeover old_exit=$codea new_exit=$codeb seek_segment=$kept"
+  kill "$TOUCH" 2>/dev/null
+
+  echo "== 21d: detached and nobody touches the keepalive: ffmpeg ends, outputs are removed"
+  sleep 60 | TC_WORKERS=shared=127.0.0.1:19921 JELLYMESH_KEEPALIVE="$KA2" $SHIM "${SH_ARGS2[@]}" 2>/dev/null &
+  SHC=$!
+  until [ -e "$T/outsh/${STEM2}0.ts" ]; do sleep 0.2; done
+  kill -9 "$SHC"; wait "$SHC" 2>/dev/null
+  t0=$SECONDS
+  while encsh "$STEM2" >/dev/null && [ $((SECONDS - t0)) -lt 20 ]; do sleep 0.5; done
+  gone=no; encsh "$STEM2" >/dev/null || gone=yes
+  sleep 1
+  left=$(ls "$T/outsh" | grep -c "^$STEM2")
+  ka=present; [ -e "$KA2" ] || ka=removed
+  echo "shared: orphan-expired ffmpeg_gone=$gone after=$((SECONDS - t0))s files_left=$left keepalive=$ka"
+  kill "$AGSH" 2>/dev/null
 fi
 
 sleep 1

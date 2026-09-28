@@ -51,6 +51,17 @@ pub struct Config {
     /// Units of capacity reserved exclusively for PLAYBACK bursts; BATCH admission never eats
     /// into this even when it's currently unused.
     pub batch_headroom: f64,
+    /// Shared transcode dir (docs/SHARED-TRANSCODE.md): keep a PLAYBACK job whose shim went away
+    /// running while its keepalive is fresh (`TC_DETACH`, default on; only jobs whose shim sent a
+    /// `keepalive_path` are eligible, so old shims keep fence-on-loss).
+    pub detach: bool,
+    /// A detached job ends after this long without a keepalive touch (`TC_ORPHAN_IDLE_SECS`).
+    pub orphan_idle: Duration,
+    /// ... or this long when the last touch said the client was paused (`TC_ORPHAN_PAUSED_SECS`).
+    pub orphan_paused: Duration,
+    /// Hard cap on how long a detached job (or its post-exit cleanup wait) lives
+    /// (`TC_ORPHAN_MAX_SECS`).
+    pub orphan_max: Duration,
 }
 
 fn env(name: &str, default: &str) -> String {
@@ -187,6 +198,11 @@ impl Config {
             batch_weight: env_f64("TC_BATCH_WEIGHT", 1.0),
             accept_batch: env_bool("TC_ACCEPT_BATCH", true),
             batch_headroom: env_f64("TC_BATCH_HEADROOM", 0.0),
+            detach: env_bool("TC_DETACH", true),
+            // Match Jellyfin's own kill timer (60 s HLS, 180 s paused with bughunt patch 02).
+            orphan_idle: Duration::from_secs_f64(env_f64("TC_ORPHAN_IDLE_SECS", 60.0)),
+            orphan_paused: Duration::from_secs_f64(env_f64("TC_ORPHAN_PAUSED_SECS", 180.0)),
+            orphan_max: Duration::from_secs_f64(env_f64("TC_ORPHAN_MAX_SECS", 6.0 * 3600.0)),
         })
     }
 
@@ -218,6 +234,10 @@ impl Config {
             batch_weight: 1.0,
             accept_batch: true,
             batch_headroom: 0.0,
+            detach: true,
+            orphan_idle: Duration::from_secs(60),
+            orphan_paused: Duration::from_secs(180),
+            orphan_max: Duration::from_secs(6 * 3600),
         }
     }
 

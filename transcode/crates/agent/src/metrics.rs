@@ -34,10 +34,17 @@ pub enum Outcome {
     Preempted,
     /// A BATCH job was admitted (counted in addition to, not instead of, `Accepted`).
     BatchAccepted,
+    /// Shared transcode dir: a PLAYBACK job's shim went away and the job kept running (counted
+    /// in addition to the job's final outcome).
+    Detached,
+    /// A job ended because another replica's shim took its output over (a seek there).
+    TakenOver,
+    /// A detached job ended because its session keepalive went stale (the viewer is gone).
+    OrphanExpired,
 }
 
 impl Outcome {
-    pub const ALL: [Outcome; 12] = [
+    pub const ALL: [Outcome; 15] = [
         Outcome::Accepted,
         Outcome::Busy,
         Outcome::RefusedPolicy,
@@ -50,6 +57,9 @@ impl Outcome {
         Outcome::BusyHeadroom,
         Outcome::Preempted,
         Outcome::BatchAccepted,
+        Outcome::Detached,
+        Outcome::TakenOver,
+        Outcome::OrphanExpired,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -66,6 +76,9 @@ impl Outcome {
             Outcome::BusyHeadroom => "busy_headroom",
             Outcome::Preempted => "preempted",
             Outcome::BatchAccepted => "batch_accepted",
+            Outcome::Detached => "detached",
+            Outcome::TakenOver => "taken_over",
+            Outcome::OrphanExpired => "orphan_expired",
         }
     }
 }

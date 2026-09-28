@@ -250,6 +250,7 @@ fn harness() -> Harness {
         ended: std::sync::Mutex::new(None),
         state: state.clone(),
         job_id: 1,
+        detach: None,
     });
     let (tx, mut rx) = mpsc::channel::<Result<ServerMsg, Status>>(1024);
     let stderr = Arc::new(std::sync::Mutex::new(String::new()));

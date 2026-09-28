@@ -31,12 +31,7 @@ pub enum Acquire {
 }
 
 pub fn lease_path(playlist: &str) -> PathBuf {
-    let p = Path::new(playlist);
-    let stem = p
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    p.with_file_name(format!("{stem}.tcpool.lock"))
+    tcpool_ir::shared::lease_path(playlist)
 }
 
 fn age(path: &Path) -> Option<Duration> {
@@ -111,6 +106,44 @@ impl Lease {
     }
 }
 
+/// Shared transcode dir: ask the current holder's agent to stop (a `<stem>.tcpool.takeover` file
+/// naming the holder's token, written atomically), then acquire once the lease is freed. `None`
+/// when the holder did not let go within `wait` (e.g. an agent without takeover support) or the
+/// lease dir is unusable; the caller then follows as before.
+pub async fn take_over(playlist: &str, wait: Duration) -> Option<Lease> {
+    let lock = lease_path(playlist);
+    let req = tcpool_ir::shared::takeover_path(playlist);
+    let holder = match fs::read_to_string(&lock) {
+        Ok(h) => h,
+        // Gone between our O_EXCL attempt and now: just try again.
+        Err(_) => {
+            return match try_acquire(playlist) {
+                Acquire::Held(l) => Some(l),
+                _ => None,
+            }
+        }
+    };
+    let tmp = PathBuf::from(format!("{}.{}.tmp", req.display(), std::process::id()));
+    if fs::write(&tmp, holder.as_bytes()).is_err() || fs::rename(&tmp, &req).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return None;
+    }
+    let deadline = std::time::Instant::now() + wait;
+    let got = loop {
+        match try_acquire(playlist) {
+            Acquire::Held(l) => break Some(l),
+            Acquire::Unavailable(_) => break None,
+            Acquire::Busy if std::time::Instant::now() >= deadline => break None,
+            Acquire::Busy => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    };
+    // Withdraw the request only if it is still ours (a later takeover may have replaced it).
+    if fs::read_to_string(&req).is_ok_and(|t| t == holder) {
+        let _ = fs::remove_file(&req);
+    }
+    got
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +160,53 @@ mod tests {
         assert!(matches!(try_acquire(&pl), Acquire::Busy));
         a.release();
         assert!(matches!(try_acquire(&pl), Acquire::Held(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn take_over_waits_for_the_holder_to_let_go() {
+        let dir = std::env::temp_dir().join(format!("tcpool-takeover-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pl = dir.join("0123456789abcdef0123456789abcdef.m3u8");
+        let pl = pl.to_string_lossy().into_owned();
+        let a = match try_acquire(&pl) {
+            Acquire::Held(l) => l,
+            _ => panic!("first acquire"),
+        };
+        let req = tcpool_ir::shared::takeover_path(&pl);
+        // A fake agent: when the request names the holder's token, free the lease.
+        let (req2, tok) = (req.clone(), a.token.clone());
+        let holder = std::thread::spawn(move || {
+            for _ in 0..50 {
+                if fs::read_to_string(&req2).is_ok_and(|t| t == tok) {
+                    a.release();
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        });
+        let b = take_over(&pl, Duration::from_secs(5)).await;
+        assert!(holder.join().unwrap(), "holder saw the request");
+        assert!(b.is_some(), "took the lease over");
+        assert!(!req.exists(), "request withdrawn after success");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn take_over_gives_up_on_a_holder_that_never_answers() {
+        let dir = std::env::temp_dir().join(format!("tcpool-takeover2-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pl = dir.join("0123456789abcdef0123456789abcdef.m3u8");
+        let pl = pl.to_string_lossy().into_owned();
+        let _a = match try_acquire(&pl) {
+            Acquire::Held(l) => l,
+            _ => panic!("first acquire"),
+        };
+        let t0 = std::time::Instant::now();
+        assert!(take_over(&pl, Duration::from_millis(600)).await.is_none());
+        assert!(t0.elapsed() >= Duration::from_millis(600));
+        assert!(!tcpool_ir::shared::takeover_path(&pl).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }
