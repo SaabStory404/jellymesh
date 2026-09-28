@@ -1,0 +1,44 @@
+card,codec,title,out_res,cap_mbps,mode,variant,bv_kbps,maxrate_kbps,delivered_kbps,pct_of_maxrate,vmaf,vmaf_min,psnr_y,ssim,notes
+tesla-p4-nvenc,h264,sample-b,1080p,0,calibrated,-,7200,8000,7858,98.2,89.53,77.87,42.93,0.9888,P5.1 render() output
+tesla-p4-nvenc,h264,sample-b,1080p,0,legacy,-,0,0,8027,0.0,90.19,83.34,43.10,0.9903,legacy render() output (TC_RC=legacy)
+tesla-p4-nvenc,h264,sample-b,1080p,4,calibrated,-,3600,4000,3865,96.6,87.29,72.67,42.27,0.9851,P5.1 render() output
+tesla-p4-nvenc,h264,sample-b,1080p,60,calibrated,p5,57000,60000,51551,85.9,95.13,93.20,47.39,0.9980,P5 render (no ladder) for comparison
+tesla-p4-nvenc,h264,sample-b,1080p,60,calibrated,-,7200,60000,7874,13.1,89.43,77.98,42.93,0.9887,P5.1 render() output
+tesla-p4-nvenc,h264,sample-b,720p,0,calibrated,-,4050,4500,4384,97.4,92.32,83.48,42.90,0.9829,P5.1 render() output
+tesla-p4-nvenc,h264,sample-b,720p,0,legacy,-,0,0,3602,0.0,92.38,86.43,42.95,0.9832,legacy render() output (TC_RC=legacy)
+tesla-p4-nvenc,h264,sample-b,720p,4,calibrated,-,3600,4000,3894,97.3,91.97,82.34,42.83,0.9823,P5.1 render() output
+tesla-p4-nvenc,h264,sample-b,720p,60,calibrated,-,4050,60000,4389,7.3,92.32,83.07,42.90,0.9829,P5.1 render() output
+tesla-p4-nvenc,h264,sample-c,1080p,0,calibrated,-,7200,8000,7485,93.6,96.01,88.12,41.94,0.9955,P5.1 render() output
+tesla-p4-nvenc,h264,sample-c,1080p,4,calibrated,-,3600,4000,3740,93.5,94.87,85.30,41.48,0.9942,P5.1 render() output
+tesla-p4-nvenc,h264,sample-c,1080p,60,calibrated,-,7200,60000,7495,12.5,96.00,88.03,41.94,0.9955,P5.1 render() output
+tesla-p4-nvenc,hevc,sample-b,1080p,0,calibrated,-,5760,6400,6162,96.3,89.45,81.36,43.11,0.9899,P5.1 render() output
+tesla-p4-nvenc,hevc,sample-b,1080p,0,legacy,-,0,0,2832,0.0,87.84,76.71,42.52,0.9869,legacy render() output (TC_RC=legacy)
+tesla-p4-nvenc,hevc,sample-b,1080p,4,calibrated,-,3600,4000,3938,98.4,88.48,78.31,42.72,0.9880,P5.1 render() output
+tesla-p4-nvenc,hevc,sample-b,1080p,60,calibrated,p5,57000,60000,51149,85.2,94.47,92.40,47.60,0.9979,P5 render (no ladder) for comparison
+tesla-p4-nvenc,hevc,sample-b,1080p,60,calibrated,-,5760,60000,6210,10.3,89.47,80.07,43.12,0.9899,P5.1 render() output
+arc-a380-qsv,h264,sample-b,1080p,0,calibrated,-,7600,8000,7555,94.4,89.80,77.80,43.02,0.9891,P5.1 render() output
+arc-a380-qsv,h264,sample-b,1080p,0,legacy,-,0,0,2571,0.0,86.71,70.87,42.05,0.9844,legacy render() output (TC_RC=legacy)
+arc-a380-qsv,h264,sample-b,1080p,4,calibrated,-,3800,4000,3767,94.2,88.08,74.23,42.44,0.9863,P5.1 render() output
+arc-a380-qsv,h264,sample-b,1080p,60,calibrated,p5,57000,60000,55811,93.0,95.45,93.57,48.05,0.9982,P5 render (no ladder) for comparison
+arc-a380-qsv,h264,sample-b,1080p,60,calibrated,-,7600,60000,7560,12.6,89.81,77.80,43.02,0.9892,P5.1 render() output
+arc-a380-qsv,h264,sample-b,720p,0,calibrated,-,4275,4500,4257,94.6,92.65,82.63,43.21,0.9839,P5.1 render() output
+arc-a380-qsv,h264,sample-b,720p,0,legacy,-,0,0,1428,0.0,90.33,75.35,42.66,0.9805,legacy render() output (TC_RC=legacy)
+arc-a380-qsv,h264,sample-b,720p,4,calibrated,-,3800,4000,3796,94.9,92.46,82.90,43.15,0.9835,P5.1 render() output
+arc-a380-qsv,h264,sample-b,720p,60,calibrated,-,4275,60000,4256,7.1,92.66,82.74,43.21,0.9839,P5.1 render() output
+arc-a380-qsv,h264,sample-c,1080p,0,calibrated,-,7600,8000,7681,96.0,93.40,84.25,33.85,0.9879,P5.1 render() output
+arc-a380-qsv,h264,sample-c,1080p,4,calibrated,-,3800,4000,3843,96.1,92.14,82.13,33.81,0.9867,P5.1 render() output
+arc-a380-qsv,h264,sample-c,1080p,60,calibrated,-,7600,60000,7682,12.8,93.42,85.59,33.86,0.9879,P5.1 render() output
+arc-a380-qsv,hevc,sample-b,1080p,0,calibrated,-,6080,6400,6032,94.3,90.41,78.38,43.26,0.9902,P5.1 render() output
+arc-a380-qsv,hevc,sample-b,1080p,0,legacy,-,0,0,576,0.0,83.10,66.24,41.75,0.9814,legacy render() output (TC_RC=legacy)
+arc-a380-qsv,hevc,sample-b,1080p,4,calibrated,-,3800,4000,3766,94.1,89.27,77.09,42.82,0.9881,P5.1 render() output
+arc-a380-qsv,hevc,sample-b,1080p,60,calibrated,p5,57000,60000,55822,93.0,95.88,94.11,48.26,0.9983,P5 render (no ladder) for comparison
+arc-a380-qsv,hevc,sample-b,1080p,60,calibrated,-,6080,60000,6034,10.1,90.42,78.38,43.26,0.9902,P5.1 render() output
+tesla-p4-nvenc,h264,sample-b,1080p,60,calibrated,nv95,7600,60000,8183,13.6,,,,,rejected: NVENC at 95% (delivered only; not scored)
+tesla-p4-nvenc,h264,sample-b,1080p,4,calibrated,nv95,3800,4000,3989,99.7,,,,,rejected: NVENC at 95% (delivered only; not scored)
+tesla-p4-nvenc,h264,sample-b,1080p,0,calibrated,nv95,7600,8000,8055,100.7,,,,,rejected: NVENC at 95% (delivered only; not scored)
+tesla-p4-nvenc,hevc,sample-b,1080p,60,calibrated,nv95,6080,60000,6492,10.8,,,,,rejected: NVENC at 95% (delivered only; not scored)
+tesla-p4-nvenc,hevc,sample-b,1080p,4,calibrated,nv95,3800,4000,4054,101.3,,,,,rejected: NVENC at 95% (delivered only; not scored)
+tesla-p4-nvenc,hevc,sample-b,1080p,0,calibrated,nv95,6080,6400,6454,100.9,,,,,rejected: NVENC at 95% (delivered only; not scored)
+tesla-p4-nvenc,h264,sample-b,720p,60,calibrated,nv95,4275,60000,4587,7.6,,,,,rejected: NVENC at 95% (delivered only; not scored)
+tesla-p4-nvenc,h264,sample-b,720p,4,calibrated,nv95,3800,4000,4030,100.8,,,,,rejected: NVENC at 95% (delivered only; not scored)
+tesla-p4-nvenc,h264,sample-b,720p,0,calibrated,nv95,4275,4500,4523,100.5,,,,,rejected: NVENC at 95% (delivered only; not scored)

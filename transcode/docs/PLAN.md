@@ -431,6 +431,11 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
       delivered Arc 94.1-96.6% of the cap (never over; was 7-22%), P4 93.7-102.4%; Arc +0.83..+1.49
       VMAF over today's mapping at equal bitrate. NVENC `-cq` hybrid rejected (25-60% of the cap) and
       NVENC AQ dropped (lower VMAF, missed ±1.5).
+- [x] P5.1 bitrate ladder (2026-09-28, calibration/README.md "P5.1"): target = min(cap, rung) per output
+      codec/size/rate, so a 61.6M LAN cap no longer yields ~58 Mbit/s at 1080p; `-maxrate 0` gets the
+      rung as calibrated VBR instead of the Arc's CQP. NVENC target 90% (P4 overshoots its `-b:v` 7-9%).
+      MEASURED sample-b 1080p h264/hevc + 720p h264 at 60M/4M/0: 4M under the cap on both cards
+      (93.5-98.4%), Arc-P4 within +0.27..+0.96 VMAF.
 - [ ] Preset scaling by headroom (concurrency at `medium`/`p5` not yet measured); tone-map choice per
       card (vaapi/cuda/opencl/libplacebo by metrics) -- P5 run: sample-c Arc-P4 gap -2.3..-2.8 VMAF
       with Arc PSNR ~8 dB lower at equal bitrate = `tonemap_vaapi`

@@ -258,6 +258,93 @@ playback tier (P0: 0.18–0.59x realtime at `slow`).
 Not re-measured here: throughput/concurrency at `medium`/`p5` (single-job cost is P0's, INHERITED),
 preset scaling, HEVC 10-bit.
 
+## P5.1: bitrate ladder (2026-09-28)
+
+**Why.** Jellyfin's `-maxrate` is the *client's* max bitrate, not a quality choice. MEASURED in prod
+(Jellyfin FFmpeg logs, 2026-09-28): real clients send `-maxrate 61599184 -bufsize 123198368`, so P5
+targeted ~58 Mbit/s for a 1080p stream (overfills LAN clients; a remote client whose cap is its real
+bandwidth gets no headroom). Requests without PlaybackInfo send `-maxrate 0 -bufsize 0`, which P5
+left on the legacy quality target (on the Arc: cap-blind CQP).
+
+**What.** `crates/ir/src/ladder.rs` + `apply_rate_control`:
+- target `-b:v` = `pct x min(cap, rung)`; `pct` = **95 QSV, 90 NVENC** (below); Jellyfin's
+  `-maxrate`/`-bufsize` are kept as the ceiling.
+- `-maxrate 0` / no `-maxrate`: `-maxrate rung -bufsize 2 x rung` + the same target, i.e. exactly a
+  calibrated request capped at the rung. `TC_RC=legacy` restores the P1 mapping for all of it.
+- The output size comes from Jellyfin's `scale=` (width bound `min(max(iw,ih*a),W)`, dual bound,
+  `-1:H`, fixed) resolved against the source size/rate from the agent's admission ffprobe (the same
+  single call that sets the job weight, now `width,height,avg_frame_rate`). Class = 16:9-equivalent
+  height (`max(h, w*9/16)`, so scope 1920x800 is 1080p). No probe: the scale bound (an upper bound);
+  nothing at all: the top rung.
+
+| class | h264 rung | hevc rung (also 10-bit) | basis |
+|---|---|---|---|
+| 360p | 1.5M | 1.2M | INHERITED: 1080p x (pixels ratio)^0.75 |
+| 480p | 2.5M | 2.0M | INHERITED, same |
+| 720p | 4.5M | 3.6M | INHERITED, same; lab-checked below |
+| **1080p** | **8M** | **6.4M** | **MEASURED** (below) |
+| 1440p | 12M | 9.6M | INHERITED |
+| 2160p | 22M | 17.6M | INHERITED |
+| > 32 fps | x 1.5 | x 1.5 | INHERITED |
+
+- **1080p h264 = 8M** (P5 rows, Arc): 3->8M buys +1.84 / +2.51 VMAF (sample-a / sample-b), 8->15M
+  +0.71 / +1.85 for almost twice the bits: 0.37-0.50 VMAF per Mbit below 8M, 0.10-0.26 above.
+- **hevc = 0.8 x h264**: the hevc bitrate matching each h264 8M score (interpolated between the hevc 3M
+  and 8M rows) is 0.86 / 0.69 of the h264 bitrate on the Arc and 0.89 / 0.76 on the P4 (sample-a /
+  sample-b), mean 0.80. The lab run confirms it: hevc at its rung scores 90.41 (Arc) / 89.45 (P4)
+  against h264 at its rung 89.80 / 89.53.
+
+### Lab check (MEASURED 2026-09-28, `2026-09-28-p51.csv`)
+
+Same excerpt/reference/metric as P5 (20 s from t=1200 s, lanczos CPU reference per output size,
+libvmaf `vmaf_v0.6.1`). argv = real `render()` with the probe's source hint, run with jellyfin-ffmpeg
+8.1.2 on `tc-worker-qsv` / `tc-worker-nv`; sample-b = 3840x1620 23.976 fps SDR (so 1080p output is
+1920x810), sample-c = 4K DV/HDR10 (tone-map-confounded, not in the ±1.5 claim). Sample-a is still
+gone from the lab.
+
+**LAN-like cap 60M no longer overfills; remote-like 4M stays under the cap** (sample-b, kbps / % of
+`-maxrate` / VMAF):
+
+| codec | out | cap | Arc delivered | Arc VMAF | P4 delivered | P4 VMAF | Arc − P4 | ±1.5 |
+|---|---|---|---|---|---|---|---|---|
+| h264 | 1080p | 60M, P5 (no ladder) | 55811 / 93.0% | 95.45 | 51551 / 85.9% | 95.13 | +0.32 | pass |
+| h264 | 1080p | 60M | **7560** / 12.6% | 89.81 | **7874** / 13.1% | 89.43 | +0.38 | pass |
+| h264 | 1080p | 4M | 3767 / **94.2%** | 88.08 | 3865 / **96.6%** | 87.29 | +0.79 | pass |
+| h264 | 1080p | 0 (none) | 7555 / 94.4% | 89.80 | 7858 / 98.2% | 89.53 | +0.27 | pass |
+| hevc | 1080p | 60M, P5 (no ladder) | 55822 / 93.0% | 95.88 | 51149 / 85.2% | 94.47 | +1.41 | pass |
+| hevc | 1080p | 60M | **6034** / 10.1% | 90.42 | **6210** / 10.3% | 89.47 | +0.95 | pass |
+| hevc | 1080p | 4M | 3766 / **94.1%** | 89.27 | 3938 / **98.4%** | 88.48 | +0.79 | pass |
+| hevc | 1080p | 0 (none) | 6032 / 94.3% | 90.41 | 6162 / 96.3% | 89.45 | +0.96 | pass |
+| h264 | 720p | 60M | **4256** / 7.1% | 92.66 | **4389** / 7.3% | 92.32 | +0.34 | pass |
+| h264 | 720p | 4M | 3796 / **94.9%** | 92.46 | 3894 / **97.3%** | 91.97 | +0.49 | pass |
+| h264 | 720p | 0 (none) | 4257 / 94.6% | 92.65 | 4384 / 97.4% | 92.32 | +0.33 | pass |
+| h264 | 1080p sample-c | 60M / 4M / 0 | 7682 / 3843 (96.1%) / 7681 | 93.42 / 92.14 / 93.40 | 7495 / 3740 (93.5%) / 7485 | 96.00 / 94.87 / 96.01 | −2.6 to −2.7 | tone map (known) |
+
+- **Every 4M row is under the cap on both cards** (Arc 94.1-96.1%, P4 93.5-98.4%). The ladder does
+  not touch this case (95%/90% of the cap, as P5 on the Arc).
+- **The cost of the ladder at 60M is real and deliberate:** 1080p h264 drops from 95.45 to 89.81 VMAF
+  (Arc) for 7.4x fewer bits; this 4K-web source is the hardest title in the set (sample-a was 97.3 at
+  8M in P5). If LAN quality matters more than bandwidth, raise the 1080p rung; the table is one
+  constant.
+- **NVENC target 90%, not 95% (MEASURED, P4 only).** The P4 delivers 7-9% above its `-b:v` (8183 kbps
+  for 7600, 6492 for 6080, 4587 for 4275 in this run). At 95% a binding 4M cap came out at **99.7-101.3%**
+  (h264 1080p 3989, hevc 4054, h264 720p 4030 kbps); at 90% it is 96.6-98.4%, and the P4 now delivers
+  within 4% of the Arc at every rung. An 85% variant (3691 / 3701 kbps at 720p h264 / 1080p hevc,
+  VMAF 91.86 / 88.36) cost 0.1 VMAF for no cap benefit and is not shipped. The 95% rows are in the CSV
+  as `nv95` (delivered only). This supersedes the NVENC `0.95*cap` in the P5 table above.
+
+**`-maxrate 0`: ladder VBR instead of the legacy quality target** (sample-b, kbps / VMAF):
+
+| codec | out | Arc legacy | Arc P5.1 | P4 legacy | P4 P5.1 | Arc − P4 legacy / P5.1 |
+|---|---|---|---|---|---|---|
+| h264 | 1080p | 2571 / 86.71 | 7555 / 89.80 (+3.09) | 8027 / 90.19 | 7858 / 89.53 (−0.66) | **−3.48** / +0.27 |
+| hevc | 1080p | 576 / 83.10 | 6032 / 90.41 (+7.31) | 2832 / 87.84 | 6162 / 89.45 (+1.61) | **−4.74** / +0.96 |
+| h264 | 720p | 1428 / 90.33 | 4257 / 92.65 (+2.32) | 3602 / 92.38 | 4384 / 92.32 (−0.06) | **−2.05** / +0.33 |
+
+Legacy under-delivers on the Arc (576 kbps for 1080p hevc) and puts the cards 2-5 VMAF apart; the
+ladder puts both at the rung and within 1 VMAF. The P4 gives up up to 0.66 VMAF at 1080p h264 against
+its own `-cq 23` at equal bits (the same trade P5 measured at 8M).
+
 
 ## Startup latency
 
