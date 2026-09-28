@@ -23,6 +23,9 @@ pub struct Config {
     /// Operator restriction on the probed outputs (never an addition).
     pub outputs_allow: Option<Vec<String>>,
     pub gpu_filters: bool,
+    /// TC_RC=calibrated|legacy (default calibrated): P5 per-encoder rate control, or the P1 parity
+    /// mapping as a per-card rollback without a rebuild.
+    pub rate_control: tcpool_ir::RateControl,
     /// Upper bounds for Jellyfin's `-probesize`/`-analyzeduration` (bytes, microseconds); None = off.
     pub probe_clamp: Option<(u64, u64)>,
     /// Kill ffmpeg after this long without a client message (must stay below the shim's 6 s).
@@ -51,6 +54,29 @@ pub struct Config {
     /// Units of capacity reserved exclusively for PLAYBACK bursts; BATCH admission never eats
     /// into this even when it's currently unused.
     pub batch_headroom: f64,
+    /// Shared transcode dir (docs/SHARED-TRANSCODE.md): keep a PLAYBACK job whose shim went away
+    /// running while its keepalive is fresh (`TC_DETACH`, default on; only jobs whose shim sent a
+    /// `keepalive_path` are eligible, so old shims keep fence-on-loss).
+    pub detach: bool,
+    /// A detached job ends after this long without a keepalive touch (`TC_ORPHAN_IDLE_SECS`).
+    pub orphan_idle: Duration,
+    /// ... or this long when the last touch said the client was paused (`TC_ORPHAN_PAUSED_SECS`).
+    pub orphan_paused: Duration,
+    /// Hard cap on how long a detached job (or its post-exit cleanup wait) lives
+    /// (`TC_ORPHAN_MAX_SECS`).
+    pub orphan_max: Duration,
+    /// Detached-job throttle (`tcpool_ir::shared::orphan_throttle`): pause ffmpeg once its output
+    /// leads the viewer's last requested segment by more than `TC_ORPHAN_LEAD_MAX_SECS` (60, the
+    /// same lead Jellyfin's own throttler allows; 0 = never throttle), resume below
+    /// `TC_ORPHAN_LEAD_RESUME_SECS` (30), and treat a `playing` viewer's position older than
+    /// `TC_ORPHAN_POS_STALE_SECS` (60) as unknown (unthrottled).
+    pub orphan_throttle: tcpool_ir::shared::ThrottleLimits,
+}
+
+/// A non-negative duration in seconds from the environment (negative or NaN -> 0).
+fn secs(name: &str, default: f64) -> Duration {
+    let v = env_f64(name, default);
+    Duration::from_secs_f64(if v.is_finite() && v > 0.0 { v } else { 0.0 })
 }
 
 fn env(name: &str, default: &str) -> String {
@@ -147,6 +173,11 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .map(|v| v.split(',').map(str::to_string).collect()),
             gpu_filters: env("TC_HW_FILTERS", "1") != "0",
+            rate_control: {
+                let v = env("TC_RC", "calibrated");
+                tcpool_ir::RateControl::parse(&v)
+                    .ok_or_else(|| format!("TC_RC={v}: want calibrated|legacy"))?
+            },
             // TC_PROBE_CLAMP="probesize,analyzeduration" (ffmpeg size syntax), "0" = off. See
             // tcpool_ir::clamp_probe for why the default is 50M,5M.
             probe_clamp: {
@@ -187,6 +218,16 @@ impl Config {
             batch_weight: env_f64("TC_BATCH_WEIGHT", 1.0),
             accept_batch: env_bool("TC_ACCEPT_BATCH", true),
             batch_headroom: env_f64("TC_BATCH_HEADROOM", 0.0),
+            detach: env_bool("TC_DETACH", true),
+            // Match Jellyfin's own kill timer (60 s HLS, 180 s paused with bughunt patch 02).
+            orphan_idle: Duration::from_secs_f64(env_f64("TC_ORPHAN_IDLE_SECS", 60.0)),
+            orphan_paused: Duration::from_secs_f64(env_f64("TC_ORPHAN_PAUSED_SECS", 180.0)),
+            orphan_max: Duration::from_secs_f64(env_f64("TC_ORPHAN_MAX_SECS", 6.0 * 3600.0)),
+            orphan_throttle: tcpool_ir::shared::ThrottleLimits {
+                lead_max: secs("TC_ORPHAN_LEAD_MAX_SECS", 60.0),
+                lead_resume: secs("TC_ORPHAN_LEAD_RESUME_SECS", 30.0),
+                pos_stale: secs("TC_ORPHAN_POS_STALE_SECS", 60.0),
+            },
         })
     }
 
@@ -208,6 +249,7 @@ impl Config {
             weight_copy: 1.0,
             outputs_allow: None,
             gpu_filters: false,
+            rate_control: tcpool_ir::RateControl::Calibrated,
             probe_clamp: None,
             fence_after: Duration::from_secs(3),
             stall_after: Duration::from_secs(20),
@@ -218,6 +260,15 @@ impl Config {
             batch_weight: 1.0,
             accept_batch: true,
             batch_headroom: 0.0,
+            detach: true,
+            orphan_idle: Duration::from_secs(60),
+            orphan_paused: Duration::from_secs(180),
+            orphan_max: Duration::from_secs(6 * 3600),
+            orphan_throttle: tcpool_ir::shared::ThrottleLimits {
+                lead_max: Duration::from_secs(60),
+                lead_resume: Duration::from_secs(30),
+                pos_stale: Duration::from_secs(60),
+            },
         }
     }
 

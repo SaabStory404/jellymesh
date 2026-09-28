@@ -164,6 +164,7 @@ async fn probe_gpu_tonemap(cfg: &Config, init: &[String]) -> bool {
         &TranslateOpts {
             pathmap: vec![],
             gpu_filters: true,
+            ..Default::default()
         },
     );
     let mut run = s(&["-hide_banner", "-v", "error"]);

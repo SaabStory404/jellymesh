@@ -2,6 +2,7 @@
 //! resolution-weighted capacity, and runs jellyfin-ffmpeg adapted to the card.
 
 mod config;
+mod detach;
 mod dv81;
 mod dv81_plan;
 mod dv81_ts;

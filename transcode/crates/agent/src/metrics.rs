@@ -34,10 +34,17 @@ pub enum Outcome {
     Preempted,
     /// A BATCH job was admitted (counted in addition to, not instead of, `Accepted`).
     BatchAccepted,
+    /// Shared transcode dir: a PLAYBACK job's shim went away and the job kept running (counted
+    /// in addition to the job's final outcome).
+    Detached,
+    /// A job ended because another replica's shim took its output over (a seek there).
+    TakenOver,
+    /// A detached job ended because its session keepalive went stale (the viewer is gone).
+    OrphanExpired,
 }
 
 impl Outcome {
-    pub const ALL: [Outcome; 12] = [
+    pub const ALL: [Outcome; 15] = [
         Outcome::Accepted,
         Outcome::Busy,
         Outcome::RefusedPolicy,
@@ -50,6 +57,9 @@ impl Outcome {
         Outcome::BusyHeadroom,
         Outcome::Preempted,
         Outcome::BatchAccepted,
+        Outcome::Detached,
+        Outcome::TakenOver,
+        Outcome::OrphanExpired,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -66,6 +76,9 @@ impl Outcome {
             Outcome::BusyHeadroom => "busy_headroom",
             Outcome::Preempted => "preempted",
             Outcome::BatchAccepted => "batch_accepted",
+            Outcome::Detached => "detached",
+            Outcome::TakenOver => "taken_over",
+            Outcome::OrphanExpired => "orphan_expired",
         }
     }
 }
@@ -141,6 +154,42 @@ pub struct Metrics {
     /// job id -> last observed `speed=` factor, while the job is running and not paused.
     job_speed: Mutex<HashMap<u64, f64>>,
     next_job_id: AtomicU64,
+    /// Detached jobs the agent currently holds paused (shared transcode dir throttle).
+    orphans_paused: AtomicU64,
+}
+
+/// Counts one detached job in `tcpool_orphans_paused` while `set(true)`; Drop releases it, so an
+/// aborted watcher task never leaves the gauge high.
+pub struct OrphanPausedGuard {
+    state: std::sync::Arc<crate::State>,
+    counted: bool,
+}
+
+impl OrphanPausedGuard {
+    pub fn new(state: std::sync::Arc<crate::State>) -> Self {
+        OrphanPausedGuard {
+            state,
+            counted: false,
+        }
+    }
+
+    pub fn set(&mut self, paused: bool) {
+        if paused != self.counted {
+            let g = &self.state.metrics.orphans_paused;
+            if paused {
+                g.fetch_add(1, Ordering::Relaxed);
+            } else {
+                g.fetch_sub(1, Ordering::Relaxed);
+            }
+            self.counted = paused;
+        }
+    }
+}
+
+impl Drop for OrphanPausedGuard {
+    fn drop(&mut self) {
+        self.set(false);
+    }
 }
 
 /// How a job that carried the P5 DV7 -> 8.1 signal ended up (`tcpool_dv81_total`). Exactly one
@@ -186,6 +235,7 @@ impl Default for Metrics {
             job_seconds: Histogram::new(&DURATION_BUCKETS),
             job_speed: Mutex::new(HashMap::new()),
             next_job_id: AtomicU64::new(1),
+            orphans_paused: AtomicU64::new(0),
         }
     }
 }
@@ -378,6 +428,13 @@ pub fn render(state: &State) -> String {
         out,
         "tcpool_draining{{{labels}}} {}",
         *state.drain.borrow() as u8
+    );
+
+    let _ = writeln!(out, "# TYPE tcpool_orphans_paused gauge");
+    let _ = writeln!(
+        out,
+        "tcpool_orphans_paused{{{labels}}} {}",
+        state.metrics.orphans_paused.load(Ordering::Relaxed)
     );
 
     let _ = writeln!(out, "# TYPE tcpool_build_info gauge");

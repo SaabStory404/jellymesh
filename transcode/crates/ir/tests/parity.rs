@@ -31,6 +31,7 @@ fn translation_matches_spike_for_every_backend() {
         let opts = TranslateOpts {
             pathmap: vec![],
             gpu_filters: true,
+            ..Default::default()
         };
         for (n, r) in rows.iter().enumerate() {
             let t = translate(&r.input, backend, &opts);

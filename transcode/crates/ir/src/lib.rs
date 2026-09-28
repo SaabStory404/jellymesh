@@ -7,6 +7,7 @@
 //! (`corpus/goldens/spike-translate.json`); deliberate improvements come after, as golden updates.
 
 pub mod filters;
+pub mod shared;
 pub mod validate;
 
 use std::fmt;
@@ -117,6 +118,32 @@ pub struct TranslateOpts {
     pub pathmap: Vec<(String, String)>,
     /// Keep scale/tonemap on the GPU when the chain is translatable.
     pub gpu_filters: bool,
+    /// Rate-control mapping `render()` applies on top of the parity translation.
+    pub rate_control: RateControl,
+}
+
+/// How `render()` maps Jellyfin's `-crf` + `-maxrate`/`-bufsize` onto a hardware encoder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RateControl {
+    /// P5: bitrate-targeted rate control per encoder from the calibration
+    /// (`calibration/README.md`), so the delivered bitrate tracks the client's cap and the two
+    /// cards land at the same quality. See `apply_rate_control`.
+    #[default]
+    Calibrated,
+    /// The P1 parity mapping: `-crf N` -> `-global_quality N` (QSV, which the iHD driver runs as
+    /// CQP: cap-blind, 16-22% of the cap MEASURED) / `-cq N` (NVENC). Rollback only.
+    Legacy,
+}
+
+impl RateControl {
+    /// `calibrated` | `legacy` (the agent's `TC_RC`).
+    pub fn parse(s: &str) -> Option<RateControl> {
+        match s {
+            "calibrated" => Some(RateControl::Calibrated),
+            "legacy" => Some(RateControl::Legacy),
+            _ => None,
+        }
+    }
 }
 
 /// Result of translating one command line for one backend.
@@ -266,6 +293,7 @@ pub fn is_video_copy(args: &[String]) -> bool {
 ///    stale-sized segment over the shared NFS scratch (seen once: `Content-Length mismatch
 ///    8404992 of 8388608` on a stream copy).
 /// 2. Stream copies get no hardware decode and no forced-IDR option (nothing is decoded).
+/// 3. With `RateControl::Calibrated` (the default), `apply_rate_control` (P5).
 pub fn render(args: &[String], backend: Backend, o: &TranslateOpts) -> Translated {
     let mut t = if is_video_copy(args) {
         Translated {
@@ -273,10 +301,133 @@ pub fn render(args: &[String], backend: Backend, o: &TranslateOpts) -> Translate
             gpu_filters: false,
         }
     } else {
-        translate(args, backend, o)
+        let mut t = translate(args, backend, o);
+        if o.rate_control == RateControl::Calibrated {
+            apply_rate_control(&mut t.args, backend);
+        }
+        t
     };
     add_hls_flag(&mut t.args, "temp_file");
     t
+}
+
+/// Target average bitrate as a percentage of the client's cap (`-maxrate`). Both cards were
+/// calibrated at 95% (MEASURED P0: Arc 94-97% delivered, never over; P4 96-105%).
+pub const RC_TARGET_PCT: u64 = 95;
+/// Calibrated preset per backend (calibration README recommendation). Single-job cost vs the old
+/// `veryfast`/`p2` (MEASURED P0, min over titles at 8M): Arc 11.5x vs 11.1x realtime, P4 4.48x vs
+/// 4.56x.
+pub const QSV_PRESET: &str = "medium";
+pub const NVENC_PRESET: &str = "p5";
+
+/// Encoder options that follow the bitrate target. Only options the driver was MEASURED to honour
+/// (calibration README, "What the drivers actually accept"):
+/// - `h264_qsv` gets **no `-look_ahead_depth`**: it SIGSEGVs jellyfin-ffmpeg on the Arc every time.
+/// - `-adaptive_i`/`-adaptive_b` are silently dropped by QSV, so they are never emitted.
+/// - `hevc_nvenc` on Pascal rejects `-temporal-aq` and `-b_ref_mode middle`.
+/// - NVENC gets **no `-spatial-aq`/`-temporal-aq`** (P5 lab, MEASURED): with AQ the P4 scored
+///   0.7-1.8 VMAF lower at the same delivered bitrate on the 4K SDR title and missed the ±1.5
+///   cross-card target there (h264 3M +2.66, hevc 8M +1.93); without AQ every SDR rung is within
+///   ±1.26 of the Arc.
+fn rc_options(encoder: &str) -> Option<&'static [&'static str]> {
+    Some(match encoder {
+        "h264_qsv" => &["-extbrc", "1"],
+        "hevc_qsv" => &[
+            "-extbrc",
+            "1",
+            "-look_ahead_depth",
+            "40",
+            "-b_strategy",
+            "1",
+        ],
+        "h264_nvenc" => &[
+            "-rc",
+            "vbr",
+            "-tune",
+            "hq",
+            "-multipass",
+            "fullres",
+            "-b_ref_mode",
+            "middle",
+        ],
+        "hevc_nvenc" => &["-rc", "vbr", "-tune", "hq", "-multipass", "fullres"],
+        _ => return None,
+    })
+}
+
+/// `a` is option `base`, bare or with a stream specifier (`-maxrate`, `-maxrate:v:0`).
+fn is_opt(a: &str, base: &str) -> bool {
+    a == base || a.strip_prefix(base).is_some_and(|s| s.starts_with(':'))
+}
+
+/// P5 rate control, applied to `translate()`'s output for a GPU backend.
+///
+/// Jellyfin's `-crf N -maxrate cap -bufsize 2cap` became `-global_quality N` (QSV) / `-cq N`
+/// (NVENC) in the parity translation. On the Arc that is CQP, which ignores the cap (MEASURED P0:
+/// 16-22% of the cap, VMAF 87 at 8 Mbps, identical at every rung). This replaces the quality
+/// target with a bitrate target of `RC_TARGET_PCT`% of `-maxrate`, keeps Jellyfin's
+/// `-maxrate`/`-bufsize` exactly (clients depend on them), adds `rc_options`, and sets the
+/// calibrated preset.
+///
+/// Unchanged: the CPU backend (libx264/libx265 CRF + VBV already honours the cap; the
+/// calibration's `-preset slow` CPU anchor runs 0.18-0.59x realtime, so it is not a playback
+/// setting), commands without `-maxrate` (no cap to track), stream copies, and encoders with no
+/// calibration (AV1). An existing `-b:v` is kept.
+pub fn apply_rate_control(args: &mut Vec<String>, backend: Backend) {
+    let quality = match backend {
+        Backend::Qsv => "-global_quality",
+        Backend::Nvenc => "-cq",
+        Backend::Cpu => return,
+    };
+    let Some(enc_at) = args.iter().position(|a| is_video_codec_flag(a)) else {
+        return;
+    };
+    let Some(opts) = args.get(enc_at + 1).and_then(|e| rc_options(e)) else {
+        return;
+    };
+    let Some(cap) = args
+        .iter()
+        .position(|a| is_opt(a, "-maxrate"))
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| parse_size(v))
+        .filter(|c| *c > 0)
+    else {
+        return;
+    };
+    let mut set: Vec<String> = Vec::with_capacity(opts.len() + 2);
+    if !args.iter().any(|a| is_opt(a, "-b:v") || a == "-vb") {
+        set.push("-b:v".into());
+        set.push((cap.saturating_mul(RC_TARGET_PCT) / 100).to_string());
+    }
+    set.extend(opts.iter().map(|s| s.to_string()));
+    // The quality target goes; the rate-control set takes its slot (else follows -maxrate's value).
+    let at = match args.iter().position(|a| is_opt(a, quality)) {
+        Some(q) => {
+            args.drain(q..(q + 2).min(args.len()));
+            q
+        }
+        None => args
+            .iter()
+            .position(|a| is_opt(a, "-maxrate"))
+            .map_or(args.len(), |m| (m + 2).min(args.len())),
+    };
+    args.splice(at..at, set);
+    let preset = if backend == Backend::Qsv {
+        QSV_PRESET
+    } else {
+        NVENC_PRESET
+    };
+    match args.iter().position(|a| is_opt(a, "-preset")) {
+        Some(p) if p + 1 < args.len() => args[p + 1] = preset.to_string(),
+        _ => {
+            let enc_at = args
+                .iter()
+                .position(|a| is_video_codec_flag(a))
+                .unwrap_or(0);
+            let at = (enc_at + 2).min(args.len());
+            args.splice(at..at, ["-preset".to_string(), preset.to_string()]);
+        }
+    }
 }
 
 /// Add `flag` to `-hls_flags`, or insert `-hls_flags flag` just before the output playlist.
@@ -1163,6 +1314,280 @@ mod tests {
         let i = out.iter().position(|x| x == "-bsf:v").unwrap();
         assert_eq!(out[i + 1], format!("hevc_mp4toannexb,{DV_REMOVAL_BSF}"));
         assert_eq!(out.last().unwrap(), "/t/a.m3u8");
+    }
+
+    /// Jellyfin's software-mode HLS command for `enc` at an 8 Mbps cap (lab-sw.tsv shape).
+    fn jf_rc(enc: &str) -> Vec<String> {
+        let crf = if enc == "libx264" { "23" } else { "28" };
+        s(&[
+            "-i",
+            "/media/x.mkv",
+            "-map",
+            "0:0",
+            "-codec:v:0",
+            enc,
+            "-preset",
+            "veryfast",
+            "-crf",
+            crf,
+            "-maxrate",
+            "8000000",
+            "-bufsize",
+            "16000000",
+            "-force_key_frames:0",
+            "expr:gte(t,n_forced*3)",
+            "-vf",
+            "scale=1920:-2,format=yuv420p",
+            "-f",
+            "hls",
+            "-hls_segment_filename",
+            "/transcodes/a%d.ts",
+            "-y",
+            "/transcodes/a.m3u8",
+        ])
+    }
+
+    fn render_rc(args: &[String], b: Backend, rc: RateControl) -> Vec<String> {
+        render(
+            args,
+            b,
+            &TranslateOpts {
+                rate_control: rc,
+                ..Default::default()
+            },
+        )
+        .args
+    }
+
+    /// The video encoder's options: from the codec flag up to `-force_key_frames:0`.
+    fn enc_opts(out: &[String]) -> Vec<String> {
+        let a = out.iter().position(|x| x == "-codec:v:0").unwrap();
+        let b = out.iter().position(|x| x == "-force_key_frames:0").unwrap();
+        out[a..b].to_vec()
+    }
+
+    #[test]
+    fn calibrated_rate_control_per_encoder_matches_the_calibration_table() {
+        let cases: [(&str, Backend, &[&str]); 4] = [
+            (
+                "libx264",
+                Backend::Qsv,
+                &[
+                    "-codec:v:0",
+                    "h264_qsv",
+                    "-forced_idr",
+                    "1",
+                    "-preset",
+                    "medium",
+                    "-b:v",
+                    "7600000",
+                    "-extbrc",
+                    "1",
+                    "-maxrate",
+                    "8000000",
+                    "-bufsize",
+                    "16000000",
+                ],
+            ),
+            (
+                "libx265",
+                Backend::Qsv,
+                &[
+                    "-codec:v:0",
+                    "hevc_qsv",
+                    "-forced_idr",
+                    "1",
+                    "-preset",
+                    "medium",
+                    "-b:v",
+                    "7600000",
+                    "-extbrc",
+                    "1",
+                    "-look_ahead_depth",
+                    "40",
+                    "-b_strategy",
+                    "1",
+                    "-maxrate",
+                    "8000000",
+                    "-bufsize",
+                    "16000000",
+                ],
+            ),
+            (
+                "libx264",
+                Backend::Nvenc,
+                &[
+                    "-codec:v:0",
+                    "h264_nvenc",
+                    "-forced-idr",
+                    "1",
+                    "-preset",
+                    "p5",
+                    "-b:v",
+                    "7600000",
+                    "-rc",
+                    "vbr",
+                    "-tune",
+                    "hq",
+                    "-multipass",
+                    "fullres",
+                    "-b_ref_mode",
+                    "middle",
+                    "-maxrate",
+                    "8000000",
+                    "-bufsize",
+                    "16000000",
+                ],
+            ),
+            (
+                "libx265",
+                Backend::Nvenc,
+                &[
+                    "-codec:v:0",
+                    "hevc_nvenc",
+                    "-forced-idr",
+                    "1",
+                    "-preset",
+                    "p5",
+                    "-b:v",
+                    "7600000",
+                    "-rc",
+                    "vbr",
+                    "-tune",
+                    "hq",
+                    "-multipass",
+                    "fullres",
+                    "-maxrate",
+                    "8000000",
+                    "-bufsize",
+                    "16000000",
+                ],
+            ),
+        ];
+        for (enc, b, want) in cases {
+            let out = render_rc(&jf_rc(enc), b, RateControl::Calibrated);
+            assert_eq!(enc_opts(&out), s(want), "{enc} on {b}");
+            assert!(
+                !out.iter().any(|x| x == "-global_quality" || x == "-cq"),
+                "{enc} on {b}: quality target left in {out:?}"
+            );
+            // the rest of the command is untouched: same tail as the legacy render
+            let legacy = render_rc(&jf_rc(enc), b, RateControl::Legacy);
+            let tail = |v: &[String]| {
+                let i = v.iter().position(|x| x == "-force_key_frames:0").unwrap();
+                v[i..].to_vec()
+            };
+            assert_eq!(tail(&out), tail(&legacy));
+        }
+    }
+
+    #[test]
+    fn h264_qsv_never_gets_look_ahead_depth_and_hevc_nvenc_never_gets_pascal_rejects() {
+        for rc in [RateControl::Calibrated, RateControl::Legacy] {
+            let q = render_rc(&jf_rc("libx264"), Backend::Qsv, rc);
+            assert!(!q.iter().any(|x| x.starts_with("-look_ahead")), "{q:?}");
+            let n = render_rc(&jf_rc("libx265"), Backend::Nvenc, rc);
+            assert!(
+                !n.iter().any(|x| x == "-temporal-aq" || x == "-b_ref_mode"),
+                "{n:?}"
+            );
+            for out in [&q, &n] {
+                assert!(!out.iter().any(|x| x == "-adaptive_i" || x == "-adaptive_b"));
+            }
+            // AQ measured worse on VMAF and cross-card consistency (rc_options' doc).
+            let h = render_rc(&jf_rc("libx264"), Backend::Nvenc, rc);
+            for out in [&n, &h] {
+                assert!(!out.iter().any(|x| x.ends_with("-aq")), "{out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_rate_control_is_the_parity_translation_byte_for_byte() {
+        for enc in ["libx264", "libx265"] {
+            for b in [Backend::Qsv, Backend::Nvenc, Backend::Cpu] {
+                let a = jf_rc(enc);
+                let mut want = translate(&a, b, &TranslateOpts::default()).args;
+                add_hls_flag(&mut want, "temp_file");
+                assert_eq!(render_rc(&a, b, RateControl::Legacy), want, "{enc} {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn calibrated_leaves_cpu_copy_uncapped_and_av1_alone() {
+        for rc in [RateControl::Calibrated, RateControl::Legacy] {
+            // CPU: Jellyfin's own x264/x265 CRF+VBV already honours the cap.
+            let a = jf_rc("libx264");
+            assert_eq!(
+                render_rc(&a, Backend::Cpu, RateControl::Calibrated),
+                render_rc(&a, Backend::Cpu, RateControl::Legacy)
+            );
+            // Stream copy.
+            let c = s(&["-i", "x", "-codec:v:0", "copy", "-f", "hls", "/t/a.m3u8"]);
+            for b in [Backend::Qsv, Backend::Nvenc] {
+                assert_eq!(render_rc(&c, b, rc), render_rc(&c, b, RateControl::Legacy));
+            }
+        }
+        // No -maxrate (no cap to track), or an uncalibrated encoder (AV1): the parity
+        // translation, including its preset, stands.
+        let mut no_cap = Vec::new();
+        for enc in ["libx264", "libx265"] {
+            let mut a = jf_rc(enc);
+            let i = a.iter().position(|x| x == "-maxrate").unwrap();
+            a.drain(i..i + 4); // -maxrate N -bufsize N
+            no_cap.push((enc, a));
+        }
+        no_cap.push(("libsvtav1", jf_rc("libsvtav1")));
+        for (enc, a) in no_cap {
+            for b in [Backend::Qsv, Backend::Nvenc] {
+                assert_eq!(
+                    render_rc(&a, b, RateControl::Calibrated),
+                    render_rc(&a, b, RateControl::Legacy),
+                    "{enc} {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn calibrated_keeps_an_existing_bitrate_and_inserts_a_missing_preset() {
+        let mut a = jf_rc("libx264");
+        // Jellyfin's bitrate form: -b:v instead of -crf, no -preset.
+        let i = a.iter().position(|x| x == "-preset").unwrap();
+        a.splice(i..i + 4, s(&["-b:v", "5000000"]));
+        let out = render_rc(&a, Backend::Qsv, RateControl::Calibrated);
+        assert_eq!(out.iter().filter(|x| *x == "-b:v").count(), 1);
+        let bv = out.iter().position(|x| x == "-b:v").unwrap();
+        assert_eq!(out[bv + 1], "5000000");
+        let p = out.iter().position(|x| x == "-preset").unwrap();
+        assert_eq!(out[p + 1], QSV_PRESET);
+        let m = out.iter().position(|x| x == "-maxrate").unwrap();
+        assert_eq!(&out[m + 2..m + 4], &s(&["-extbrc", "1"])[..]);
+        assert_eq!(RateControl::parse("legacy"), Some(RateControl::Legacy));
+        assert_eq!(
+            RateControl::parse("calibrated"),
+            Some(RateControl::Calibrated)
+        );
+        assert_eq!(RateControl::parse("cq"), None);
+        assert_eq!(RateControl::default(), RateControl::Calibrated);
+    }
+
+    #[test]
+    fn calibrated_output_passes_the_allowlist_unchanged() {
+        // Every new option takes a value, so validate()'s structural scan accepts them with no
+        // allowlist change; pin that for every calibrated encoder.
+        let p = validate::Policy::default();
+        for enc in ["libx264", "libx265"] {
+            for b in [Backend::Qsv, Backend::Nvenc] {
+                let out = render_rc(&jf_rc(enc), b, RateControl::Calibrated);
+                assert_eq!(
+                    validate::validate(&out, &p, Shape::Hls),
+                    Ok(()),
+                    "{enc} {b}"
+                );
+            }
+        }
     }
 
     #[test]

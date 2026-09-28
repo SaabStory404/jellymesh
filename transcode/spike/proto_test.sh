@@ -513,6 +513,162 @@ if [ -n "$NATIVE" ]; then
   kill -CONT $(encaff) 2>/dev/null # safety net; the watchdog's SIGKILL should already be gone
 
   kill "$AGAFFA" "$AGAFFB" 2>/dev/null
+
+  # 21: shared transcode dir (docs/SHARED-TRANSCODE.md). A shim that carries JELLYMESH_KEEPALIVE
+  # (patched Jellyfin in shared mode) makes its job detachable: the agent keeps ffmpeg running
+  # when the shim dies with its replica, heartbeats the lease itself, honours a takeover from
+  # another replica's shim (a seek there), and ends + cleans up once the keepalive goes stale.
+  STEM=0123456789abcdef0123456789abcdef
+  STEM2=fedcba9876543210fedcba9876543210
+  mkdir -p "$T/outsh/.jellymesh-alive"
+  KA="$T/outsh/.jellymesh-alive/sess1"
+  KA2="$T/outsh/.jellymesh-alive/sess2"
+  echo playing > "$KA"; echo playing > "$KA2"
+  TC_KIND=cpu TC_NAME=shared TC_FFMPEG=ffmpeg TC_LOG="$T/agent.log" TC_PORT=19921 TC_ORPHAN_IDLE_SECS=4 \
+    $AGENT >> "$T/agent.log" 2>&1 &
+  AGSH=$!
+  listening 19921
+  SH_ARGS=(-re -i "$T/src.mkv" -c:v libx264 -preset ultrafast -force_key_frames "expr:gte(t,n_forced*3)" -f hls
+           -hls_time 3 -hls_list_size 0 -hls_segment_filename "$T/outsh/${STEM}%d.ts" "$T/outsh/${STEM}.m3u8")
+  SH_SEEK=(-re -i "$T/src.mkv" -c:v libx264 -preset ultrafast -force_key_frames "expr:gte(t,n_forced*3)" -f hls
+           -hls_time 3 -hls_list_size 0 -start_number 12 -hls_segment_filename "$T/outsh/${STEM}%d.ts" "$T/outsh/${STEM}.m3u8")
+  SH_ARGS2=(-re -i "$T/src.mkv" -c:v libx264 -preset ultrafast -force_key_frames "expr:gte(t,n_forced*3)" -f hls
+           -hls_time 3 -hls_list_size 0 -hls_segment_filename "$T/outsh/${STEM2}%d.ts" "$T/outsh/${STEM2}.m3u8")
+  encsh() { pgrep -f "^ffmpeg .*src.mkv.*outsh/$1"; }
+  segs() { ls "$T/outsh" | grep -c "^$1[0-9]*\.ts$"; }
+  lease_age() { echo $(( $(date +%s) - $(stat -c %Y "$T/outsh/$1.tcpool.lock" 2>/dev/null || echo 0) )); }
+  ( while :; do touch "$KA"; sleep 1; done ) &
+  TOUCH=$!
+
+  echo "== 21a: the shim dies mid-stream; its detachable job keeps the same ffmpeg writing"
+  sleep 60 | TC_WORKERS=shared=127.0.0.1:19921 JELLYMESH_KEEPALIVE="$KA" $SHIM "${SH_ARGS[@]}" 2>/dev/null &
+  SHA=$!
+  until [ -e "$T/outsh/${STEM}1.ts" ]; do sleep 0.2; done
+  pid1=$(encsh "$STEM")
+  # no `wait`: bash would wait for the whole `sleep 60 | shim` pipeline job
+  kill -9 "$SHA"
+  sleep 7
+  pid2=$(encsh "$STEM"); n1=$(segs "$STEM"); sleep 4; n2=$(segs "$STEM")
+  same=no; [ -n "$pid1" ] && [ "$pid1" = "$pid2" ] && same=yes
+  grow=no; [ "$n2" -gt "$n1" ] && grow=yes
+  fresh=no; [ "$(lease_age "$STEM")" -le 3 ] && fresh=yes
+  echo "shared: detached same_ffmpeg=$same growing=$grow lease_fresh=$fresh (pids $pid1/$pid2 segs $n1->$n2 lease_age $(lease_age "$STEM")s)"
+
+  echo "== 21b: another replica's shim seeks the same output: takes it over from the orphan"
+  ( sleep 6; printf q ) | TC_WORKERS=shared=127.0.0.1:19921 JELLYMESH_KEEPALIVE="$KA" timeout 40 $SHIM "${SH_SEEK[@]}" 2>/dev/null
+  code=$?
+  old=gone; kill -0 "$pid1" 2>/dev/null && old=running
+  seek=no; [ -e "$T/outsh/${STEM}12.ts" ] && seek=yes
+  took=$(grep -c "took output .*${STEM}.m3u8 over from another replica" "$T/shim.log")
+  echo "shared: takeover exit=$code old_ffmpeg=$old seek_segment=$seek took_over_logged=$took"
+  kill "$TOUCH" 2>/dev/null
+
+  echo "== 21c: attached holder taken over: the old shim exits 0 and leaves the new writer's files"
+  rm -f "$T/outsh/${STEM}"*
+  ( while :; do touch "$KA"; sleep 1; done ) &
+  TOUCH=$!
+  sleep 60 | TC_WORKERS=shared=127.0.0.1:19921 JELLYMESH_KEEPALIVE="$KA" timeout 50 $SHIM "${SH_ARGS[@]}" 2>/dev/null &
+  SHA=$!
+  until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done
+  ( sleep 6; printf q ) | TC_WORKERS=shared=127.0.0.1:19921 JELLYMESH_KEEPALIVE="$KA" timeout 40 $SHIM "${SH_SEEK[@]}" 2>/dev/null &
+  SHB=$!
+  wait "$SHA"; codea=$?
+  wait "$SHB"; codeb=$?
+  kept=no; [ -e "$T/outsh/${STEM}12.ts" ] && kept=yes
+  echo "shared: attached-takeover old_exit=$codea new_exit=$codeb seek_segment=$kept"
+  kill "$TOUCH" 2>/dev/null
+
+  echo "== 21d: detached and nobody touches the keepalive: ffmpeg ends, outputs are removed"
+  sleep 60 | TC_WORKERS=shared=127.0.0.1:19921 JELLYMESH_KEEPALIVE="$KA2" $SHIM "${SH_ARGS2[@]}" 2>/dev/null &
+  SHC=$!
+  until [ -e "$T/outsh/${STEM2}0.ts" ]; do sleep 0.2; done
+  kill -9 "$SHC"
+  t0=$SECONDS
+  while encsh "$STEM2" >/dev/null && [ $((SECONDS - t0)) -lt 20 ]; do sleep 0.5; done
+  gone=no; encsh "$STEM2" >/dev/null || gone=yes
+  sleep 1
+  left=$(ls "$T/outsh" | grep -c "^$STEM2")
+  ka=present; [ -e "$KA2" ] || ka=removed
+  echo "shared: orphan-expired ffmpeg_gone=$gone after=$((SECONDS - t0))s files_left=$left keepalive=$ka"
+  echo "== 21e: a throttler-paused job whose shim dies is resumed (u) by the agent"
+  # Stock ffmpeg has no p/u keys (case 11 fakes the pause with SIGSTOP), so this checks the key
+  # stream itself: a wrapper records what the agent writes to ffmpeg's stdin, then runs ffmpeg.
+  mkdir -p "$T/keys"
+  printf '#!/bin/sh\nexec 3<&0\n( cat <&3 > "%s/keys/$$" ) &\nexec ffmpeg "$@" < /dev/null\n' "$T" > "$T/ff-keys"
+  chmod +x "$T/ff-keys"
+  TC_KIND=cpu TC_NAME=keys TC_FFMPEG="$T/ff-keys" TC_LOG="$T/agent.log" TC_PORT=19922 TC_ORPHAN_IDLE_SECS=4 \
+    $AGENT >> "$T/agent.log" 2>&1 &
+  AGK=$!
+  listening 19922
+  rm -f "$T/outsh/${STEM}"*
+  ( while :; do touch "$KA"; sleep 1; done ) &
+  TOUCH=$!
+  ( until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done; printf p; sleep 60 ) \
+    | TC_WORKERS=keys=127.0.0.1:19922 JELLYMESH_KEEPALIVE="$KA" $SHIM "${SH_ARGS[@]}" 2>/dev/null &
+  SHK=$!
+  until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done
+  sleep 2
+  kill -9 "$SHK"
+  sleep 3
+  resumed=$(grep -l '^pu$' "$T"/keys/* 2>/dev/null | wc -l)
+  kill "$TOUCH" 2>/dev/null
+  echo "shared: paused-detach keys_pu=$resumed detach_logged=$(grep -c 'detaching: ffmpeg keeps writing' "$T/agent.log")"
+  kill "$AGK" 2>/dev/null
+
+  echo "== 21f: a detached job throttles itself against the viewer's position (<keepalive>.seg)"
+  # The wrapper turns the agent's p/u keys into SIGSTOP/SIGCONT (stock ffmpeg has no p/u; the
+  # jellyfin-ffmpeg the agents run does), so the segment lead is real, not just the key stream.
+  # Limits scaled down: pause above 6 s (2 segments) ahead, resume below 4 s, position stale 5 s.
+  mkdir -p "$T/keys2"
+  printf '#!/bin/bash\nexec 3<&0\n( while IFS= read -r -n1 k <&3; do printf %%s "$k" >> "%s/keys2/$$"; case "$k" in p) kill -STOP $$;; u) kill -CONT $$;; esac; done ) &\nexec ffmpeg "$@" < /dev/null\n' "$T" > "$T/ff-stop"
+  chmod +x "$T/ff-stop"
+  TC_KIND=cpu TC_NAME=thr TC_FFMPEG="$T/ff-stop" TC_LOG="$T/agent.log" TC_PORT=19923 TC_ORPHAN_IDLE_SECS=4 \
+    TC_ORPHAN_LEAD_MAX_SECS=6 TC_ORPHAN_LEAD_RESUME_SECS=4 TC_ORPHAN_POS_STALE_SECS=5 \
+    $AGENT >> "$T/agent.log" 2>&1 &
+  AGT=$!
+  listening 19923
+  rm -f "$T/outsh/${STEM}"*
+  SEGF="$KA.seg"
+  echo 0 > "$SEGF"
+  newest() { grep -v '^#' "$T/outsh/${STEM}.m3u8" 2>/dev/null | tail -1 | sed -E "s/^${STEM}([0-9]+)\.ts$/\1/"; }
+  keys2() { cat "$T"/keys2/* 2>/dev/null; }
+  ( while :; do touch "$KA"; sleep 1; done ) &
+  TOUCH=$!
+  ( while :; do touch "$SEGF"; sleep 1; done ) &
+  SEGT=$!
+  sleep 60 | TC_WORKERS=thr=127.0.0.1:19923 JELLYMESH_KEEPALIVE="$KA" $SHIM "${SH_ARGS[@]}" 2>/dev/null &
+  SHT=$!
+  until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done
+  kill -9 "$SHT"
+  # viewer parked at segment 0: the job pauses once the output is > 2 segments ahead
+  t0=$SECONDS
+  until [ "$(keys2)" = p ] || [ $((SECONDS - t0)) -gt 30 ]; do sleep 0.5; done
+  sleep 1; n1=$(newest); sleep 6; n2=$(newest)
+  bounded=no; [ -n "$n1" ] && [ "$n1" = "$n2" ] && [ "$n2" -le 4 ] && bounded=yes
+  # the viewer catches up: resume, then pause again once > 2 segments ahead of it
+  kill "$SEGT"; echo "$n2" > "$SEGF"
+  ( while :; do touch "$SEGF"; sleep 1; done ) &
+  SEGT=$!
+  t0=$SECONDS
+  until [ "$(keys2)" = pup ] || [ $((SECONDS - t0)) -gt 30 ]; do sleep 0.5; done
+  sleep 1; n3=$(newest)
+  repaused=no; [ "$(keys2)" = pup ] && [ "$n3" -gt "$n2" ] && [ $((n3 - n2)) -le 4 ] && repaused=yes
+  # position goes stale while the keepalive still says playing: unknown -> unthrottled (u)
+  kill "$SEGT"
+  t0=$SECONDS
+  until [ "$(keys2)" = pupu ] || [ $((SECONDS - t0)) -gt 20 ]; do sleep 0.5; done
+  stale=$((SECONDS - t0))
+  sleep 4; n4=$(newest)
+  runs=no; [ -n "$n4" ] && [ "$n4" -gt "$n3" ] && runs=yes
+  gauge=$(grep -c "resuming ffmpeg (newest segment [0-9]*, viewer at $n2, lead unknown)" "$T/agent.log")
+  # viewer gone: expires and removes the sidecar with the keepalive
+  kill "$TOUCH"
+  t0=$SECONDS
+  while [ -e "$SEGF" ] && [ $((SECONDS - t0)) -lt 20 ]; do sleep 0.5; done
+  seg_left=present; [ -e "$SEGF" ] || seg_left=removed
+  echo "shared: throttle keys=$(keys2) bounded=$bounded repaused=$repaused stale_resume_after=${stale}s runs_after=$runs sidecar=$seg_left (newest $n1/$n2 -> $n3 -> $n4, stale_logged=$gauge)"
+  kill "$AGT" 2>/dev/null
+  kill "$AGSH" 2>/dev/null
 fi
 
 sleep 1

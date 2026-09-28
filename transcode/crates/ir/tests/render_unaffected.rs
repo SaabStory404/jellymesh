@@ -14,7 +14,7 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
-use tcpool_ir::{is_video_copy, map_path, render, Backend, TranslateOpts};
+use tcpool_ir::{is_video_copy, map_path, render, Backend, RateControl, TranslateOpts};
 
 #[derive(Deserialize)]
 struct Row {
@@ -62,6 +62,7 @@ fn render_of_every_golden_is_translate_plus_temp_file() {
         let opts = TranslateOpts {
             pathmap: vec![],
             gpu_filters: true,
+            rate_control: RateControl::Legacy,
         };
         for (n, r) in rows.iter().enumerate() {
             let rendered = render(&r.input, backend, &opts);
@@ -104,7 +105,14 @@ fn render_is_backend_independent_of_which_golden_list_it_came_from() {
     for rows in g.values() {
         for r in rows {
             for backend in [Backend::Cpu, Backend::Qsv, Backend::Nvenc] {
-                let out = render(&r.input, backend, &TranslateOpts::default());
+                let out = render(
+                    &r.input,
+                    backend,
+                    &TranslateOpts {
+                        rate_control: RateControl::Legacy,
+                        ..Default::default()
+                    },
+                );
                 let has_hwaccel = out.args.iter().any(|a| a == "-hwaccel");
                 if is_video_copy(&r.input) || backend == Backend::Cpu {
                     assert!(

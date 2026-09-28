@@ -58,6 +58,7 @@ to a worker that is shutting down.
 | `TC_OUTPUT_ROOT` | `/transcodes` | allowlist: outputs only under here |
 | `TC_READ_ROOTS` | `/config/data/data/subtitles,/config/data/data/attachments` | subtitle burn-in and attachment fonts, read-only |
 | `TC_HW_FILTERS` | `0` on the CPU worker only | |
+| `TC_RC` | **unset** (= `calibrated`) | P5 per-encoder rate control; `legacy` restores the P1 `-global_quality`/`-cq` mapping on one card without a rebuild. Any other value fails agent startup |
 | `TC_PATHMAP` | **unset** | not needed: the agents mount `/data/media` at `/data/media`, the same path prod Jellyfin uses, so the command line's paths are already valid |
 
 ### Shim (inside Jellyfin, installed as `/usr/lib/jellyfin-ffmpeg/ffmpeg`)
@@ -132,6 +133,16 @@ StorageClasses both marked default, so an unqualified RWX claim binds non-determ
 The scratch `mountOptions` are load-bearing: `nfsvers=4.2, lookupcache=positive, actimeo=1`. With
 the defaults a freshly written segment stayed invisible to other nodes for 12–23 s, which is
 Jellyfin waiting on a segment that already exists.
+
+## Shared transcode directory (optional, `JELLYMESH_SHARED_TRANSCODE_DIR=1`)
+
+Both replicas may instead share **one** `TranscodingTempPath` (still a subdirectory, never the
+root). Jellyfin (bughunt patch 16) then sets `JELLYMESH_KEEPALIVE` on each HLS ffmpeg; the shim
+forwards it and the agent keeps the job running if that replica dies (`TC_DETACH`,
+`TC_ORPHAN_IDLE_SECS`, `TC_ORPHAN_PAUSED_SECS`, `TC_ORPHAN_MAX_SECS`), throttling it against the
+viewer's position (`TC_ORPHAN_LEAD_MAX_SECS`, `TC_ORPHAN_LEAD_RESUME_SECS`, `TC_ORPHAN_POS_STALE_SECS`).
+Roll agents before Jellyfin.
+Details: `transcode/docs/SHARED-TRANSCODE.md`.
 
 ## Two rules about the scratch directory
 
