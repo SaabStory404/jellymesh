@@ -22,20 +22,28 @@ touched assemblies into the overlay directory (`$JF_OVERLAY`, default
 `Jellyfin.Server.Implementations`, `MediaBrowser.Controller`, `MediaBrowser.MediaEncoding`,
 `MediaBrowser.Model`, `Jellyfin.Api`, `jellyfin`. The last three (`MediaBrowser.Model.dll`,
 `Jellyfin.Api.dll`, `jellyfin.dll`) are new for this series — the query patch alone only touched
-the first four. All public API changes are additive (no existing public signature changed or
-removed), so plugins built against stock 12.1 keep binding.
+the first four. No existing public signature is changed or removed, so plugins that *call* these
+APIs keep binding. The series does add interface members: patch 08 adds non-default members to
+`IMediaStreamRepository`, `IMediaAttachmentRepository`, `IMediaSegmentManager` and
+`IMediaSourceManager` (and patch 07 a defaulted one to `IUserDataManager`). That is a breaking
+change for any plugin that *implements* one of those interfaces; none of the plugins deployed with
+JellyMesh does (Galera provider, Leader), so the practical risk is low, but check before loading a
+third-party plugin that replaces one of these services.
 
 **Deployment: nothing here has been built into an image or deployed.** Every number in this
 document comes from the build/test/measurement commands shown; the owning session builds and
 ships the image separately.
 
 **Integrated verification** (MEASURED on the integrated tree, perf patch + all 14 patches
-`00`-`13`, Release build): 0 warnings / 0 errors. Tests, all passing: `Jellyfin.Api.Tests` 160,
+`00`-`13`, Release build): 0 warnings / 0 errors. Tests, all passing: `Jellyfin.Api.Tests` 167,
 `Jellyfin.Controller.Tests` 218 (5 consecutive clean runs), `Jellyfin.MediaEncoding.Tests` 113
 (+1 skipped), `Jellyfin.MediaEncoding.Hls.Tests` 18, `Jellyfin.Model.Tests` 754,
-`Jellyfin.Server.Implementations.Tests` 980 (+12 skipped; 4 consecutive clean runs),
+`Jellyfin.Server.Implementations.Tests` 988 (+12 skipped),
 `Jellyfin.Server.Tests` 20, `Jellyfin.Providers.Tests` 481. `build.sh` re-run end to end on a
-throwaway clone of the tree: all patches apply, build clean, 7 overlay assemblies produced.
+throwaway clone of the tree: all patches apply, build clean, 7 overlay assemblies produced. `build.sh` is
+idempotent (a clean of untracked files after the checkout): on the default `$SRC`, two consecutive default
+runs and then `BUGHUNT=0` all exit 0 with 0 warnings / 0 errors, and the `BUGHUNT=0` build contains none
+of the series' new types (MEASURED).
 
 **Response parity** (MEASURED, the README's method): two SQLite lab nodes on private copies of the
 prepared real-library database (`galera/lab/jf-galera.sh up`, `JG_SQLITE`), one with the perf-only
@@ -61,11 +69,11 @@ kill timer, failover Stop, stale web client, the DV flag); those are covered by 
 | 00 | `00-tests-fixup.patch` | build fix | — | MEASURED | none (test project only) | `Jellyfin.Server.Implementations.Tests` compiles again; 980/12 skipped, 5/5 clean runs |
 | 01 | `01-killtimer-wipe-race.patch` | Known issue #2 | high | MIXED | Deferred kill-delete skips when a replacement transcode job is already registered on the same output path | 3 new `TranscodeManagerTests`; assembly 103 passed / 1 skipped |
 | 02 | `02-killtimer-paused-grace.patch` | Known issue #2 | high | MIXED | Paused HLS/DASH job gets a 180s kill grace instead of 60s; unpaused HLS/DASH and Progressive unchanged | 5 new `TranscodeManagerPingTimerTests` (2 discriminate from baseline); assembly 110 passed / 1 skipped |
-| 03 | `03-k2-incident-and-shared-dir.patch` | Known issue #2 | medium | MIXED | A node with no locally-tracked job waits on a still-fresh shared-dir segment file before starting its own ffmpeg | 9 new unit tests on the extracted helpers; `Jellyfin.Api.Tests` 148 passed |
+| 03 | `03-k2-incident-and-shared-dir.patch` | Known issue #2 | medium | MIXED | Opt-in `JELLYMESH_SHARED_TRANSCODE_DIR=1`: a node with no locally-tracked job waits on a still-fresh shared-dir segment file before starting its own ffmpeg; flag off = unchanged | Helper tests + gate tests (flag off/on, local job present) |
 | 04 | `04-segment-wait-request-aborted.patch` | Known issue #2 | medium | MIXED | Segment-wait loops exit on client/proxy abort instead of polling for the rest of the transcode's runtime | `DynamicHlsControllerSegmentWaitTests` 12/12 (11 prior + 1 new) |
 | 05 | `05-remux-desync.patch` | Known issue #1 | medium | MIXED | HLS copy-video remux: the transcoded audio track no longer accurate-seeks past a target the copied video track can't reach | ffmpeg PTS measurement (below); no dotnet regression test (ffmpeg-argument-level change) |
 | 06 | `06-pgs-default-same-language-text.patch` | Known issue #4 | medium | MEASURED | Default/Smart subtitle selection prefers a same-language text track over a tied image (PGS/VobSub) track; fixes a dead Always-mode scoring fallback | 9 new `MediaStreamSelectorTests` cases |
-| 07 | `07-progress-write-stall.patch` | Known issue #6 | medium | MIXED | `PlaybackProgress` writes get a bounded async path and a narrower conflict predicate; Start/Finished/manual edits unchanged | New `UserDataManagerTests` cases (sync + async retry, coalescing) |
+| 07 | `07-progress-write-stall.patch` | Known issue #6 | medium | MIXED | `PlaybackProgress` writes get a bounded async path with a narrower conflict predicate; every other write keeps the perf patch's broad retry predicate unchanged | New `UserDataManagerTests` cases (sync + async retry, coalescing) |
 | 08 | `08-mediasources-batch.patch` | Known issue #6 | high | MIXED | A page of items with `Fields=MediaSources`/`MediaStreams` batches into ~3 statements instead of 3 per item | `DtoServiceMediaSourceBatchTests`; statement count 3N → 3 |
 | 09 | `09-stopped-no-position.patch` | other | medium | MEASURED | A positionless Stop no longer assumes `Played=true` when this node has no session record for the item | New `SessionManager` regression tests |
 | 10 | `10-displayprefs-retry.patch` | other | medium | MIXED | A concurrent first-write for the same display-preferences key retries instead of surfacing a 500 | New `DisplayPreferencesManager` retry test |
@@ -181,9 +189,10 @@ Disclosed gap: the fix's freshness check only sees a file on disk, and the motiv
 ffmpeg command line (`-analyzeduration 200M -probesize 1G` plus a tonemap filter chain on a 4K HDR
 source) makes it plausible the first replica hadn't written its first segment yet 10.6s in — so
 this exact collision may not be caught by the fix as shipped (inferred from the measured command
-line and gap, not from an independently timed encode). Prod's two backend types currently write to
-non-overlapping directory roots, so this fix is dormant there today; it's live for the lab pool and
-for any future shared-directory topology.
+line and gap, not from an independently timed encode). Prod's replicas write to per-replica
+directories, where this path only adds up to 15 s of latency, so the whole path is opt-in:
+`JELLYMESH_SHARED_TRANSCODE_DIR=1` (default off = the pre-03 behaviour; set it only where replicas
+share one transcode directory, e.g. the lab pool).
 
 **04 — `segment-wait-request-aborted` (fixed, medium, MIXED).** `GetDynamicSegment`'s lock wait and
 `GetSegmentResult`'s wait loop ran on a free-standing token never linked to `HttpContext.RequestAborted`,
@@ -278,6 +287,11 @@ and share the winner's language/forced flag, swap in a same-language text altern
 current pick is image-based. This deliberately does not widen Default mode's own eligibility rule;
 Smart mode's rule (language-only) is where the swap actually fires for the reported case.
 Different-language, differently-forced, and single-candidate cases are unaffected byte-for-byte.
+
+Owner review addition: when the selected image track is a full (non-forced) default, a text track
+whose title marks it as partial (`sign`, `song`, `forced`, `commentary`, case-insensitive) is never
+swapped in, even if its forced flag is unset (common on "Signs & Songs" tracks). A forced PGS pick
+can still swap to a same-language forced text track. Tests pin all three cases.
 
 Also fixed in the same patch: a dead fallback in `MediaStreamSelector`'s Always-mode branch
 (`SetSubtitleStreamScores`) — `.ToList() ?? BehaviorOnlyForced(...)` can never take the right side
@@ -401,10 +415,12 @@ any `DbException`, and the write itself was a synchronous exists-check + add + `
 commit. The investigate phase cited a specific slow-write incident for this; that incident predates
 this fork's Galera cutover and ran on a different server image, so attribution to this exact code
 path is not confirmed — the code-level defect (unbounded retry, over-eager conflict matching) is
-real independent of that one incident. Fix: narrow the conflict predicate to real conflicts only
-(duplicate key, deadlock/certification failure, SQLite constraint violation) — walking the full
-exception chain, since a save failure can be wrapped two layers deep and a fixed-depth unwrap can
-miss it — before adding a bounded, fail-fast async path for `PlaybackProgress` writes specifically.
+real independent of that one incident. Fix: a bounded, fail-fast async path for `PlaybackProgress`
+writes, which retries only real conflicts (duplicate key, deadlock/certification failure, SQLite
+constraint violation, found by walking the whole exception chain). Every other write — Start,
+Finished, manual edits, and the progress tick that flips `Played` — keeps the perf patch's broad
+predicate (any `DbUpdateException`/`DbException`), so a lost connection during a Galera node flap is
+still retried there (owner review; tests pin both paths).
 A progress write superseded by a newer one for the same user+item drops out of its own retry loop
 early. Start/Finished/manual edits, and the one progress tick that flips `Played`, keep the
 original unbounded, always-retried path unchanged — never dropped. This round's fixup fixed a bug

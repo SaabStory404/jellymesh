@@ -1,8 +1,28 @@
 diff --git a/Jellyfin.Api/Controllers/DynamicHlsController.cs b/Jellyfin.Api/Controllers/DynamicHlsController.cs
-index 034a9dea5..422ab73a6 100644
+index 034a9dea5..5a0a3644f 100644
 --- a/Jellyfin.Api/Controllers/DynamicHlsController.cs
 +++ b/Jellyfin.Api/Controllers/DynamicHlsController.cs
-@@ -1501,6 +1501,36 @@ public class DynamicHlsController : BaseJellyfinApiController
+@@ -1424,6 +1424,19 @@ public class DynamicHlsController : BaseJellyfinApiController
+         return new FileContentResult(Encoding.UTF8.GetBytes(playlist), MimeTypes.GetMimeType("playlist.m3u8"));
+     }
+ 
++    // JELLYMESH_SHARED_TRANSCODE_DIR=1: opt-in for a deployment where several nodes share one
++    // transcode directory (see the "no local job" wait-for-other-writer block below). Prod runs
++    // each replica against its own, separate transcode directory root, so there "another node's
++    // fresh segment" cannot exist and the only effect of that block firing would be adding up to
++    // the wait's floor (~15s) of pure latency to a request that should have started ffmpeg
++    // immediately. Default off keeps GetDynamicSegment byte-identical to the pre-shared-dir
++    // behavior; only a deployment that actually shares the directory (e.g. the lab pool) should
++    // set this. Read as a property (not a cached static-readonly field, unlike JELLYFIN_SHARED_DB
++    // elsewhere in this fork) so tests can toggle it per-case, mirroring JELLYMESH_DOVI_P7_TO_81
++    // in EncodingHelper. internal (not private), like ShouldWaitForOtherWriter below, so
++    // DynamicHlsControllerTests can assert the gate directly via InternalsVisibleTo.
++    internal static bool SharedTranscodeDirEnabled => Environment.GetEnvironmentVariable("JELLYMESH_SHARED_TRANSCODE_DIR") == "1";
++
+     private async Task<ActionResult> GetDynamicSegment(StreamingRequestDto streamingRequest, int segmentId)
+     {
+         if ((streamingRequest.StartTimeTicks ?? 0) > 0)
+@@ -1501,6 +1514,38 @@ public class DynamicHlsController : BaseJellyfinApiController
                      var currentJob = _transcodeManager.GetTranscodingJob(playlistPath, TranscodingJobType);
                      await WaitForActiveTranscodingRequests(currentJob, cancellationToken).ConfigureAwait(false);
  
@@ -16,7 +36,9 @@ index 034a9dea5..422ab73a6 100644
 +                    // recently-written segment file for this exact playlist is the only signal
 +                    // that crosses the node boundary, so use it to tell "someone is actively
 +                    // producing this" apart from "nothing is, so self-heal by starting fresh".
-+                    if (currentJob is null)
++                    // Gated behind JELLYMESH_SHARED_TRANSCODE_DIR: see the flag's own comment
++                    // above GetDynamicSegment for why this must stay opt-in.
++                    if (ShouldCheckForOtherWriter(currentJob))
 +                    {
 +                        var lastForeignFile = GetLastTranscodingFile(playlistPath, segmentExtension, _fileSystem);
 +                        var lastForeignWriteUtc = lastForeignFile is null ? (DateTime?)null : _fileSystem.GetLastWriteTimeUtc(lastForeignFile);
@@ -39,7 +61,7 @@ index 034a9dea5..422ab73a6 100644
                      await _transcodeManager.KillTranscodingJobs(streamingRequest.DeviceId, streamingRequest.PlaySessionId, p => false)
                          .ConfigureAwait(false);
  
-@@ -1551,6 +1581,51 @@ public class DynamicHlsController : BaseJellyfinApiController
+@@ -1551,6 +1596,66 @@ public class DynamicHlsController : BaseJellyfinApiController
          }
      }
  
@@ -61,6 +83,21 @@ index 034a9dea5..422ab73a6 100644
 +    internal static bool ShouldWaitForOtherWriter(DateTime? lastSegmentWriteTimeUtc, DateTime utcNow, TimeSpan maxWriterAge)
 +    {
 +        return lastSegmentWriteTimeUtc.HasValue && (utcNow - lastSegmentWriteTimeUtc.Value) <= maxWriterAge;
++    }
++
++    /// <summary>
++    /// The actual gate GetDynamicSegment uses before it will even look at the shared transcode
++    /// directory for another writer's output: a local job is authoritative when one exists
++    /// (nothing to check), and even with no local job, the whole foreign-file check is skipped
++    /// unless JELLYMESH_SHARED_TRANSCODE_DIR opted in (see <see cref="SharedTranscodeDirEnabled"/>).
++    /// Extracted to its own testable unit so flag-off can be asserted directly against the same
++    /// condition the controller branches on, rather than reconstructed in a test.
++    /// </summary>
++    /// <param name="currentJob">The transcoding job this node has tracked for the playlist, if any.</param>
++    /// <returns><c>true</c> if GetDynamicSegment should go on to check the shared directory for a fresh foreign segment.</returns>
++    internal static bool ShouldCheckForOtherWriter(TranscodingJob? currentJob)
++    {
++        return SharedTranscodeDirEnabled && currentJob is null;
 +    }
 +
 +    /// <summary>
@@ -92,7 +129,7 @@ index 034a9dea5..422ab73a6 100644
          => GetSegmentLengthsInternal(state.RunTimeTicks ?? 0, state.SegmentLength);
  
 diff --git a/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerTests.cs b/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerTests.cs
-index 5f5f273f1..626e82c98 100644
+index 5f5f273f1..83900e8de 100644
 --- a/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerTests.cs
 +++ b/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerTests.cs
 @@ -1,4 +1,5 @@
@@ -101,7 +138,7 @@ index 5f5f273f1..626e82c98 100644
  using System.Threading;
  using System.Threading.Tasks;
  using Jellyfin.Api.Controllers;
-@@ -117,5 +118,168 @@ namespace Jellyfin.Api.Tests.Controllers
+@@ -117,5 +118,233 @@ namespace Jellyfin.Api.Tests.Controllers
  
              Assert.Equal(0, job.ActiveRequestCount);
          }
@@ -267,6 +304,71 @@ index 5f5f273f1..626e82c98 100644
 +            {
 +                dir.Delete(true);
 +            }
++        }
++
++        // JELLYMESH_SHARED_TRANSCODE_DIR -----------------------------------------------------
++
++        [Fact]
++        public void ShouldCheckForOtherWriter_FlagUnset_NoLocalJob_ReturnsFalse()
++        {
++            using var env = new EnvVarScope("JELLYMESH_SHARED_TRANSCODE_DIR", null);
++
++            // This is the exact call GetDynamicSegment makes before it will even look at the
++            // shared directory for another writer's output. With the flag off, it must return
++            // false even for the case the whole feature exists to handle (no local job) --
++            // otherwise prod's per-replica transcode dirs would pay the wait's latency for a
++            // "fresh foreign segment" that structurally cannot exist there.
++            Assert.False(DynamicHlsController.ShouldCheckForOtherWriter(null));
++        }
++
++        [Fact]
++        public void ShouldCheckForOtherWriter_FlagSet_NoLocalJob_ReturnsTrue()
++        {
++            using var env = new EnvVarScope("JELLYMESH_SHARED_TRANSCODE_DIR", "1");
++
++            Assert.True(DynamicHlsController.ShouldCheckForOtherWriter(null));
++        }
++
++        [Fact]
++        public void ShouldCheckForOtherWriter_FlagSet_LocalJobExists_ReturnsFalse()
++        {
++            using var env = new EnvVarScope("JELLYMESH_SHARED_TRANSCODE_DIR", "1");
++            var job = new TranscodingJob(NullLogger<TranscodingJob>.Instance);
++
++            // A local job is authoritative regardless of the flag: this node already knows it
++            // owns the transcode, so there is nothing to check the shared directory for.
++            Assert.False(DynamicHlsController.ShouldCheckForOtherWriter(job));
++        }
++
++        [Theory]
++        [InlineData(null, false)]
++        [InlineData("0", false)]
++        [InlineData("true", false)]
++        [InlineData("1", true)]
++        public void SharedTranscodeDirEnabled_ReadsEnvVarExactly(string? value, bool expected)
++        {
++            using var env = new EnvVarScope("JELLYMESH_SHARED_TRANSCODE_DIR", value);
++
++            Assert.Equal(expected, DynamicHlsController.SharedTranscodeDirEnabled);
++        }
++
++        /// <summary>
++        /// Sets an environment variable for the scope's lifetime and restores the prior value on
++        /// dispose, so JELLYMESH_SHARED_TRANSCODE_DIR tests do not leak state to other tests.
++        /// </summary>
++        private sealed class EnvVarScope : IDisposable
++        {
++            private readonly string _name;
++            private readonly string? _original;
++
++            public EnvVarScope(string name, string? value)
++            {
++                _name = name;
++                _original = Environment.GetEnvironmentVariable(name);
++                Environment.SetEnvironmentVariable(name, value);
++            }
++
++            public void Dispose() => Environment.SetEnvironmentVariable(_name, _original);
 +        }
      }
  }

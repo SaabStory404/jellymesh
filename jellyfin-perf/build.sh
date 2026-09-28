@@ -11,6 +11,8 @@ if [ ! -d "$SRC/.git" ]; then
 fi
 git -C "$SRC" fetch -q --tags origin
 git -C "$SRC" checkout -q -f v12.1
+# Drop files created by a previous run's patches (bin/obj are ignored, so the build cache survives).
+git -C "$SRC" clean -fdq
 git -C "$SRC" apply "$HERE/jellyfin-12.1-perf.patch"
 if [ "${BUGHUNT:-1}" != 0 ]; then
   for p in "$HERE"/bughunt/[0-9][0-9]-*.patch; do

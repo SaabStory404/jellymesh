@@ -1,8 +1,8 @@
 diff --git a/Jellyfin.Api/Controllers/DynamicHlsController.cs b/Jellyfin.Api/Controllers/DynamicHlsController.cs
-index 422ab73a6..71838dda8 100644
+index 5a0a3644f..8a7716c98 100644
 --- a/Jellyfin.Api/Controllers/DynamicHlsController.cs
 +++ b/Jellyfin.Api/Controllers/DynamicHlsController.cs
-@@ -1435,6 +1435,15 @@ public class DynamicHlsController : BaseJellyfinApiController
+@@ -1448,6 +1448,15 @@ public class DynamicHlsController : BaseJellyfinApiController
          var cancellationTokenSource = new CancellationTokenSource();
          var cancellationToken = cancellationTokenSource.Token;
  
@@ -18,7 +18,7 @@ index 422ab73a6..71838dda8 100644
          var state = await StreamingHelpers.GetStreamingState(
                  streamingRequest,
                  HttpContext,
-@@ -1457,7 +1466,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+@@ -1470,7 +1479,7 @@ public class DynamicHlsController : BaseJellyfinApiController
  
          // Keep segment selection and transcoding replacement under the same playlist lock.
          // An out-of-order request must not replace a job while another request is using its output.
@@ -27,7 +27,7 @@ index 422ab73a6..71838dda8 100644
          {
              TranscodingJob? job;
              var startTranscoding = false;
-@@ -1465,7 +1474,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+@@ -1478,7 +1487,7 @@ public class DynamicHlsController : BaseJellyfinApiController
              {
                  job = _transcodeManager.OnTranscodeBeginRequest(playlistPath, TranscodingJobType);
                  _logger.LogDebug("returning {0} [it exists]", segmentPath);
@@ -36,7 +36,7 @@ index 422ab73a6..71838dda8 100644
              }
  
              var currentTranscodingIndex = GetCurrentTranscodingIndex(playlistPath, segmentExtension);
-@@ -1499,7 +1508,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+@@ -1512,7 +1521,7 @@ public class DynamicHlsController : BaseJellyfinApiController
                  try
                  {
                      var currentJob = _transcodeManager.GetTranscodingJob(playlistPath, TranscodingJobType);
@@ -45,7 +45,7 @@ index 422ab73a6..71838dda8 100644
  
                      // No job is tracked on this node for this playlist. In a deployment where
                      // several nodes share one transcode directory (see JellyMesh's shared-mode
-@@ -1521,10 +1530,10 @@ public class DynamicHlsController : BaseJellyfinApiController
+@@ -1536,10 +1545,10 @@ public class DynamicHlsController : BaseJellyfinApiController
                          {
                              var nextSegmentPath = GetSegmentPath(state, playlistPath, segmentId + 1);
                              var waitForOtherWriterTimeout = TimeSpan.FromSeconds(Math.Max(state.SegmentLength * 3, 15));
@@ -58,7 +58,7 @@ index 422ab73a6..71838dda8 100644
                              }
  
                              _logger.LogDebug("No active writer found for {0} after waiting; starting a new transcode", playlistPath);
-@@ -1569,7 +1578,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+@@ -1584,7 +1593,7 @@ public class DynamicHlsController : BaseJellyfinApiController
  
              _logger.LogDebug("returning {0} [general case]", segmentPath);
              job ??= _transcodeManager.OnTranscodeBeginRequest(playlistPath, TranscodingJobType);
@@ -67,7 +67,7 @@ index 422ab73a6..71838dda8 100644
          }
      }
  
-@@ -1987,7 +1996,10 @@ public class DynamicHlsController : BaseJellyfinApiController
+@@ -2017,7 +2026,10 @@ public class DynamicHlsController : BaseJellyfinApiController
          return Path.Combine(folder, filename + index.ToString(CultureInfo.InvariantCulture) + EncodingHelper.GetSegmentFileExtension(state.Request.SegmentContainer));
      }
  
@@ -79,7 +79,7 @@ index 422ab73a6..71838dda8 100644
          StreamState state,
          string playlistPath,
          string segmentPath,
-@@ -2019,40 +2031,57 @@ public class DynamicHlsController : BaseJellyfinApiController
+@@ -2049,40 +2061,57 @@ public class DynamicHlsController : BaseJellyfinApiController
          var nextSegmentPath = GetSegmentPath(state, playlistPath, segmentIndex + 1);
          if (transcodingJob is not null)
          {

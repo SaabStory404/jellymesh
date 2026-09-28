@@ -1,5 +1,5 @@
 diff --git a/Emby.Server.Implementations/Library/MediaStreamSelector.cs b/Emby.Server.Implementations/Library/MediaStreamSelector.cs
-index 631179ffc..b51d081c4 100644
+index 631179ffc..802fff2b0 100644
 --- a/Emby.Server.Implementations/Library/MediaStreamSelector.cs
 +++ b/Emby.Server.Implementations/Library/MediaStreamSelector.cs
 @@ -52,10 +52,16 @@ namespace Emby.Server.Implementations.Library
@@ -30,7 +30,7 @@ index 631179ffc..b51d081c4 100644
                  }
                  else
                  {
-@@ -83,9 +90,38 @@ namespace Emby.Server.Implementations.Library
+@@ -83,9 +90,68 @@ namespace Emby.Server.Implementations.Library
                  stream = BehaviorOnlyForced(sortedStreams, preferredLanguages).FirstOrDefault();
              }
  
@@ -49,7 +49,11 @@ index 631179ffc..b51d081c4 100644
 +        /// initially selected stream. This avoids forcing a burn-in transcode when a same-language text
 +        /// alternative to a disposition-flagged image subtitle exists, without letting a
 +        /// different-language, differently-forced, or otherwise-ineligible text track outrank the
-+        /// selection the mode's own rules already produced.
++        /// selection the mode's own rules already produced. When the selected image track is a full
++        /// (non-forced) track, a text track that looks like a partial signs/songs, forced or commentary
++        /// track by title is never a swap candidate, even when its forced flag is unset: it is not a
++        /// substitute for a full same-language default. A forced image track can still be swapped for a
++        /// same-language forced text track.
 +        /// </summary>
 +        private static MediaStream? PreferSameLanguageTextSubtitle(MediaStream? candidate, IEnumerable<MediaStream> sortedStreams, Func<MediaStream, bool> eligiblePredicate)
 +        {
@@ -62,14 +66,40 @@ index 631179ffc..b51d081c4 100644
 +                eligiblePredicate(x)
 +                && x.IsTextSubtitleStream
 +                && x.IsForced == candidate.IsForced
++                && (candidate.IsForced || !IsPartialTextSubtitleByTitle(x))
 +                && string.Equals(x.Language, candidate.Language, StringComparison.OrdinalIgnoreCase))
 +                ?? candidate;
++        }
++
++        // Titles containing these (case-insensitive) typically indicate a partial text track -
++        // signs/songs-only, forced-only, or a commentary track - rather than a full same-language
++        // subtitle track, so such a track must never be swapped in for a full disposition-flagged
++        // default even when its own IsForced flag is unset.
++        private static readonly string[] _partialTextSubtitleTitleKeywords = { "sign", "song", "commentary", "forced" };
++
++        private static bool IsPartialTextSubtitleByTitle(MediaStream stream)
++        {
++            var title = stream.Title;
++            if (string.IsNullOrEmpty(title))
++            {
++                return false;
++            }
++
++            foreach (var keyword in _partialTextSubtitleTitleKeywords)
++            {
++                if (title.Contains(keyword, StringComparison.OrdinalIgnoreCase))
++                {
++                    return true;
++                }
++            }
++
++            return false;
 +        }
 +
          private static IEnumerable<MediaStream> GetSortedStreams(IEnumerable<MediaStream> streams, MediaStreamType type, IReadOnlyList<string> languagePreferences)
          {
              // Give some preference to external text subs for better performance
-@@ -134,7 +170,11 @@ namespace Emby.Server.Implementations.Library
+@@ -134,7 +200,11 @@ namespace Emby.Server.Implementations.Library
              {
                  // Always load (full/non-forced) subtitles of the user's preferred subtitle language if possible, otherwise OnlyForced behavior.
                  filteredStreams = sortedStreams.Where(s => !s.IsForced && MatchesPreferredLanguage(s.Language, preferredLanguages))
@@ -83,7 +113,7 @@ index 631179ffc..b51d081c4 100644
              else if (mode == SubtitlePlaybackMode.OnlyForced)
              {
 diff --git a/tests/Jellyfin.Server.Implementations.Tests/Library/MediaStreamSelectorTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Library/MediaStreamSelectorTests.cs
-index 07feae587..3dbb49195 100644
+index 07feae587..423268f9e 100644
 --- a/tests/Jellyfin.Server.Implementations.Tests/Library/MediaStreamSelectorTests.cs
 +++ b/tests/Jellyfin.Server.Implementations.Tests/Library/MediaStreamSelectorTests.cs
 @@ -1,5 +1,7 @@
@@ -94,11 +124,11 @@ index 07feae587..3dbb49195 100644
  using MediaBrowser.Model.Entities;
  using Xunit;
  
-@@ -7,6 +9,157 @@ namespace Jellyfin.Server.Implementations.Tests.Library;
+@@ -7,6 +9,222 @@ namespace Jellyfin.Server.Implementations.Tests.Library;
  
  public class MediaStreamSelectorTests
  {
-+    private static MediaStream Subtitle(int index, string codec, string language, bool isDefault = false, bool isForced = false, bool isExternal = false)
++    private static MediaStream Subtitle(int index, string codec, string language, bool isDefault = false, bool isForced = false, bool isExternal = false, string? title = null)
 +    {
 +        return new MediaStream
 +        {
@@ -108,7 +138,8 @@ index 07feae587..3dbb49195 100644
 +            Language = language,
 +            IsDefault = isDefault,
 +            IsForced = isForced,
-+            IsExternal = isExternal
++            IsExternal = isExternal,
++            Title = title
 +        };
 +    }
 +
@@ -217,6 +248,70 @@ index 07feae587..3dbb49195 100644
 +        var result = MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, Array.Empty<string>(), SubtitlePlaybackMode.Default, "eng");
 +
 +        Assert.Equal(0, result);
++    }
++
++    // An unflagged "Signs & Songs" text track (IsForced left false, as many releases mistag it) must
++    // never be swapped in for a full same-language PGS default: it is a partial track and not a
++    // substitute, even though it satisfies the Default mode's own eligibility predicate via IsDefault.
++    [Fact]
++    public void GetDefaultSubtitleStreamIndex_SignsAndSongsTextTitle_DoesNotOutrankFullPgsDefault()
++    {
++        var streams = new[]
++        {
++            Subtitle(0, "pgssub", "eng", isDefault: true),
++            Subtitle(1, "subrip", "eng", isDefault: true, title: "Signs & Songs")
++        };
++
++        var result = MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, Array.Empty<string>(), SubtitlePlaybackMode.Default, "eng");
++
++        Assert.Equal(0, result);
++    }
++
++    // A commentary text track must never be swapped in for a full same-language PGS default.
++    [Fact]
++    public void GetDefaultSubtitleStreamIndex_CommentaryTextTitle_DoesNotOutrankFullPgsDefault()
++    {
++        var streams = new[]
++        {
++            Subtitle(0, "pgssub", "eng", isDefault: true),
++            Subtitle(1, "subrip", "eng", isDefault: true, title: "Commentary")
++        };
++
++        var result = MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, Array.Empty<string>(), SubtitlePlaybackMode.Default, "eng");
++
++        Assert.Equal(0, result);
++    }
++
++    // A plain same-language full text track (no signs/songs/commentary/forced title) still wins the
++    // tie-break, confirming the title check does not over-exclude ordinary tracks.
++    [Fact]
++    public void GetDefaultSubtitleStreamIndex_PlainSameLanguageTextTitle_StillOutranksPgsDefault()
++    {
++        var streams = new[]
++        {
++            Subtitle(0, "pgssub", "eng", isDefault: true),
++            Subtitle(1, "subrip", "eng", isDefault: true, title: "English")
++        };
++
++        var result = MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, Array.Empty<string>(), SubtitlePlaybackMode.Default, "eng");
++
++        Assert.Equal(1, result);
++    }
++
++    // A forced-only PGS pick can still be swapped for a same-language forced text track, even one
++    // titled "Forced": the title exclusion only guards a full (non-forced) image default.
++    [Fact]
++    public void GetDefaultSubtitleStreamIndex_ForcedPgsPick_SameLanguageForcedText_PrefersText()
++    {
++        var streams = new[]
++        {
++            Subtitle(0, "pgssub", "eng", isForced: true),
++            Subtitle(1, "subrip", "eng", isForced: true, title: "Forced")
++        };
++
++        var result = MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, Array.Empty<string>(), SubtitlePlaybackMode.Default, "eng");
++
++        Assert.Equal(1, result);
 +    }
 +
 +    // Single-candidate titles (the vast majority) must be unaffected by the tie-break.

@@ -1,8 +1,8 @@
 diff --git a/Jellyfin.Api/Controllers/DynamicHlsController.cs b/Jellyfin.Api/Controllers/DynamicHlsController.cs
-index 71838dda8..5f8193b32 100644
+index 8a7716c98..31394c7f4 100644
 --- a/Jellyfin.Api/Controllers/DynamicHlsController.cs
 +++ b/Jellyfin.Api/Controllers/DynamicHlsController.cs
-@@ -1919,6 +1919,15 @@ public class DynamicHlsController : BaseJellyfinApiController
+@@ -1949,6 +1949,15 @@ public class DynamicHlsController : BaseJellyfinApiController
              }
          }
  

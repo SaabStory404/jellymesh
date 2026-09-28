@@ -1,5 +1,5 @@
 diff --git a/Emby.Server.Implementations/Library/UserDataManager.cs b/Emby.Server.Implementations/Library/UserDataManager.cs
-index e4557be35..3907987ae 100644
+index e4557be35..9a85e5516 100644
 --- a/Emby.Server.Implementations/Library/UserDataManager.cs
 +++ b/Emby.Server.Implementations/Library/UserDataManager.cs
 @@ -1,10 +1,12 @@
@@ -52,27 +52,55 @@ index e4557be35..3907987ae 100644
          /// <summary>
          /// Initializes a new instance of the <see cref="UserDataManager"/> class.
          /// </summary>
-@@ -98,9 +120,62 @@ namespace Emby.Server.Implementations.Library
+@@ -98,9 +120,90 @@ namespace Emby.Server.Implementations.Library
              });
          }
  
++        /// <summary>
++        /// The perf patch's original, broad write-conflict predicate: true for any
++        /// <see cref="DbUpdateException"/> or <see cref="DbException"/> (including one wrapped a
++        /// single level deep in an <see cref="InvalidOperationException"/>, the shape a provider
++        /// without a retrying execution strategy configured uses). Used by every write that is
++        /// unbounded and must not be silently dropped: the synchronous
++        /// <see cref="SaveUserData(User, BaseItem, UserItemData, UserDataSaveReason, CancellationToken)"/>
++        /// path (PlaybackStart/PlaybackFinished/manual edits, and the progress tick that flips
++        /// <c>Played</c> -- SessionManager deliberately routes that one through this synchronous,
++        /// unbounded overload rather than <see cref="SaveUserDataAsync"/>), and every
++        /// non-<see cref="UserDataSaveReason.PlaybackProgress"/> reason on the async path. This is
++        /// deliberately broader than a genuine write conflict -- it also retries a lost connection
++        /// during a Galera/PXC node flap or any other transient <see cref="DbException"/> -- because
++        /// none of these writes are bounded, so failing to retry would lose data instead of merely
++        /// costing an extra attempt. Only <see cref="IsProgressWriteConflict"/>, used solely by the
++        /// bounded PlaybackProgress path, narrows further.
++        /// </summary>
++        /// <param name="ex">The exception <see cref="WriteUserData"/> or <see cref="WriteUserDataAsync"/> threw.</param>
++        /// <returns><c>true</c> if a fresh attempt might resolve <paramref name="ex"/>.</returns>
+         private static bool IsWriteConflict(Exception ex)
+-            => ex is DbUpdateException or System.Data.Common.DbException
+-                || ex is InvalidOperationException { InnerException: DbUpdateException or System.Data.Common.DbException };
++            => ex is DbUpdateException or DbException
++                || ex is InvalidOperationException { InnerException: DbUpdateException or DbException };
++
 +        /// <summary>
 +        /// True only for a genuine write conflict that a fresh attempt can resolve: a duplicate-key
 +        /// insert race (MySQL/MariaDB 1062, SQLSTATE 23000) or a deadlock/certification abort (MySQL
 +        /// 1213, SQLSTATE 40001 -- Galera reuses 1213/40001 for a wsrep certification failure by
 +        /// design, specifically so ordinary deadlock-retry logic like this one already handles it,
 +        /// and its own message names "WSREP"), or the SQLite-serialized-writer equivalent
-+        /// (SQLITE_CONSTRAINT). Deliberately false for anything else -- in particular a bare timeout
++        /// (SQLITE_CONSTRAINT). Used ONLY by the bounded async PlaybackProgress path (see
++        /// <see cref="SaveUserDataAsync"/>): a dropped progress tick is harmless (the client's next
++        /// report a few seconds later supersedes it), so that path can afford to fail fast on
++        /// anything that isn't a conflict certain to clear on retry -- in particular a bare timeout
 +        /// (from <see cref="ProgressWriteBound"/> or any other cause), a lock-wait timeout (MySQL
-+        /// 1205, SQLSTATE HY000), or an unrelated connection error -- none of those are resolved by
-+        /// retrying, and retrying a timeout would multiply the stall by MaxAttempts instead of
-+        /// bounding it.
++        /// 1205, SQLSTATE HY000), or an unrelated connection error. That is a policy choice for a
++        /// bounded, droppable write, not a claim that those are unresolvable in general: every other
++        /// write path uses the broader <see cref="IsWriteConflict"/> above and retries them too,
++        /// because dropping an unbounded write (a play start/finish, a manual edit, a completed-
++        /// playback flag) would lose data instead of merely costing an extra attempt.
 +        /// </summary>
-+        /// <param name="ex">The exception <see cref="WriteUserData"/> or <see cref="WriteUserDataAsync"/> threw.</param>
++        /// <param name="ex">The exception <see cref="WriteUserDataAsync"/> threw.</param>
 +        /// <returns><c>true</c> if a fresh attempt can resolve <paramref name="ex"/>.</returns>
-         private static bool IsWriteConflict(Exception ex)
--            => ex is DbUpdateException or System.Data.Common.DbException
--                || ex is InvalidOperationException { InnerException: DbUpdateException or System.Data.Common.DbException };
++        private static bool IsProgressWriteConflict(Exception ex)
 +        {
 +            // EF Core wraps a SaveChanges failure in DbUpdateException; a provider without a
 +            // retrying execution strategy configured additionally wraps THAT in
@@ -117,7 +145,7 @@ index e4557be35..3907987ae 100644
  
          private void WriteUserData(User user, BaseItem item, UserItemData userData, List<string> keys)
          {
-@@ -126,6 +201,132 @@ namespace Emby.Server.Implementations.Library
+@@ -126,6 +229,132 @@ namespace Emby.Server.Implementations.Library
              item.UserData = dbContext.UserData.Where(e => e.ItemId == item.Id).AsNoTracking().ToArray(); // rehydrate the cached userdata
          }
  
@@ -157,7 +185,7 @@ index e4557be35..3907987ae 100644
 +                        await WriteUserDataAsync(user, item, userData, keys, writeToken).ConfigureAwait(false);
 +                        break;
 +                    }
-+                    catch (Exception ex) when (attempt < MaxAttempts && IsWriteConflict(ex))
++                    catch (Exception ex) when (attempt < MaxAttempts && (isProgress ? IsProgressWriteConflict(ex) : IsWriteConflict(ex)))
 +                    {
 +                        // Fresh context and transaction; jitter so racing writers stop colliding.
 +                        await Task.Delay(Random.Shared.Next(5, 20) * attempt, writeToken).ConfigureAwait(false);
@@ -353,7 +381,7 @@ index 2ee884534..b3646dd38 100644
          /// Save the provided user data for the given user.
          /// </summary>
 diff --git a/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataManagerTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataManagerTests.cs
-index ba3127bc0..4b016a1f2 100644
+index ba3127bc0..65360e82b 100644
 --- a/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataManagerTests.cs
 +++ b/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataManagerTests.cs
 @@ -1,5 +1,10 @@
@@ -436,28 +464,85 @@ index ba3127bc0..4b016a1f2 100644
      private UserData CreateUserDataRow(AudioBook item, string key, long positionTicks)
      {
          return new UserData
-@@ -213,4 +264,300 @@ public sealed class UserDataManagerTests : IDisposable
+@@ -213,4 +264,385 @@ public sealed class UserDataManagerTests : IDisposable
          var item = CreateAudioBook();
          Assert.Throws<ArgumentNullException>(() => _userDataManager.GetUserData(null!, item));
      }
 +
-+    // --- IsWriteConflict narrowing + retry -----------------------------------------------------
++    // --- IsWriteConflict (sync + non-progress async): broad, retries any DbException -----------
 +
 +    [Fact]
-+    public void SaveUserData_Finished_LockWaitTimeout_IsNotRetried()
++    public void SaveUserData_Finished_ConnectionError_IsRetried()
++    {
++        var item = CreateAudioBook();
++        SeedUserAndItem(item);
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 111 };
++
++        // A lost connection during a Galera/PXC node flap: not a duplicate-key/deadlock/
++        // certification conflict, just a dropped connection -- but the sync path (and every
++        // non-PlaybackProgress reason on the async path) is unbounded and must not drop an
++        // unbounded write, so it retries any DbException, exactly like the perf patch's original
++        // broad predicate.
++        var interceptor = new ThrowNTimesInterceptor(1, () => new FakeDbException("Lost connection to MySQL server during query", "08S01"));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        manager.SaveUserData(_user, item, userData, UserDataSaveReason.PlaybackFinished, CancellationToken.None);
++
++        Assert.Equal(2, interceptor.Invocations);
++    }
++
++    [Fact]
++    public void SaveUserData_ProgressTickThatFlipsPlayed_ConnectionError_IsRetried()
++    {
++        var item = CreateAudioBook();
++        SeedUserAndItem(item);
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 0, Played = true };
++
++        // SessionManager deliberately routes the progress tick that crosses MaxResumePct (flips
++        // Played) through this synchronous, unbounded overload -- with reason PlaybackProgress --
++        // rather than SaveUserDataAsync. The sync overload never branches on reason, so this must
++        // retry a connection error exactly like every other sync write.
++        var interceptor = new ThrowNTimesInterceptor(1, () => new FakeDbException("Lost connection to MySQL server during query", "08S01"));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        manager.SaveUserData(_user, item, userData, UserDataSaveReason.PlaybackProgress, CancellationToken.None);
++
++        Assert.Equal(2, interceptor.Invocations);
++    }
++
++    [Fact]
++    public async Task SaveUserDataAsync_Progress_ConnectionError_IsNotRetried_FailsFast()
 +    {
 +        var item = CreateAudioBook();
 +        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 111 };
 +
-+        // MySQL 1205 / SQLSTATE HY000: a lock-wait timeout, not a conflict a retry can resolve --
-+        // and specifically not a bare timeout of the kind ProgressWriteBound produces, which must
-+        // never be retried either (that would multiply the stall by MaxAttempts).
-+        var interceptor = new ThrowNTimesInterceptor(6, () => new FakeDbException("Lock wait timeout exceeded; try restarting transaction", "HY000"));
++        // Same connection error as above, but on the bounded PlaybackProgress path: a dropped
++        // progress tick is harmless (the client's next report supersedes it), so this path fails
++        // fast on anything short of a conflict certain to clear on retry, instead of retrying
++        // every DbException like the sync/non-progress path does.
++        var interceptor = new ThrowNTimesInterceptor(6, () => new FakeDbException("Lost connection to MySQL server during query", "08S01"));
 +        var manager = CreateManagerWithInterceptor(interceptor);
 +
-+        Assert.ThrowsAny<Exception>(() => manager.SaveUserData(_user, item, userData, UserDataSaveReason.PlaybackFinished, CancellationToken.None));
++        await Assert.ThrowsAnyAsync<Exception>(() => manager.SaveUserDataAsync(_user, item, userData, UserDataSaveReason.PlaybackProgress, CancellationToken.None));
 +
 +        Assert.Equal(1, interceptor.Invocations);
++    }
++
++    [Fact]
++    public async Task SaveUserDataAsync_Start_ConnectionError_IsRetried()
++    {
++        var item = CreateAudioBook();
++        SeedUserAndItem(item);
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlayCount = 1 };
++
++        // Non-PlaybackProgress reason on the ASYNC path must use the same broad predicate as the
++        // sync path, not the narrowed PlaybackProgress-only one.
++        var interceptor = new ThrowNTimesInterceptor(1, () => new FakeDbException("Lost connection to MySQL server during query", "08S01"));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        await manager.SaveUserDataAsync(_user, item, userData, UserDataSaveReason.PlaybackStart, CancellationToken.None);
++
++        Assert.Equal(2, interceptor.Invocations);
 +    }
 +
 +    [Fact]
@@ -534,14 +619,42 @@ index ba3127bc0..4b016a1f2 100644
 +    }
 +
 +    [Fact]
-+    public void SaveUserData_Finished_NonConflict_WrappedInInvalidOperationException_IsNotRetried()
++    public void SaveUserData_Finished_NonConflict_WrappedInInvalidOperationException_IsRetried()
 +    {
 +        var item = CreateAudioBook();
++        SeedUserAndItem(item);
 +        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 777, Played = true };
 +
-+        // Same two-wrapper depth as the test above, but the innermost exception is a lock-wait
-+        // timeout (SQLSTATE HY000), not a conflict -- must NOT retry regardless of how many wrappers
-+        // sit on top of it (a bare timeout retried is exactly what would multiply a stall).
++        // Same two-wrapper depth as the RealConflict test above, but the innermost exception is a
++        // lock-wait timeout (SQLSTATE HY000), not a conflict. The broad predicate used by this
++        // (unbounded) path matches on the wrapper shape alone -- InvalidOperationException wrapping
++        // a DbUpdateException -- exactly like the perf patch's original predicate did, so this still
++        // retries. Only the narrowed, PlaybackProgress-only predicate walks the chain to distinguish
++        // this from a real conflict (see SaveUserDataAsync_Progress_NonConflict_... below).
++        var interceptor = new ThrowNTimesInterceptor(
++            1,
++            () => new InvalidOperationException(
++                "An exception has been raised that is likely due to a transient failure. Consider enabling transient error resiliency.",
++                new DbUpdateException(
++                    "An error occurred while saving the entity changes.",
++                    new FakeDbException("Lock wait timeout exceeded; try restarting transaction", "HY000"))));
++        var manager = CreateManagerWithInterceptor(interceptor);
++
++        manager.SaveUserData(_user, item, userData, UserDataSaveReason.PlaybackFinished, CancellationToken.None);
++
++        Assert.Equal(2, interceptor.Invocations);
++    }
++
++    [Fact]
++    public async Task SaveUserDataAsync_Progress_NonConflict_WrappedInInvalidOperationException_IsNotRetried_FailsFast()
++    {
++        var item = CreateAudioBook();
++        var userData = new UserItemData { Key = item.GetUserDataKeys()[0], PlaybackPositionTicks = 777 };
++
++        // Same wrapped shape, but on the bounded PlaybackProgress path: its narrowed predicate walks
++        // the whole InnerException chain (past the InvalidOperationException and DbUpdateException
++        // wrappers) to the real HY000 lock-wait timeout underneath and correctly does not retry it,
++        // unlike the wrapper-shape-only broad predicate the sync path uses above.
 +        var interceptor = new ThrowNTimesInterceptor(
 +            6,
 +            () => new InvalidOperationException(
@@ -551,7 +664,7 @@ index ba3127bc0..4b016a1f2 100644
 +                    new FakeDbException("Lock wait timeout exceeded; try restarting transaction", "HY000"))));
 +        var manager = CreateManagerWithInterceptor(interceptor);
 +
-+        Assert.ThrowsAny<Exception>(() => manager.SaveUserData(_user, item, userData, UserDataSaveReason.PlaybackFinished, CancellationToken.None));
++        await Assert.ThrowsAnyAsync<Exception>(() => manager.SaveUserDataAsync(_user, item, userData, UserDataSaveReason.PlaybackProgress, CancellationToken.None));
 +
 +        Assert.Equal(1, interceptor.Invocations);
 +    }
