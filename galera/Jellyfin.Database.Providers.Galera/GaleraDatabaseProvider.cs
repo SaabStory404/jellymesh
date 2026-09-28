@@ -14,7 +14,7 @@ namespace Jellyfin.Database.Providers.Galera;
 /// interceptors (see docs/jellymesh-db-options.md for why).
 /// </summary>
 [JellyfinDatabaseProviderKey("Jellyfin-Galera")]
-public sealed class GaleraDatabaseProvider : IJellyfinDatabaseProvider
+public sealed partial class GaleraDatabaseProvider : IJellyfinDatabaseProvider
 {
     private readonly ILogger<GaleraDatabaseProvider> _logger;
 
@@ -136,9 +136,33 @@ public sealed class GaleraDatabaseProvider : IJellyfinDatabaseProvider
         await dbContext.Database.ExecuteSqlRawAsync(sql).ConfigureAwait(false);
     }
 
-    private static string RedactPassword(string connectionString) =>
-        string.Join(';', connectionString.Split(';').Select(p =>
-            p.TrimStart().StartsWith("password", StringComparison.OrdinalIgnoreCase) || p.TrimStart().StartsWith("pwd", StringComparison.OrdinalIgnoreCase)
-                ? p[..(p.IndexOf('=') + 1)] + "*****"
-                : p));
+    /// <summary>
+    /// Masks the password in a MySQL connection string for logging. Parsed with the connection-string
+    /// builder so a quoted password containing <c>;</c> (<c>Password="a;b"</c>) is masked whole; the
+    /// regex fallback (malformed strings the builder rejects) also treats quoted values as one token.
+    /// </summary>
+    /// <param name="connectionString">Connection string, possibly with a password.</param>
+    /// <returns>The connection string with any password replaced by <c>*****</c>.</returns>
+    internal static string RedactPassword(string connectionString)
+    {
+        try
+        {
+            var builder = new MySqlConnector.MySqlConnectionStringBuilder(connectionString);
+            if (!string.IsNullOrEmpty(builder.Password))
+            {
+                builder.Password = "*****";
+            }
+
+            return builder.ConnectionString;
+        }
+        catch (Exception ex) when (ex is ArgumentException or FormatException or InvalidOperationException)
+        {
+            // Logging must never be what fails startup; a bad value (Port=abc) surfaces at connect.
+            return PasswordPattern().Replace(connectionString, "$1*****");
+        }
+    }
+
+    // key = "double-quoted with "" escapes" | 'single-quoted with '' escapes' | bare to next ';'.
+    [System.Text.RegularExpressions.GeneratedRegex("""((?:^|;)\s*(?:password|pwd)\s*=\s*)(?:"(?:[^"]|"")*"?|'(?:[^']|'')*'?|[^;]*)""", System.Text.RegularExpressions.RegexOptions.IgnoreCase)]
+    private static partial System.Text.RegularExpressions.Regex PasswordPattern();
 }
