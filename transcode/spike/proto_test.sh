@@ -678,6 +678,61 @@ if [ -n "$NATIVE" ]; then
   seg_left=present; [ -e "$SEGF" ] || seg_left=removed
   echo "shared: throttle keys=$(keys2) bounded=$bounded repaused=$repaused stale_resume_after=${stale}s runs_after=$runs sidecar=$seg_left (newest $n1/$n2 -> $n3 -> $n4, stale_logged=$gauge)"
   kill "$AGT" 2>/dev/null
+
+  echo "== 21g: SIGTERM while the orphan throttle holds a detached job paused: u, next segment, drained"
+  # Without the resume the drain waits for a segment a paused ffmpeg never writes and the job is
+  # killed at the drain deadline instead of at a segment boundary.
+  mkdir -p "$T/keys3"
+  sed "s#/keys2/#/keys3/#" "$T/ff-stop" > "$T/ff-stop3"; chmod +x "$T/ff-stop3"
+  keys3() { cat "$T"/keys3/* 2>/dev/null; }
+  drained_n() { grep -c "ending job (Drained)" "$T/agent.log"; }
+  TC_KIND=cpu TC_NAME=drn TC_FFMPEG="$T/ff-stop3" TC_LOG="$T/agent.log" TC_PORT=19924 TC_ORPHAN_IDLE_SECS=30 \
+    TC_ORPHAN_LEAD_MAX_SECS=6 TC_ORPHAN_LEAD_RESUME_SECS=4 TC_ORPHAN_POS_STALE_SECS=60 \
+    $AGENT >> "$T/agent.log" 2>&1 &
+  AGD=$!
+  listening 19924
+  rm -f "$T/outsh/${STEM}"*
+  echo 0 > "$SEGF"
+  ( while :; do touch "$KA" "$SEGF"; sleep 1; done ) &
+  TOUCH=$!
+  ( until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done ) \
+    | TC_WORKERS=drn=127.0.0.1:19924 JELLYMESH_KEEPALIVE="$KA" $SHIM "${SH_VOD[@]}" 2>/dev/null &
+  SHD=$!
+  until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done
+  sleep 1
+  kill -9 "$SHD"
+  t0=$SECONDS
+  until [ "$(keys3)" = p ] || [ $((SECONDS - t0)) -gt 30 ]; do sleep 0.5; done
+  sleep 2; n1=$(newest); d0=$(drained_n)
+  t0=$SECONDS
+  kill -TERM "$AGD"
+  while kill -0 "$AGD" 2>/dev/null && [ $((SECONDS - t0)) -lt 30 ]; do sleep 0.2; done
+  dt=$((SECONDS - t0)); n2=$(newest)
+  next=no; [ -n "$n1" ] && [ -n "$n2" ] && [ "$n2" -gt "$n1" ] && next=yes
+  kill "$TOUCH" 2>/dev/null
+  echo "shared: drain-paused-orphan keys=$(keys3) next_segment=$next drained_logged=$(( $(drained_n) - d0 )) agent_exit_after=${dt}s (newest $n1 -> $n2)"
+
+  echo "== 21h: SIGTERM while Jellyfin's throttler holds an attached job paused: u, next segment, drained"
+  mkdir -p "$T/keys4"
+  sed "s#/keys2/#/keys4/#" "$T/ff-stop" > "$T/ff-stop4"; chmod +x "$T/ff-stop4"
+  keys4() { cat "$T"/keys4/* 2>/dev/null; }
+  TC_KIND=cpu TC_NAME=drj TC_FFMPEG="$T/ff-stop4" TC_LOG="$T/agent.log" TC_PORT=19925 $AGENT >> "$T/agent.log" 2>&1 &
+  AGJ=$!
+  listening 19925
+  rm -f "$T/outsh/${STEM}"*
+  ( until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done; printf p; sleep 60 ) \
+    | TC_WORKERS=drj=127.0.0.1:19925 timeout 60 $SHIM "${SH_VOD[@]}" 2>/dev/null &
+  SHJ=$!
+  t0=$SECONDS
+  until [ "$(keys4)" = p ] || [ $((SECONDS - t0)) -gt 30 ]; do sleep 0.5; done
+  sleep 2; n1=$(newest); d0=$(drained_n)
+  t0=$SECONDS
+  kill -TERM "$AGJ"
+  while kill -0 "$AGJ" 2>/dev/null && [ $((SECONDS - t0)) -lt 30 ]; do sleep 0.2; done
+  dt=$((SECONDS - t0)); n2=$(newest)
+  next=no; [ -n "$n1" ] && [ -n "$n2" ] && [ "$n2" -gt "$n1" ] && next=yes
+  kill "$SHJ" 2>/dev/null
+  echo "shared: drain-paused-attached keys=$(keys4) next_segment=$next drained_logged=$(( $(drained_n) - d0 )) agent_exit_after=${dt}s (newest $n1 -> $n2)"
   kill "$AGSH" 2>/dev/null
 fi
 

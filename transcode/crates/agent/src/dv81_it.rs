@@ -225,9 +225,13 @@ struct Harness {
 }
 
 fn harness() -> Harness {
+    harness_with(Config::minimal(), None)
+}
+
+fn harness_with(cfg: Config, detach: Option<Arc<Detach>>) -> Harness {
     let (_drain_tx, drain_rx) = watch::channel(false);
     let state = Arc::new(State {
-        cfg: Config::minimal(),
+        cfg,
         probed: crate::probe::Probed {
             outputs: vec![],
             gpu_tonemap: false,
@@ -250,7 +254,7 @@ fn harness() -> Harness {
         ended: std::sync::Mutex::new(None),
         state: state.clone(),
         job_id: 1,
-        detach: None,
+        detach,
     });
     let (tx, mut rx) = mpsc::channel::<Result<ServerMsg, Status>>(1024);
     let stderr = Arc::new(std::sync::Mutex::new(String::new()));
@@ -580,5 +584,106 @@ async fn a_non_dv_source_falls_back_as_not_p7() {
     );
     let init = ffprobe(&[p(&out.join("init.mp4"))]);
     assert!(!init.contains("DOVI configuration record"), "{init}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// pool-r1 (jm8 follow-up): a detached DV7 -> 8.1 job must be throttleable like a plain one. The
+/// orphan throttle's edge is the HLS muxer's `Opening '<stem>N.<ext>' for writing` on the pumped
+/// stderr, and its keys go down the job's stdin channel; in the converting pipeline both must be
+/// ffmpeg#2's (the HLS writer), never ffmpeg#1's (the demuxer: `-nostdin`, stderr to the log).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_detached_dv81_job_sees_segment_progress_and_its_keys_reach_the_hls_writer() {
+    if !have_tools() {
+        eprintln!("SKIP a_detached_dv81_job_sees_segment_progress: ffmpeg/ffprobe/libx265 missing");
+        return;
+    }
+    const STEM: &str = "0123456789abcdef0123456789abcdef";
+    let dir = tmpdir("detach");
+    let src = build_fixture(&dir, true);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    // Jellyfin's names: <stem>.m3u8, <stem>N.mp4, <stem>-1.mp4 (init).
+    let args: Vec<String> = remux_args(&src, &out, None)
+        .into_iter()
+        .map(|a| {
+            a.replace("seg%d.mp4", &format!("{STEM}%d.mp4"))
+                .replace("main.m3u8", &format!("{STEM}.m3u8"))
+                .replace("init.mp4", &format!("{STEM}-1.mp4"))
+        })
+        .collect();
+    // Record what reaches each ffmpeg's stdin, keyed by which one it is (ffmpeg#2 reads pipe:3).
+    let wrapper = dir.join("ff-keys");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *pipe:3*) exec 9<&0; ( cat <&9 > '{d}/keys-mux' ) & exec ffmpeg \"$@\" < /dev/null;;\n  *pipe:1*) exec 9<&0; ( cat <&9 > '{d}/keys-demux' ) & exec ffmpeg \"$@\" < /dev/null;;\nesac\nexec ffmpeg \"$@\"\n",
+            d = p(&dir)
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut cfg = Config::minimal();
+    cfg.ffmpeg = p(&wrapper).to_string();
+    cfg.detach = true;
+    cfg.policy.output_root = p(&dir).to_string();
+    let pl = out.join(format!("{STEM}.m3u8"));
+    std::fs::write(tcpool_ir::shared::lease_path(p(&pl)), "token").unwrap();
+    let d = Detach::from_job(&cfg, &args, p(&dir.join("keepalive")))
+        .expect("detachable")
+        .expect("a lease and a Jellyfin-shaped output");
+    let d = Arc::new(d);
+    let h = harness_with(cfg, Some(d.clone()));
+    // The throttle's keys, queued before ffmpeg#2 exists: whoever drains the channel gets them.
+    h._stdin_tx.send(Some(b"p".to_vec())).await.unwrap();
+    h._stdin_tx.send(Some(b"u".to_vec())).await.unwrap();
+
+    let code = run_signaled(&h, &args).await;
+    let stderr = h.stderr.lock().unwrap().clone();
+    assert_eq!(code, 0, "converting pipeline failed:\n{stderr}");
+    assert_eq!(dv81_count(&h, crate::metrics::Dv81Outcome::Converted), 1);
+
+    let segs = std::fs::read_dir(&out)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.strip_prefix(STEM)?
+                .strip_suffix(".mp4")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .expect("segments written");
+    assert!(
+        segs >= 2,
+        "fixture too short for the check: last segment {segs}"
+    );
+    // Opening the last segment (index `segs`) means 0..segs-1 are complete.
+    assert_eq!(
+        d.newest_written(),
+        Some(segs - 1),
+        "the throttle edge must come from ffmpeg#2's stderr:\n{stderr}"
+    );
+    let read = |n: &str| {
+        let f = dir.join(n);
+        for _ in 0..40 {
+            if let Ok(t) = std::fs::read_to_string(&f) {
+                if !t.is_empty() {
+                    return t;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::fs::read_to_string(&f).unwrap_or_default()
+    };
+    assert_eq!(
+        read("keys-mux"),
+        "pu",
+        "p/u must reach ffmpeg#2 (the HLS writer)"
+    );
+    assert_eq!(read("keys-demux"), "", "ffmpeg#1 must not get the keys");
     let _ = std::fs::remove_dir_all(&dir);
 }

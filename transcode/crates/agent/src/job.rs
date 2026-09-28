@@ -354,6 +354,7 @@ pub async fn run_job(
     // Client -> us: stdin keys, heartbeats. Stream end or error = shim gone -> fence.
     let reader = {
         let ctl = ctl.clone();
+        let drain = state.drain.clone();
         tokio::spawn(async move {
             loop {
                 match inbound.message().await {
@@ -363,6 +364,12 @@ pub async fn run_job(
                             Some(client_msg::Msg::Stdin(b)) => {
                                 // Jellyfin's throttler keys: p = pause, u = resume, q = quit
                                 let key = b.iter().rev().find(|k| matches!(k, b'p' | b'u' | b'q'));
+                                if key == Some(&b'p') && *drain.borrow() {
+                                    // Draining: the job must reach its next segment and end
+                                    // (see `drain_watch`); a pause now would only run out the
+                                    // grace period.
+                                    continue;
+                                }
                                 match key {
                                     Some(b'p') => ctl.paused.store(true, Ordering::SeqCst),
                                     Some(b'u') => ctl.paused.store(false, Ordering::SeqCst),
@@ -435,6 +442,7 @@ pub async fn run_job(
         let ctl = ctl.clone();
         let stdin_tx = stdin_detach.clone();
         let cfg = cfg.clone();
+        let drain = state.drain.clone();
         tokio::spawn(async move {
             // Counts this job in `tcpool_orphans_paused` while the agent holds it paused; the
             // guard's Drop undoes that when the watcher returns or is aborted at job end.
@@ -449,7 +457,7 @@ pub async fn run_job(
                     ctl.end(Ended::TakenOver, "another replica took this output over");
                     return;
                 }
-                if d.is_detached() {
+                if d.is_detached() && !*drain.borrow() {
                     // Nobody sends Jellyfin's throttler keys any more: keep the output a bounded
                     // lead ahead of the viewer ourselves (a job Jellyfin had paused when its
                     // replica died is resumed here too, unless the viewer is far behind).
@@ -478,13 +486,15 @@ pub async fn run_job(
                             t.lead_secs.map_or("unknown".into(), |l| format!("{l:.0}s")),
                         ));
                     }
-                    if d.expired(&cfg, std::time::SystemTime::now()) {
-                        ctl.end(
-                            Ended::Orphaned,
-                            "detached and the session keepalive went stale",
-                        );
-                        return;
-                    }
+                } else if *drain.borrow() {
+                    held.set(false); // `drain_watch` resumes it
+                }
+                if d.is_detached() && d.expired(&cfg, std::time::SystemTime::now()) {
+                    ctl.end(
+                        Ended::Orphaned,
+                        "detached and the session keepalive went stale",
+                    );
+                    return;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -524,9 +534,12 @@ pub async fn run_job(
         })
     };
     // Drain: on SIGTERM let the current segment finish, then end the job so Jellyfin restarts
-    // it on another worker (the drill-proven restart path).
+    // it on another worker (the drill-proven restart path). A paused ffmpeg (Jellyfin's
+    // throttler, or the agent's own orphan throttle) writes no next segment, so it is resumed
+    // first (`u`); the reader and the detach watcher stop pausing once draining.
     let drain_watch = {
         let ctl = ctl.clone();
+        let stdin_tx = stdin_detach.clone();
         let mut drain = state.drain.clone();
         let mapped: Vec<String> = job.args.iter().map(|a| map_path(a, &cfg.pathmap)).collect();
         tokio::spawn(async move {
@@ -550,6 +563,14 @@ pub async fn run_job(
             loop {
                 if ctl.done.load(Ordering::SeqCst) {
                     return;
+                }
+                // Every tick, not once: a `p` already in flight when the drain began (from
+                // Jellyfin or the detach watcher) is undone on the next one.
+                if ctl.paused.swap(false, Ordering::SeqCst) {
+                    crate::log(format_args!(
+                        "agent draining: resuming paused ffmpeg (u) so it reaches its next segment"
+                    ));
+                    let _ = stdin_tx.send(Some(b"u".to_vec())).await;
                 }
                 let now = tcpool_ir::last_segment_index(&mapped);
                 if now > base || started.elapsed() > Duration::from_secs(10) {
