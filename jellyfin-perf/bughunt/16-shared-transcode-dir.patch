@@ -1,0 +1,1075 @@
+diff --git a/Jellyfin.Api/Controllers/DynamicHlsController.cs b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+index 31394c7f4..82bd2ede2 100644
+--- a/Jellyfin.Api/Controllers/DynamicHlsController.cs
++++ b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+@@ -1477,6 +1477,17 @@ public class DynamicHlsController : BaseJellyfinApiController
+ 
+         var segmentExtension = EncodingHelper.GetSegmentFileExtension(state.Request.SegmentContainer);
+ 
++        // JellyMesh shared transcode dir: a segment request is proof of life for the session, on
++        // whichever replica it lands. The job's owner (another replica, or a pool agent whose
++        // replica died) reads this instead of its own, now silent, request stream. The requested
++        // index is the viewer's position: a pool agent throttles an orphaned job against it.
++        if (SharedTranscodeDirEnabled)
++        {
++            var transcodePath = _serverConfigurationManager.GetTranscodePath();
++            SharedTranscodeDir.Touch(transcodePath, streamingRequest.PlaySessionId, null);
++            SharedTranscodeDir.RecordSegmentRequest(transcodePath, streamingRequest.PlaySessionId, segmentId);
++        }
++
+         // Keep segment selection and transcoding replacement under the same playlist lock.
+         // An out-of-order request must not replace a job while another request is using its output.
+         using (await _transcodeManager.LockAsync(playlistPath, linkedCancellationToken).ConfigureAwait(false))
+@@ -1541,9 +1552,23 @@ public class DynamicHlsController : BaseJellyfinApiController
+                         var lastForeignWriteUtc = lastForeignFile is null ? (DateTime?)null : _fileSystem.GetLastWriteTimeUtc(lastForeignFile);
+                         var writerFreshnessWindow = TimeSpan.FromSeconds(Math.Max(state.SegmentLength * 2, 10));
+ 
+-                        if (ShouldWaitForOtherWriter(lastForeignWriteUtc, DateTime.UtcNow, writerFreshnessWindow))
++                        // A seek relative to the other writer (behind its newest segment, or past
++                        // Jellyfin's own restart gap) will never be satisfied by waiting: restart
++                        // now. The transcode-pool shim then takes the output over from that writer.
++                        var foreignIndex = GetSegmentIndexFromFile(playlistPath, lastForeignFile);
++                        var isSeek = SharedTranscodeDir.IsSeekAwayFromWriter(segmentId, foreignIndex, segmentGapRequiringTranscodingChange);
++                        if (isSeek)
++                        {
++                            _logger.LogDebug("Requested segment {0} is a seek away from the other writer's segment {1}; starting a new transcode", segmentId, foreignIndex);
++                        }
++
++                        if (!isSeek && ShouldWaitForOtherWriter(lastForeignWriteUtc, DateTime.UtcNow, writerFreshnessWindow))
+                         {
+-                            var nextSegmentPath = GetSegmentPath(state, playlistPath, segmentId + 1);
++                            // A pool writer (fresh lease) publishes segments with temp_file, so the
++                            // segment alone is complete; otherwise also wait for the next one.
++                            var nextSegmentPath = SharedTranscodeDir.IsLeaseFresh(playlistPath, DateTime.UtcNow)
++                                ? segmentPath
++                                : GetSegmentPath(state, playlistPath, segmentId + 1);
+                             var waitForOtherWriterTimeout = TimeSpan.FromSeconds(Math.Max(state.SegmentLength * 3, 15));
+                             if (await WaitForSegmentFromOtherWriter(segmentPath, nextSegmentPath, waitForOtherWriterTimeout, linkedCancellationToken).ConfigureAwait(false))
+                             {
+@@ -1637,7 +1662,32 @@ public class DynamicHlsController : BaseJellyfinApiController
+     /// <returns><c>true</c> if GetDynamicSegment should go on to check the shared directory for a fresh foreign segment.</returns>
+     internal static bool ShouldCheckForOtherWriter(TranscodingJob? currentJob)
+     {
+-        return SharedTranscodeDirEnabled && currentJob is null;
++        // An exited local job (e.g. its output was taken over by another replica) is no more
++        // authoritative than none: its ffmpeg is gone, but another writer may not be.
++        return SharedTranscodeDirEnabled && (currentJob is null || currentJob.HasExited);
++    }
++
++    /// <summary>
++    /// The segment index encoded in a segment file's name (<c>&lt;playlist stem&gt;&lt;index&gt;.&lt;ext&gt;</c>).
++    /// </summary>
++    /// <param name="playlistPath">The playlist path.</param>
++    /// <param name="file">The segment file, if any.</param>
++    /// <returns>The index, or <c>null</c> if there is no file or the name does not parse.</returns>
++    internal static int? GetSegmentIndexFromFile(string playlistPath, FileSystemMetadata? file)
++    {
++        if (file is null)
++        {
++            return null;
++        }
++
++        var stem = Path.GetFileNameWithoutExtension(playlistPath);
++        var name = Path.GetFileNameWithoutExtension(file.Name);
++        if (name.Length <= stem.Length || !name.StartsWith(stem, StringComparison.OrdinalIgnoreCase))
++        {
++            return null;
++        }
++
++        return int.TryParse(name.AsSpan(stem.Length), NumberStyles.Integer, CultureInfo.InvariantCulture, out var index) ? index : null;
+     }
+ 
+     /// <summary>
+diff --git a/Jellyfin.Api/Controllers/PlaystateController.cs b/Jellyfin.Api/Controllers/PlaystateController.cs
+index 4ff1eef41..42c4c5f13 100644
+--- a/Jellyfin.Api/Controllers/PlaystateController.cs
++++ b/Jellyfin.Api/Controllers/PlaystateController.cs
+@@ -220,10 +220,27 @@ public class PlaystateController : BaseJellyfinApiController
+     {
+         playbackProgressInfo.PlayMethod = ValidatePlayMethod(playbackProgressInfo.PlayMethod, playbackProgressInfo.PlaySessionId);
+         playbackProgressInfo.SessionId = await RequestHelpers.GetSessionId(_sessionManager, _userManager, HttpContext).ConfigureAwait(false);
++        PingSharedTranscode(playbackProgressInfo);
+         await _sessionManager.OnPlaybackProgress(playbackProgressInfo).ConfigureAwait(false);
+         return NoContent();
+     }
+ 
++    /// <summary>
++    /// JellyMesh shared transcode dir: record the client's liveness (and paused state) before the
++    /// progress event fans out. The kill timer otherwise only hears about progress through the
++    /// PlaybackProgress event, and a subscriber that throws first (MEASURED: the Playback Reporting
++    /// plugin, for a session this replica never saw start) stops it from ever running -- which is
++    /// the normal case on the replica a client fails over to.
++    /// </summary>
++    /// <param name="info">The progress report.</param>
++    private void PingSharedTranscode(PlaybackProgressInfo info)
++    {
++        if (SharedTranscodeDir.Enabled && !string.IsNullOrEmpty(info.PlaySessionId))
++        {
++            _transcodeManager.PingTranscodingJob(info.PlaySessionId, info.IsPaused);
++        }
++    }
++
+     /// <summary>
+     /// Pings a playback session.
+     /// </summary>
+@@ -388,6 +405,7 @@ public class PlaystateController : BaseJellyfinApiController
+ 
+         playbackProgressInfo.PlayMethod = ValidatePlayMethod(playbackProgressInfo.PlayMethod, playbackProgressInfo.PlaySessionId);
+         playbackProgressInfo.SessionId = await RequestHelpers.GetSessionId(_sessionManager, _userManager, HttpContext).ConfigureAwait(false);
++        PingSharedTranscode(playbackProgressInfo);
+         await _sessionManager.OnPlaybackProgress(playbackProgressInfo).ConfigureAwait(false);
+         return NoContent();
+     }
+diff --git a/MediaBrowser.Controller/MediaEncoding/SharedTranscodeDir.cs b/MediaBrowser.Controller/MediaEncoding/SharedTranscodeDir.cs
+new file mode 100644
+index 000000000..864a1bdaa
+--- /dev/null
++++ b/MediaBrowser.Controller/MediaEncoding/SharedTranscodeDir.cs
+@@ -0,0 +1,389 @@
++using System;
++using System.Collections.Concurrent;
++using System.Globalization;
++using System.IO;
++using System.Linq;
++
++namespace MediaBrowser.Controller.MediaEncoding;
++
++/// <summary>
++/// JellyMesh shared transcode directory (JELLYMESH_SHARED_TRANSCODE_DIR=1): every Jellyfin
++/// replica uses one transcode directory, so a replica can serve (and outlive) segments another
++/// replica's job is writing. This class holds the cross-replica file contract Jellyfin needs:
++/// <list type="bullet">
++/// <item><description>a per-session keepalive file, <c>&lt;transcode dir&gt;/.jellymesh-alive/&lt;PlaySessionId&gt;</c>, touched by
++/// whichever replica receives a segment request or a progress ping for that session, and read by the owning
++/// replica's kill timer (and by a transcode-pool agent running a job whose replica died);</description></item>
++/// <item><description>the transcode pool's per-output lease, <c>&lt;stem&gt;.tcpool.lock</c> next to the playlist, whose holder token
++/// starts with the holder's host name. A fresh lease held by another host means another replica owns that output.</description></item>
++/// <item><description>a per-session viewer position, <c>&lt;keepalive&gt;.seg</c>: the index of the last segment any replica served a
++/// request for (mtime = when). A pool agent running a job whose replica died throttles it against this, as Jellyfin's own
++/// throttler would have.</description></item>
++/// </list>
++/// Everything here is a no-op unless the flag is set, and every file operation is best-effort:
++/// a failure falls back to stock (per-replica) behaviour, never to an exception on a request path.
++/// </summary>
++public static class SharedTranscodeDir
++{
++    /// <summary>
++    /// The environment variable set on every HLS ffmpeg (the transcode-pool shim) in shared mode,
++    /// naming the session keepalive file.
++    /// </summary>
++    public const string KeepaliveEnvironmentVariable = "JELLYMESH_KEEPALIVE";
++
++    /// <summary>
++    /// The keepalive directory's name under the transcode directory.
++    /// </summary>
++    public const string KeepaliveDirectoryName = ".jellymesh-alive";
++
++    /// <summary>
++    /// Appended to a keepalive path to name the session's viewer-position file.
++    /// </summary>
++    public const string PositionSuffix = ".seg";
++
++    /// <summary>
++    /// A pool lease older than this is dead (its holder heartbeats every second).
++    /// </summary>
++    public static readonly TimeSpan LeaseStaleAfter = TimeSpan.FromSeconds(6);
++
++    /// <summary>
++    /// Touches of the same session's keepalive closer together than this are skipped (NFS writes).
++    /// </summary>
++    public static readonly TimeSpan TouchInterval = TimeSpan.FromSeconds(2);
++
++    private static readonly ConcurrentDictionary<string, (DateTime AtUtc, bool Paused)> _lastTouch = new(StringComparer.Ordinal);
++
++    private static readonly ConcurrentDictionary<string, (DateTime AtUtc, int Index)> _lastPosition = new(StringComparer.Ordinal);
++
++    /// <summary>
++    /// Gets a value indicating whether shared transcode directory mode is on. Read on every call
++    /// (not cached) so tests can toggle it.
++    /// </summary>
++    public static bool Enabled => Environment.GetEnvironmentVariable("JELLYMESH_SHARED_TRANSCODE_DIR") == "1";
++
++    /// <summary>
++    /// Gets the host name this replica writes into pool lease tokens (the shim's <c>HOSTNAME</c>).
++    /// </summary>
++    public static string HostName => Environment.GetEnvironmentVariable("HOSTNAME") is { Length: > 0 } h ? h : Environment.MachineName;
++
++    /// <summary>
++    /// The keepalive file for a play session, or <c>null</c> when the session id is missing or not a
++    /// plain token (it becomes a file name).
++    /// </summary>
++    /// <param name="transcodePath">The transcode directory.</param>
++    /// <param name="playSessionId">The play session id.</param>
++    /// <returns>The keepalive path, or <c>null</c>.</returns>
++    public static string? GetKeepalivePath(string transcodePath, string? playSessionId)
++    {
++        if (string.IsNullOrEmpty(transcodePath)
++            || string.IsNullOrEmpty(playSessionId)
++            || playSessionId.Length > 128
++            || !playSessionId.All(c => char.IsAsciiLetterOrDigit(c) || c == '-' || c == '_'))
++        {
++            return null;
++        }
++
++        return Path.Combine(transcodePath, KeepaliveDirectoryName, playSessionId);
++    }
++
++    /// <summary>
++    /// Records that a client of this play session is alive (a segment request or a progress ping
++    /// reached this replica). <paramref name="isPaused"/> <c>null</c> keeps the last reported state.
++    /// Throttled per session to one write every <see cref="TouchInterval"/> unless the paused state changes.
++    /// </summary>
++    /// <param name="transcodePath">The transcode directory.</param>
++    /// <param name="playSessionId">The play session id.</param>
++    /// <param name="isPaused">Whether the client reported itself paused, if it said.</param>
++    /// <returns><c>true</c> if the file was written.</returns>
++    public static bool Touch(string transcodePath, string? playSessionId, bool? isPaused)
++    {
++        var path = GetKeepalivePath(transcodePath, playSessionId);
++        if (path is null)
++        {
++            return false;
++        }
++
++        var now = DateTime.UtcNow;
++        var known = _lastTouch.TryGetValue(path, out var last);
++        var paused = isPaused ?? (known && last.Paused);
++        if (known && paused == last.Paused && now - last.AtUtc < TouchInterval)
++        {
++            return false;
++        }
++
++        try
++        {
++            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
++            if (!known || paused != last.Paused || !File.Exists(path))
++            {
++                File.WriteAllText(path, paused ? "paused" : "playing");
++            }
++
++            // Explicit, not implied by the write: the reader compares this against its own clock.
++            File.SetLastWriteTimeUtc(path, now);
++            _lastTouch[path] = (now, paused);
++            if (_lastTouch.Count > 4096)
++            {
++                PruneTouchCache(now);
++            }
++
++            return true;
++        }
++        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
++        {
++            return false;
++        }
++    }
++
++    /// <summary>
++    /// Reads a keepalive file: when it was last touched and whether the client last reported paused.
++    /// </summary>
++    /// <param name="path">The keepalive path.</param>
++    /// <returns>The state, or <c>null</c> if the file does not exist or cannot be read.</returns>
++    public static (DateTime TouchedUtc, bool Paused)? ReadKeepalive(string? path)
++    {
++        if (path is null)
++        {
++            return null;
++        }
++
++        try
++        {
++            if (!File.Exists(path))
++            {
++                return null;
++            }
++
++            var touched = File.GetLastWriteTimeUtc(path);
++            var paused = File.ReadAllText(path).StartsWith("paused", StringComparison.Ordinal);
++            return (touched, paused);
++        }
++        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
++        {
++            return null;
++        }
++    }
++
++    /// <summary>
++    /// The viewer-position file for a play session (<c>&lt;keepalive&gt;.seg</c>), or <c>null</c> when
++    /// the session id is not usable (see <see cref="GetKeepalivePath"/>).
++    /// </summary>
++    /// <param name="transcodePath">The transcode directory.</param>
++    /// <param name="playSessionId">The play session id.</param>
++    /// <returns>The position path, or <c>null</c>.</returns>
++    public static string? GetPositionPath(string transcodePath, string? playSessionId)
++        => GetKeepalivePath(transcodePath, playSessionId) is { } keepalive ? keepalive + PositionSuffix : null;
++
++    /// <summary>
++    /// Records the segment a client of this play session just requested, on whichever replica got
++    /// the request. The transcode-pool agent throttles a job whose replica died against it. Written
++    /// to a temporary file and renamed (a reader never sees a torn value); rewritten whenever the
++    /// index changes, otherwise at most every <see cref="TouchInterval"/>.
++    /// </summary>
++    /// <param name="transcodePath">The transcode directory.</param>
++    /// <param name="playSessionId">The play session id.</param>
++    /// <param name="segmentIndex">The requested segment index (negative, e.g. an fMP4 init segment, is ignored).</param>
++    /// <returns><c>true</c> if the file was written.</returns>
++    public static bool RecordSegmentRequest(string transcodePath, string? playSessionId, int segmentIndex)
++    {
++        var path = segmentIndex < 0 ? null : GetPositionPath(transcodePath, playSessionId);
++        if (path is null)
++        {
++            return false;
++        }
++
++        var now = DateTime.UtcNow;
++        if (_lastPosition.TryGetValue(path, out var last) && last.Index == segmentIndex && now - last.AtUtc < TouchInterval)
++        {
++            return false;
++        }
++
++        var temp = path + ".tmp-" + Environment.ProcessId.ToString(CultureInfo.InvariantCulture);
++        try
++        {
++            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
++            File.WriteAllText(temp, segmentIndex.ToString(CultureInfo.InvariantCulture));
++            File.SetLastWriteTimeUtc(temp, now);
++            File.Move(temp, path, true);
++            _lastPosition[path] = (now, segmentIndex);
++            if (_lastPosition.Count > 4096)
++            {
++                PruneTouchCache(now);
++            }
++
++            return true;
++        }
++        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
++        {
++            try
++            {
++                File.Delete(temp);
++            }
++            catch (Exception cleanup) when (cleanup is IOException or UnauthorizedAccessException)
++            {
++                // best effort
++            }
++
++            return false;
++        }
++    }
++
++    /// <summary>
++    /// Reads a viewer-position file.
++    /// </summary>
++    /// <param name="path">The position path.</param>
++    /// <returns>The segment index and when it was written, or <c>null</c> if missing or unreadable.</returns>
++    public static (int Index, DateTime WrittenUtc)? ReadPosition(string? path)
++    {
++        if (path is null)
++        {
++            return null;
++        }
++
++        try
++        {
++            if (!File.Exists(path)
++                || !int.TryParse(File.ReadAllText(path).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var index))
++            {
++                return null;
++            }
++
++            return (index, File.GetLastWriteTimeUtc(path));
++        }
++        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
++        {
++            return null;
++        }
++    }
++
++    /// <summary>
++    /// How much longer a job must be kept alive because of its session keepalive: the keepalive's
++    /// age measured against the kill timeout that applies to it (<paramref name="pausedTimeoutMs"/>
++    /// when the last touch said paused). Zero or less means no replica has seen the client recently.
++    /// </summary>
++    /// <param name="keepalive">The keepalive state, if any.</param>
++    /// <param name="utcNow">The current time.</param>
++    /// <param name="playingTimeoutMs">The kill timeout for a playing client.</param>
++    /// <param name="pausedTimeoutMs">The kill timeout for a paused client.</param>
++    /// <returns>Milliseconds left, or zero.</returns>
++    public static int KeepaliveRemainingMs((DateTime TouchedUtc, bool Paused)? keepalive, DateTime utcNow, int playingTimeoutMs, int pausedTimeoutMs)
++    {
++        if (keepalive is not { } k)
++        {
++            return 0;
++        }
++
++        var timeout = k.Paused ? pausedTimeoutMs : playingTimeoutMs;
++
++        // A touch "in the future" (clock skew between replicas) counts as now.
++        var age = Math.Max(0, (utcNow - k.TouchedUtc).TotalMilliseconds);
++        return (int)Math.Max(0, Math.Min(timeout, timeout - age));
++    }
++
++    /// <summary>
++    /// The pool lease file for an HLS output: <c>&lt;dir&gt;/&lt;stem&gt;.tcpool.lock</c>.
++    /// </summary>
++    /// <param name="outputPath">The playlist (or any file named after the output stem).</param>
++    /// <returns>The lease path.</returns>
++    public static string GetLeasePath(string outputPath)
++        => Path.Combine(Path.GetDirectoryName(outputPath) ?? string.Empty, Path.GetFileNameWithoutExtension(outputPath) + ".tcpool.lock");
++
++    /// <summary>
++    /// Whether the lease token names another host (tokens are <c>host:pid:nanos</c>). An empty or
++    /// unreadable token cannot be proven ours, so it counts as foreign.
++    /// </summary>
++    /// <param name="token">The lease file's content.</param>
++    /// <param name="ownHost">This replica's host name.</param>
++    /// <returns><c>true</c> if the token belongs to another host.</returns>
++    public static bool IsForeignToken(string? token, string ownHost)
++    {
++        if (string.IsNullOrEmpty(token))
++        {
++            return true;
++        }
++
++        var sep = token.IndexOf(':', StringComparison.Ordinal);
++        var host = sep < 0 ? token : token[..sep];
++        return !string.Equals(host, ownHost, StringComparison.Ordinal);
++    }
++
++    /// <summary>
++    /// Whether another replica currently owns an HLS output: its pool lease is fresh and not ours.
++    /// Used to keep this replica's cleanup away from files another replica's writer is producing
++    /// under the same (session-derived) name.
++    /// </summary>
++    /// <param name="outputPath">The playlist path.</param>
++    /// <param name="utcNow">The current time.</param>
++    /// <param name="ownHost">This replica's host name; <see cref="HostName"/> when <c>null</c>.</param>
++    /// <returns><c>true</c> if another replica holds a fresh lease on the output.</returns>
++    public static bool IsHeldByAnotherReplica(string outputPath, DateTime utcNow, string? ownHost = null)
++    {
++        var lease = GetLeasePath(outputPath);
++        try
++        {
++            if (!File.Exists(lease) || utcNow - File.GetLastWriteTimeUtc(lease) > LeaseStaleAfter)
++            {
++                return false;
++            }
++
++            return IsForeignToken(File.ReadAllText(lease), ownHost ?? HostName);
++        }
++        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
++        {
++            // It existed a moment ago and we cannot read it: do not delete on a guess.
++            return true;
++        }
++    }
++
++    /// <summary>
++    /// Whether a fresh pool lease exists on an HLS output (anyone's). A pool writer publishes
++    /// segments with <c>temp_file</c>, so an existing segment under a fresh lease is complete.
++    /// </summary>
++    /// <param name="outputPath">The playlist path.</param>
++    /// <param name="utcNow">The current time.</param>
++    /// <returns><c>true</c> if the lease is fresh.</returns>
++    public static bool IsLeaseFresh(string outputPath, DateTime utcNow)
++    {
++        var lease = GetLeasePath(outputPath);
++        try
++        {
++            return File.Exists(lease) && utcNow - File.GetLastWriteTimeUtc(lease) <= LeaseStaleAfter;
++        }
++        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
++        {
++            return false;
++        }
++    }
++
++    /// <summary>
++    /// Whether a request with no local job for its playlist is a seek relative to what another
++    /// writer is producing: behind the writer's newest segment (that segment is missing, or it
++    /// would have been served), or further ahead than Jellyfin's own restart gap. Such a request
++    /// must restart the transcode at once instead of waiting for the writer to get there.
++    /// </summary>
++    /// <param name="requestedSegment">The requested segment index.</param>
++    /// <param name="writerSegment">The newest segment index on disk, if any.</param>
++    /// <param name="maxGap">Jellyfin's restart gap (<c>24 / SegmentLength</c>).</param>
++    /// <returns><c>true</c> if the request should restart the transcode.</returns>
++    public static bool IsSeekAwayFromWriter(int requestedSegment, int? writerSegment, int maxGap)
++        => writerSegment is { } w && (requestedSegment < w || requestedSegment - w > maxGap);
++
++    private static void PruneTouchCache(DateTime utcNow)
++    {
++        foreach (var entry in _lastTouch)
++        {
++            if (utcNow - entry.Value.AtUtc > TimeSpan.FromMinutes(10))
++            {
++                _lastTouch.TryRemove(entry.Key, out _);
++            }
++        }
++
++        foreach (var entry in _lastPosition)
++        {
++            if (utcNow - entry.Value.AtUtc > TimeSpan.FromMinutes(10))
++            {
++                _lastPosition.TryRemove(entry.Key, out _);
++            }
++        }
++    }
++}
+diff --git a/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs b/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
+index 8afafc85d..4ee23eaa8 100644
+--- a/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
++++ b/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
+@@ -145,6 +145,15 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+ 
+         _logger.LogDebug("PingTranscodingJob PlaySessionId={0} isUsedPaused: {1}", playSessionId, isUserPaused);
+ 
++        // JellyMesh shared transcode dir: the job for this session may live on another replica
++        // (or on a transcode-pool agent whose replica died). Record the ping where every replica
++        // and the agent can see it, before looking for a local job -- a replica that serves the
++        // client without owning the job has none, which is exactly the case this exists for.
++        if (SharedTranscodeDir.Enabled)
++        {
++            SharedTranscodeDir.Touch(_serverConfigurationManager.GetTranscodePath(), playSessionId, isUserPaused);
++        }
++
+         List<TranscodingJob> jobs;
+ 
+         lock (_activeTranscodingJobs)
+@@ -219,6 +228,18 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+                 job.StartKillTimer(OnTranscodeKillTimerStopped, job.PingTimeout);
+                 return;
+             }
++
++            var sharedRemainingMs = GetSharedKeepaliveRemainingMs(job, DateTime.UtcNow);
++            if (sharedRemainingMs > 0)
++            {
++                _logger.LogDebug(
++                    "Transcoding kill timer for JobId {0} PlaySessionId {1} deferred {2} ms: the client is alive on another replica",
++                    job.Id,
++                    job.PlaySessionId,
++                    sharedRemainingMs);
++                job.StartKillTimer(OnTranscodeKillTimerStopped, sharedRemainingMs);
++                return;
++            }
+         }
+ 
+         _logger.LogInformation("Transcoding kill timer stopped for JobId {0} PlaySessionId {1}. Killing transcoding", job.Id, job.PlaySessionId);
+@@ -226,6 +247,30 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+         await KillTranscodingJob(job, true, path => true).ConfigureAwait(false);
+     }
+ 
++    /// <summary>
++    /// JellyMesh shared transcode dir: how long an HLS job must stay alive because its client was
++    /// seen (segment request or progress ping) on any replica, per the session keepalive file.
++    /// Zero when the flag is off, the job has no play session, or nobody has seen the client within
++    /// the kill timeout that applies to its last reported state (paused or playing).
++    /// </summary>
++    /// <param name="job">The job whose kill timer fired.</param>
++    /// <param name="utcNow">The current time.</param>
++    /// <returns>Milliseconds to re-arm the timer for, or zero to proceed with the kill.</returns>
++    internal int GetSharedKeepaliveRemainingMs(TranscodingJob job, DateTime utcNow)
++    {
++        if (!SharedTranscodeDir.Enabled || job.Type == TranscodingJobType.Progressive)
++        {
++            return 0;
++        }
++
++        var path = SharedTranscodeDir.GetKeepalivePath(_serverConfigurationManager.GetTranscodePath(), job.PlaySessionId);
++        return SharedTranscodeDir.KeepaliveRemainingMs(
++            SharedTranscodeDir.ReadKeepalive(path),
++            utcNow,
++            GetKillTimeoutMs(job.Type, false),
++            GetKillTimeoutMs(job.Type, true));
++    }
++
+     /// <inheritdoc />
+     public Task KillTranscodingJobs(string deviceId, string? playSessionId, Func<string, bool> deleteFiles)
+     {
+@@ -318,6 +363,20 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+                     return;
+                 }
+ 
++                // JellyMesh shared transcode dir: the output name is derived from the play session,
++                // so a replacement job on another replica (it took the output over, e.g. for a seek
++                // it served) writes the very files this replica is about to delete. The pool lease
++                // says who writes them now.
++                if (SharedTranscodeDir.Enabled
++                    && jobType != TranscodingJobType.Progressive
++                    && SharedTranscodeDir.IsHeldByAnotherReplica(path, DateTime.UtcNow))
++                {
++                    _logger.LogInformation(
++                        "Skipping deletion of partial stream file(s) {Path}; another replica's transcode owns this output",
++                        path);
++                    return;
++                }
++
+                 if (jobType == TranscodingJobType.Progressive)
+                 {
+                     DeleteProgressivePartialStreamFiles(path);
+@@ -575,6 +634,20 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+ 
+         process.Exited += (_, _) => OnFfMpegProcessExited(process, transcodingJob, state);
+ 
++        // JellyMesh shared transcode dir: tell the transcode-pool shim which keepalive file speaks
++        // for this session, so the pool can keep the encode running (and serving every replica)
++        // if this replica dies mid-stream. Stock ffmpeg ignores the variable.
++        if (SharedTranscodeDir.Enabled && transcodingJobType == TranscodingJobType.Hls)
++        {
++            var transcodePath = _serverConfigurationManager.GetTranscodePath();
++            var keepalivePath = SharedTranscodeDir.GetKeepalivePath(transcodePath, state.Request.PlaySessionId);
++            if (keepalivePath is not null)
++            {
++                SharedTranscodeDir.Touch(transcodePath, state.Request.PlaySessionId, null);
++                process.StartInfo.Environment[SharedTranscodeDir.KeepaliveEnvironmentVariable] = keepalivePath;
++            }
++        }
++
+         try
+         {
+             process.Start();
+@@ -818,7 +891,9 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+         // JELLYFIN_SHARED_DB=1: several Jellyfin replicas share one transcode dir, so wiping it at
+         // startup would delete the segments another replica is serving right now. Only clear what is
+         // old enough to belong to no live session.
+-        var sharedCutoff = Environment.GetEnvironmentVariable("JELLYFIN_SHARED_DB") == "1"
++        // JELLYMESH_SHARED_TRANSCODE_DIR=1 is the same situation stated directly (the pool's leases,
++        // affinity pins and session keepalives live there too): same cutoff.
++        var sharedCutoff = Environment.GetEnvironmentVariable("JELLYFIN_SHARED_DB") == "1" || SharedTranscodeDir.Enabled
+             ? DateTime.UtcNow.AddHours(-6)
+             : (DateTime?)null;
+ 
+diff --git a/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerTests.cs b/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerTests.cs
+index 83900e8de..d69f6a4f4 100644
+--- a/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerTests.cs
++++ b/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerTests.cs
+@@ -328,6 +328,43 @@ namespace Jellyfin.Api.Tests.Controllers
+             Assert.Equal(expected, DynamicHlsController.SharedTranscodeDirEnabled);
+         }
+ 
++        [Fact]
++        public void ShouldCheckForOtherWriter_FlagSet_ExitedLocalJob_ReturnsTrue()
++        {
++            using var env = new EnvVarScope("JELLYMESH_SHARED_TRANSCODE_DIR", "1");
++            var job = new TranscodingJob(NullLogger<TranscodingJob>.Instance) { HasExited = true };
++
++            // An exited local job (its output taken over by another replica) must not make this
++            // replica restart the transcode under a writer that is still producing it.
++            Assert.True(DynamicHlsController.ShouldCheckForOtherWriter(job));
++        }
++
++        [Fact]
++        public void ShouldCheckForOtherWriter_FlagUnset_ExitedLocalJob_ReturnsFalse()
++        {
++            using var env = new EnvVarScope("JELLYMESH_SHARED_TRANSCODE_DIR", null);
++            var job = new TranscodingJob(NullLogger<TranscodingJob>.Instance) { HasExited = true };
++
++            Assert.False(DynamicHlsController.ShouldCheckForOtherWriter(job));
++        }
++
++        [Theory]
++        [InlineData("/t/0123456789abcdef0123456789abcdef.m3u8", "0123456789abcdef0123456789abcdef17.ts", 17)]
++        [InlineData("/t/0123456789abcdef0123456789abcdef.m3u8", "0123456789abcdef0123456789abcdef0.mp4", 0)]
++        [InlineData("/t/0123456789abcdef0123456789abcdef.m3u8", "0123456789abcdef0123456789abcdef.ts", null)]
++        [InlineData("/t/0123456789abcdef0123456789abcdef.m3u8", "ffffffffffffffffffffffffffffffff3.ts", null)]
++        [InlineData("/t/0123456789abcdef0123456789abcdef.m3u8", "0123456789abcdef0123456789abcdefx.ts", null)]
++        public void GetSegmentIndexFromFile_ParsesTheIndexAfterTheStem(string playlist, string fileName, int? expected)
++        {
++            var file = new MediaBrowser.Model.IO.FileSystemMetadata { Name = fileName, FullName = "/t/" + fileName };
++
++            Assert.Equal(expected, DynamicHlsController.GetSegmentIndexFromFile(playlist, file));
++        }
++
++        [Fact]
++        public void GetSegmentIndexFromFile_NoFile_ReturnsNull()
++            => Assert.Null(DynamicHlsController.GetSegmentIndexFromFile("/t/a.m3u8", null));
++
+         /// <summary>
+         /// Sets an environment variable for the scope's lifetime and restores the prior value on
+         /// dispose, so JELLYMESH_SHARED_TRANSCODE_DIR tests do not leak state to other tests.
+diff --git a/tests/Jellyfin.Controller.Tests/MediaEncoding/SharedTranscodeDirTests.cs b/tests/Jellyfin.Controller.Tests/MediaEncoding/SharedTranscodeDirTests.cs
+new file mode 100644
+index 000000000..8f93d1b2e
+--- /dev/null
++++ b/tests/Jellyfin.Controller.Tests/MediaEncoding/SharedTranscodeDirTests.cs
+@@ -0,0 +1,169 @@
++using System;
++using System.IO;
++using MediaBrowser.Controller.MediaEncoding;
++using Xunit;
++
++namespace Jellyfin.Controller.Tests.MediaEncoding;
++
++/// <summary>
++/// JellyMesh shared transcode dir: the cross-replica file contract (session keepalive, pool lease).
++/// </summary>
++public sealed class SharedTranscodeDirTests : IDisposable
++{
++    private const string Stem = "0123456789abcdef0123456789abcdef";
++
++    private readonly DirectoryInfo _dir = Directory.CreateTempSubdirectory(nameof(SharedTranscodeDirTests));
++
++    public void Dispose() => _dir.Delete(true);
++
++    [Theory]
++    [InlineData("abc123", true)]
++    [InlineData("0f1e2d3c-4b5a_x", true)]
++    [InlineData("", false)]
++    [InlineData(null, false)]
++    [InlineData("../etc", false)]
++    [InlineData("a/b", false)]
++    [InlineData("a b", false)]
++    public void GetKeepalivePath_OnlyForPlainTokens(string? playSessionId, bool expected)
++    {
++        var path = SharedTranscodeDir.GetKeepalivePath("/transcodes/jf", playSessionId);
++        Assert.Equal(expected, path is not null);
++        if (expected)
++        {
++            Assert.Equal(Path.Combine("/transcodes/jf", ".jellymesh-alive", playSessionId!), path);
++        }
++    }
++
++    [Fact]
++    public void GetKeepalivePath_RejectsOverlongIds()
++        => Assert.Null(SharedTranscodeDir.GetKeepalivePath("/t", new string('a', 129)));
++
++    [Fact]
++    public void Touch_WritesStateAndKeepsItWhenUnspecified()
++    {
++        var id = "touch" + Guid.NewGuid().ToString("N");
++        Assert.True(SharedTranscodeDir.Touch(_dir.FullName, id, true));
++        var path = SharedTranscodeDir.GetKeepalivePath(_dir.FullName, id);
++        var ka = SharedTranscodeDir.ReadKeepalive(path);
++        Assert.NotNull(ka);
++        Assert.True(ka.Value.Paused);
++        Assert.True(DateTime.UtcNow - ka.Value.TouchedUtc < TimeSpan.FromSeconds(5));
++
++        // Within the throttle window and no state change: skipped.
++        Assert.False(SharedTranscodeDir.Touch(_dir.FullName, id, null));
++        Assert.False(SharedTranscodeDir.Touch(_dir.FullName, id, true));
++
++        // A state change is always written, throttle or not.
++        Assert.True(SharedTranscodeDir.Touch(_dir.FullName, id, false));
++        Assert.False(SharedTranscodeDir.ReadKeepalive(path)!.Value.Paused);
++    }
++
++    [Fact]
++    public void Touch_IgnoresUnsafeSessionIds()
++        => Assert.False(SharedTranscodeDir.Touch(_dir.FullName, "../x", false));
++
++    [Fact]
++    public void ReadKeepalive_MissingFile_IsNull()
++    {
++        Assert.Null(SharedTranscodeDir.ReadKeepalive(Path.Combine(_dir.FullName, "nope")));
++        Assert.Null(SharedTranscodeDir.ReadKeepalive(null));
++    }
++
++    [Fact]
++    public void KeepaliveRemainingMs_UsesThePausedOrPlayingTimeout()
++    {
++        var now = new DateTime(2026, 9, 28, 12, 0, 0, DateTimeKind.Utc);
++        Assert.Equal(0, SharedTranscodeDir.KeepaliveRemainingMs(null, now, 60000, 180000));
++        Assert.Equal(50000, SharedTranscodeDir.KeepaliveRemainingMs((now.AddSeconds(-10), false), now, 60000, 180000));
++        Assert.Equal(0, SharedTranscodeDir.KeepaliveRemainingMs((now.AddSeconds(-61), false), now, 60000, 180000));
++
++        // A paused client that stopped pinging 100 s ago is still inside the paused grace.
++        Assert.Equal(80000, SharedTranscodeDir.KeepaliveRemainingMs((now.AddSeconds(-100), true), now, 60000, 180000));
++        Assert.Equal(0, SharedTranscodeDir.KeepaliveRemainingMs((now.AddSeconds(-181), true), now, 60000, 180000));
++
++        // Clock skew: a touch in the future counts as now, never more than the full timeout.
++        Assert.Equal(60000, SharedTranscodeDir.KeepaliveRemainingMs((now.AddSeconds(30), false), now, 60000, 180000));
++    }
++
++    [Theory]
++    [InlineData("jf-a:12:34", "jf-a", false)]
++    [InlineData("jf-b:12:34", "jf-a", true)]
++    [InlineData("jf-a", "jf-a", false)]
++    [InlineData("", "jf-a", true)]
++    [InlineData(null, "jf-a", true)]
++    public void IsForeignToken_ComparesTheHostPart(string? token, string host, bool expected)
++        => Assert.Equal(expected, SharedTranscodeDir.IsForeignToken(token, host));
++
++    [Fact]
++    public void GetLeasePath_IsTheStemSibling()
++        => Assert.Equal(
++            Path.Combine("/transcodes/jf", Stem + ".tcpool.lock"),
++            SharedTranscodeDir.GetLeasePath(Path.Combine("/transcodes/jf", Stem + ".m3u8")));
++
++    [Fact]
++    public void IsHeldByAnotherReplica_FreshForeignLeaseOnly()
++    {
++        var playlist = Path.Combine(_dir.FullName, Stem + ".m3u8");
++        var lease = SharedTranscodeDir.GetLeasePath(playlist);
++        var now = DateTime.UtcNow;
++
++        Assert.False(SharedTranscodeDir.IsHeldByAnotherReplica(playlist, now, "jf-a"));
++
++        File.WriteAllText(lease, "jf-b:1:2");
++        File.SetLastWriteTimeUtc(lease, now);
++        Assert.True(SharedTranscodeDir.IsHeldByAnotherReplica(playlist, now, "jf-a"));
++        Assert.False(SharedTranscodeDir.IsHeldByAnotherReplica(playlist, now, "jf-b"));
++        Assert.True(SharedTranscodeDir.IsLeaseFresh(playlist, now));
++
++        // Stale: the holder is gone, the output is nobody's.
++        File.SetLastWriteTimeUtc(lease, now.AddSeconds(-30));
++        Assert.False(SharedTranscodeDir.IsHeldByAnotherReplica(playlist, now, "jf-a"));
++        Assert.False(SharedTranscodeDir.IsLeaseFresh(playlist, now));
++    }
++
++    [Theory]
++    [InlineData(10, null, 4, false)] // no writer at all
++    [InlineData(10, 10, 4, false)] // at the writer's edge: wait
++    [InlineData(12, 10, 4, false)] // a little ahead: wait
++    [InlineData(15, 10, 4, true)] // past the restart gap
++    [InlineData(3, 10, 4, true)] // behind the writer, and the segment is missing
++    public void IsSeekAwayFromWriter_MatchesJellyfinsRestartRule(int requested, int? writer, int gap, bool expected)
++        => Assert.Equal(expected, SharedTranscodeDir.IsSeekAwayFromWriter(requested, writer, gap));
++
++    [Fact]
++    public void RecordSegmentRequest_WritesTheIndexNextToTheKeepalive()
++    {
++        var id = "pos" + Guid.NewGuid().ToString("N");
++        var path = SharedTranscodeDir.GetPositionPath(_dir.FullName, id);
++        Assert.Equal(SharedTranscodeDir.GetKeepalivePath(_dir.FullName, id) + ".seg", path);
++
++        Assert.True(SharedTranscodeDir.RecordSegmentRequest(_dir.FullName, id, 17));
++        // The pool agent parses the whole file as a plain decimal index.
++        Assert.Equal("17", File.ReadAllText(path!));
++        var first = SharedTranscodeDir.ReadPosition(path);
++        Assert.Equal(17, first!.Value.Index);
++        Assert.True(DateTime.UtcNow - first.Value.WrittenUtc < TimeSpan.FromMinutes(1));
++
++        // The same index again within the touch interval: skipped. A new index: written at once.
++        Assert.False(SharedTranscodeDir.RecordSegmentRequest(_dir.FullName, id, 17));
++        Assert.True(SharedTranscodeDir.RecordSegmentRequest(_dir.FullName, id, 18));
++        Assert.Equal(18, SharedTranscodeDir.ReadPosition(path)!.Value.Index);
++        // A seek back is a position too.
++        Assert.True(SharedTranscodeDir.RecordSegmentRequest(_dir.FullName, id, 3));
++        Assert.Equal(3, SharedTranscodeDir.ReadPosition(path)!.Value.Index);
++
++        // Written via a temporary file and a rename: nothing else is left behind.
++        var dir = Path.GetDirectoryName(path)!;
++        Assert.Empty(Directory.GetFiles(dir, Path.GetFileName(path) + ".tmp-*"));
++    }
++
++    [Fact]
++    public void RecordSegmentRequest_IgnoresInitSegmentsAndUnsafeIds()
++    {
++        Assert.False(SharedTranscodeDir.RecordSegmentRequest(_dir.FullName, "pos-init", -1));
++        Assert.Null(SharedTranscodeDir.ReadPosition(SharedTranscodeDir.GetPositionPath(_dir.FullName, "pos-init")));
++        Assert.False(SharedTranscodeDir.RecordSegmentRequest(_dir.FullName, "../x", 5));
++        Assert.Null(SharedTranscodeDir.GetPositionPath(_dir.FullName, "../x"));
++        Assert.Null(SharedTranscodeDir.ReadPosition(null));
++    }
++}
+diff --git a/tests/Jellyfin.MediaEncoding.Tests/Transcoding/SharedTranscodeDirEnvCollection.cs b/tests/Jellyfin.MediaEncoding.Tests/Transcoding/SharedTranscodeDirEnvCollection.cs
+new file mode 100644
+index 000000000..7172d877b
+--- /dev/null
++++ b/tests/Jellyfin.MediaEncoding.Tests/Transcoding/SharedTranscodeDirEnvCollection.cs
+@@ -0,0 +1,11 @@
++using Xunit;
++
++namespace Jellyfin.MediaEncoding.Tests.Transcoding;
++
++/// <summary>
++/// Serializes the tests that flip JELLYMESH_SHARED_TRANSCODE_DIR (process-wide state).
++/// </summary>
++[CollectionDefinition(nameof(SharedTranscodeDirEnvCollection), DisableParallelization = true)]
++public sealed class SharedTranscodeDirEnvCollection
++{
++}
+diff --git a/tests/Jellyfin.MediaEncoding.Tests/Transcoding/TranscodeManagerSharedDirTests.cs b/tests/Jellyfin.MediaEncoding.Tests/Transcoding/TranscodeManagerSharedDirTests.cs
+new file mode 100644
+index 000000000..97f287c63
+--- /dev/null
++++ b/tests/Jellyfin.MediaEncoding.Tests/Transcoding/TranscodeManagerSharedDirTests.cs
+@@ -0,0 +1,189 @@
++using System;
++using System.IO;
++using System.Threading.Tasks;
++using MediaBrowser.Common.Configuration;
++using MediaBrowser.Controller.Configuration;
++using MediaBrowser.Controller.IO;
++using MediaBrowser.Controller.Library;
++using MediaBrowser.Controller.MediaEncoding;
++using MediaBrowser.Controller.Session;
++using MediaBrowser.MediaEncoding.Transcoding;
++using MediaBrowser.Model.Configuration;
++using MediaBrowser.Model.IO;
++using Microsoft.Extensions.Configuration;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.MediaEncoding.Tests.Transcoding;
++
++/// <summary>
++/// JellyMesh shared transcode dir: the owner's kill timer honours a keepalive touched on another
++/// replica, and cleanup never deletes an output another replica's writer now owns.
++/// </summary>
++[Collection(nameof(SharedTranscodeDirEnvCollection))]
++public sealed class TranscodeManagerSharedDirTests : IDisposable
++{
++    private const string Stem = "0123456789abcdef0123456789abcdef";
++
++    private readonly DirectoryInfo _dir = Directory.CreateTempSubdirectory(nameof(TranscodeManagerSharedDirTests));
++    private readonly string? _originalFlag = Environment.GetEnvironmentVariable("JELLYMESH_SHARED_TRANSCODE_DIR");
++
++    public TranscodeManagerSharedDirTests()
++    {
++        Environment.SetEnvironmentVariable("JELLYMESH_SHARED_TRANSCODE_DIR", "1");
++    }
++
++    public void Dispose()
++    {
++        Environment.SetEnvironmentVariable("JELLYMESH_SHARED_TRANSCODE_DIR", _originalFlag);
++        _dir.Delete(true);
++    }
++
++    private (TranscodeManager Manager, Mock<IFileSystem> FileSystem) CreateManager()
++    {
++        var fileSystem = new Mock<IFileSystem>();
++        fileSystem.Setup(f => f.GetFilePaths(It.IsAny<string>(), true)).Returns(Array.Empty<string>());
++
++        var appPaths = Mock.Of<IApplicationPaths>();
++        var serverConfigurationManager = new Mock<IServerConfigurationManager>();
++        serverConfigurationManager.Setup(s => s.GetConfiguration("encoding")).Returns(new EncodingOptions { TranscodingTempPath = _dir.FullName });
++        serverConfigurationManager.Setup(s => s.CommonApplicationPaths).Returns(Mock.Of<IApplicationPaths>(a => a.CachePath == "/cache"));
++
++        var mediaEncoder = new Mock<IMediaEncoder>();
++        var encodingHelper = new EncodingHelper(
++            appPaths,
++            mediaEncoder.Object,
++            new Mock<ISubtitleEncoder>().Object,
++            new Mock<IConfiguration>().Object,
++            new Mock<MediaBrowser.Common.Configuration.IConfigurationManager>().Object,
++            new Mock<IPathManager>().Object);
++
++        var manager = new TranscodeManager(
++            NullLoggerFactory.Instance,
++            fileSystem.Object,
++            appPaths,
++            serverConfigurationManager.Object,
++            Mock.Of<IUserManager>(),
++            new Mock<ISessionManager>().Object,
++            encodingHelper,
++            mediaEncoder.Object,
++            Mock.Of<IMediaSourceManager>(),
++            Mock.Of<IAttachmentExtractor>());
++
++        return (manager, fileSystem);
++    }
++
++    private TranscodingJob CreateJob(string playSessionId)
++        => new(NullLogger<TranscodingJob>.Instance)
++        {
++            Path = Path.Combine(_dir.FullName, Stem + ".m3u8"),
++            Type = TranscodingJobType.Hls,
++            PlaySessionId = playSessionId
++        };
++
++    private void WriteKeepalive(string playSessionId, string state, DateTime touchedUtc)
++    {
++        var path = SharedTranscodeDir.GetKeepalivePath(_dir.FullName, playSessionId)!;
++        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
++        File.WriteAllText(path, state);
++        File.SetLastWriteTimeUtc(path, touchedUtc);
++    }
++
++    [Fact]
++    public void KillTimer_KeepsAJobWhoseClientPingsAnotherReplica()
++    {
++        var (manager, _) = CreateManager();
++        var now = DateTime.UtcNow;
++        WriteKeepalive("sessplaying", "playing", now.AddSeconds(-10));
++
++        var remaining = manager.GetSharedKeepaliveRemainingMs(CreateJob("sessplaying"), now);
++
++        Assert.InRange(remaining, 49000, 50000);
++    }
++
++    [Fact]
++    public void KillTimer_PausedOnAnotherReplicaGetsThePausedGrace()
++    {
++        var (manager, _) = CreateManager();
++        var now = DateTime.UtcNow;
++
++        // 100 s without a ping would kill a playing session (60 s) but not a paused one (180 s).
++        WriteKeepalive("sesspaused", "paused", now.AddSeconds(-100));
++
++        var remaining = manager.GetSharedKeepaliveRemainingMs(CreateJob("sesspaused"), now);
++
++        Assert.InRange(remaining, 79000, 80000);
++    }
++
++    [Fact]
++    public void KillTimer_ProceedsWhenNobodySawTheClient()
++    {
++        var (manager, _) = CreateManager();
++        var now = DateTime.UtcNow;
++        WriteKeepalive("sessgone", "playing", now.AddSeconds(-61));
++
++        Assert.Equal(0, manager.GetSharedKeepaliveRemainingMs(CreateJob("sessgone"), now));
++        Assert.Equal(0, manager.GetSharedKeepaliveRemainingMs(CreateJob("sessnever"), now));
++    }
++
++    [Fact]
++    public void KillTimer_IgnoresTheKeepaliveWhenTheFlagIsOff()
++    {
++        var (manager, _) = CreateManager();
++        var now = DateTime.UtcNow;
++        WriteKeepalive("sessoff", "playing", now);
++        Environment.SetEnvironmentVariable("JELLYMESH_SHARED_TRANSCODE_DIR", null);
++
++        Assert.Equal(0, manager.GetSharedKeepaliveRemainingMs(CreateJob("sessoff"), now));
++    }
++
++    [Fact]
++    public void Ping_TouchesTheSharedKeepaliveWithoutALocalJob()
++    {
++        var (manager, _) = CreateManager();
++
++        manager.PingTranscodingJob("sessping", true);
++
++        var ka = SharedTranscodeDir.ReadKeepalive(SharedTranscodeDir.GetKeepalivePath(_dir.FullName, "sessping"));
++        Assert.NotNull(ka);
++        Assert.True(ka.Value.Paused);
++    }
++
++    [Fact]
++    public async Task DeletePartialStreamFiles_SkipsAnOutputAnotherReplicaOwns()
++    {
++        var (manager, fileSystem) = CreateManager();
++        var playlist = Path.Combine(_dir.FullName, Stem + ".m3u8");
++        var lease = SharedTranscodeDir.GetLeasePath(playlist);
++        await File.WriteAllTextAsync(lease, "some-other-replica:42:1", TestContext.Current.CancellationToken);
++        File.SetLastWriteTimeUtc(lease, DateTime.UtcNow);
++        fileSystem.Setup(f => f.GetFilePaths(_dir.FullName, false)).Returns(new[] { Path.Combine(_dir.FullName, Stem + "12.ts") });
++
++        await manager.DeletePartialStreamFiles(playlist, TranscodingJobType.Hls, 0, 0);
++
++        fileSystem.Verify(f => f.DeleteFile(It.IsAny<string>()), Times.Never);
++    }
++
++    [Fact]
++    public async Task DeletePartialStreamFiles_DeletesOwnOrUnleasedOutputs()
++    {
++        var (manager, fileSystem) = CreateManager();
++        var playlist = Path.Combine(_dir.FullName, Stem + ".m3u8");
++        var segment = Path.Combine(_dir.FullName, Stem + "12.ts");
++        fileSystem.Setup(f => f.GetFilePaths(_dir.FullName, false)).Returns(new[] { segment });
++
++        // Our own (fresh) lease: our job, our files.
++        var lease = SharedTranscodeDir.GetLeasePath(playlist);
++        await File.WriteAllTextAsync(lease, SharedTranscodeDir.HostName + ":42:1", TestContext.Current.CancellationToken);
++        File.SetLastWriteTimeUtc(lease, DateTime.UtcNow);
++        await manager.DeletePartialStreamFiles(playlist, TranscodingJobType.Hls, 0, 0);
++        fileSystem.Verify(f => f.DeleteFile(segment), Times.Once);
++
++        // A stale foreign lease: its holder is gone, the files are garbage.
++        await File.WriteAllTextAsync(lease, "some-other-replica:42:1", TestContext.Current.CancellationToken);
++        File.SetLastWriteTimeUtc(lease, DateTime.UtcNow.AddMinutes(-1));
++        await manager.DeletePartialStreamFiles(playlist, TranscodingJobType.Hls, 0, 0);
++        fileSystem.Verify(f => f.DeleteFile(segment), Times.Exactly(2));
++    }
++}
