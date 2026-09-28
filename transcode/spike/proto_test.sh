@@ -534,7 +534,7 @@ if [ -n "$NATIVE" ]; then
            -hls_time 3 -hls_list_size 0 -start_number 12 -hls_segment_filename "$T/outsh/${STEM}%d.ts" "$T/outsh/${STEM}.m3u8")
   SH_ARGS2=(-re -i "$T/src.mkv" -c:v libx264 -preset ultrafast -force_key_frames "expr:gte(t,n_forced*3)" -f hls
            -hls_time 3 -hls_list_size 0 -hls_segment_filename "$T/outsh/${STEM2}%d.ts" "$T/outsh/${STEM2}.m3u8")
-  encsh() { pgrep -f "ffmpeg -re -i $T/src.mkv.*outsh/$1"; }
+  encsh() { pgrep -f "^ffmpeg .*src.mkv.*outsh/$1"; }
   segs() { ls "$T/outsh" | grep -c "^$1[0-9]*\.ts$"; }
   lease_age() { echo $(( $(date +%s) - $(stat -c %Y "$T/outsh/$1.tcpool.lock" 2>/dev/null || echo 0) )); }
   ( while :; do touch "$KA"; sleep 1; done ) &
@@ -545,13 +545,14 @@ if [ -n "$NATIVE" ]; then
   SHA=$!
   until [ -e "$T/outsh/${STEM}1.ts" ]; do sleep 0.2; done
   pid1=$(encsh "$STEM")
-  kill -9 "$SHA"; wait "$SHA" 2>/dev/null
+  # no `wait`: bash would wait for the whole `sleep 60 | shim` pipeline job
+  kill -9 "$SHA"
   sleep 7
   pid2=$(encsh "$STEM"); n1=$(segs "$STEM"); sleep 4; n2=$(segs "$STEM")
   same=no; [ -n "$pid1" ] && [ "$pid1" = "$pid2" ] && same=yes
   grow=no; [ "$n2" -gt "$n1" ] && grow=yes
   fresh=no; [ "$(lease_age "$STEM")" -le 3 ] && fresh=yes
-  echo "shared: detached same_ffmpeg=$same growing=$grow lease_fresh=$fresh"
+  echo "shared: detached same_ffmpeg=$same growing=$grow lease_fresh=$fresh (pids $pid1/$pid2 segs $n1->$n2 lease_age $(lease_age "$STEM")s)"
 
   echo "== 21b: another replica's shim seeks the same output: takes it over from the orphan"
   ( sleep 6; printf q ) | TC_WORKERS=shared=127.0.0.1:19921 JELLYMESH_KEEPALIVE="$KA" timeout 40 $SHIM "${SH_SEEK[@]}" 2>/dev/null
@@ -581,7 +582,7 @@ if [ -n "$NATIVE" ]; then
   sleep 60 | TC_WORKERS=shared=127.0.0.1:19921 JELLYMESH_KEEPALIVE="$KA2" $SHIM "${SH_ARGS2[@]}" 2>/dev/null &
   SHC=$!
   until [ -e "$T/outsh/${STEM2}0.ts" ]; do sleep 0.2; done
-  kill -9 "$SHC"; wait "$SHC" 2>/dev/null
+  kill -9 "$SHC"
   t0=$SECONDS
   while encsh "$STEM2" >/dev/null && [ $((SECONDS - t0)) -lt 20 ]; do sleep 0.5; done
   gone=no; encsh "$STEM2" >/dev/null || gone=yes

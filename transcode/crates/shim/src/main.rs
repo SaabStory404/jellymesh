@@ -609,6 +609,22 @@ async fn follow(args: &[String], pl: &str) -> Option<Outcome> {
     }
 }
 
+/// Shared transcode dir: if the Jellyfin that started us dies without killing us (kill -9 of the
+/// server process under a supervisor that restarts it in the same container), we would stay
+/// connected forever with nobody left to send `q`, pinning the job as ATTACHED. Exit instead; the
+/// agent sees the connection drop and detaches the job, which then lives exactly as long as the
+/// session keepalive says the viewer does. The lease is left for the agent to keep fresh.
+fn watch_parent() {
+    let parent = std::os::unix::process::parent_id();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(500));
+        if std::os::unix::process::parent_id() != parent {
+            log("Jellyfin (our parent) is gone; exiting so the agent detaches the job");
+            std::process::exit(255);
+        }
+    });
+}
+
 async fn run(args: Vec<String>) -> Outcome {
     let sink: StdinSink = Arc::new(Mutex::new(None));
     start_stdin_pump(sink.clone());
@@ -648,6 +664,9 @@ async fn run(args: Vec<String>) -> Outcome {
     } else {
         String::new()
     };
+    if !keepalive.is_empty() {
+        watch_parent();
+    }
     let finish = |o: Outcome| {
         if let Some(l) = &lease {
             l.release();

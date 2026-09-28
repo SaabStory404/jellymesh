@@ -192,6 +192,10 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
 - [x] Shim overhead 0.33 ms vs 71 ms for Python (MEASURED)
 - [x] Protocol suite 14/14 on native binaries, locally and in CI (`tcpool` job)
 - [x] Per-output lease with follow-then-take-over (multi-replica Jellyfin)
+- [x] Shared transcode dir across Jellyfin replicas (docs/SHARED-TRANSCODE.md): jobs detach from a dead
+      replica's shim and keep writing, agent heartbeats the lease, takeover on a seek, session keepalive
+      for the kill timer (bughunt patch 14). jm-lab 2026-09-28: pod delete / kill -9 of the serving
+      replica with 3 sessions -> 0 failed, 0 slow, no new ffmpeg; suite case 21
 - [x] Native binaries serving tc-lab (2026-09-27): playback 0 failed requests; graceful pod delete of the
       serving Arc mid-4K-HDR → agent drained in 0.9 s, Jellyfin resumed at segment 22 on the new pod,
       0 failed requests, lowest buffer 1.3 s

@@ -56,12 +56,20 @@ in `Job.keepalive_path` (proto field 4). The agent validates it under `TC_OUTPUT
     +-- (fence on shim loss when not detachable: unchanged)
 ```
 
+The shim also exits when its parent Jellyfin process disappears (a `kill -9` of the server under a
+supervisor that restarts it in the same container would otherwise leave the shim connected, the job
+ATTACHED, and nobody to send `q`), so that case detaches too.
+
 `TC_DETACH=0` turns detaching off; `TC_ORPHAN_MAX_SECS` (6 h) caps a detached job. Metrics:
 `tcpool_jobs_total{outcome="detached"|"taken_over"|"orphan_expired"}`. An agent drain (SIGTERM) still
 ends detached jobs after their next segment, like any job.
 
 ## Cross-replica keepalive (the kill-timer blocker)
 
+- `PlaystateController`'s progress handlers call `PingTranscodingJob` directly before the
+  PlaybackProgress event fans out: a throwing subscriber earlier in the chain (MEASURED in jm-lab:
+  the Playback Reporting plugin, for a session the replica never saw start) otherwise stops the
+  transcode manager's handler from running, which is exactly the failed-over case.
 - `PingTranscodingJob` (progress/ping, any replica) touches the keepalive **before** the local job
   lookup, preserving the paused state when the ping does not say (`/Sessions/Playing/Ping`).
 - `GetDynamicSegment` (any replica) touches it on every segment request.
@@ -109,6 +117,26 @@ replica serves them. Segments:
 - Mixed versions: a new shim against an old agent sends a field the old agent ignores (no detach,
   takeover unanswered -> follow after 8 s). An old shim against a new agent never sends a keepalive
   (fence-on-loss, unchanged). Roll agents first, then Jellyfin.
+
+## Lab proof (jm-lab, 2026-09-28, MEASURED)
+
+Setup: both `jm-jf` replicas on one transcode dir (`/transcodes/jm-st` on the NFS scratch), patch 14
+overlay + new shim, one NVENC agent built from this branch (`jm-st-agent`, plaintext, lab only).
+Client: `transcode/spike/shared_dir_drill.py`, 3 concurrent HLS sessions (1080p H.264 -> 720p,
+3 s segments, player pacing with a 12 s buffer) through the Traefik failover route
+(primary `jm-jf-0`, fallback `jm-jf-1`). "Slow" = a segment request > 3 s; each session's first
+segment (cold start, 3.7-4.8 s) is reported separately.
+
+| Drill | Failed segments | Slow (excl. first) | Slowest in failover window | New ffmpeg for the sessions |
+|---|---|---|---|---|
+| A: `kubectl delete pod` the serving replica at +45 s | 0 / 162 | 0 | 0.55 s | none: agent `accepted` 3 -> 3 (per drill), 3x "shim lost ... detaching", survivor's FFmpeg log count unchanged |
+| B: `kill -9` the serving Jellyfin process at +45 s | 0 / 162 | 0 | 1.33 s | none: shim saw its parent die in 0.4 s, 3x detach, `accepted` unchanged |
+| C: restart the *other* replica while `jm-jf-0` serves; session 0 paused 150 s with every progress ping sent only to `jm-jf-1` | 0 / 223 | 0 | 0.43 s | none: 3 jobs total; no "kill timer stopped" on the owner; all 194 files in the shared dir before `jm-jf-1`'s startup still present (same inodes) after |
+
+Before the direct progress ping (first run of C) the paused session's job WAS killed at pause+60 s
+by the owner's timer (the plugin exception above); that is what the `PlaystateController` change fixes.
+Orphan cleanup: after the viewers stopped, each detached job ended 60 s later ("viewer gone,
+removed ~290-315 files").
 
 ## Not covered
 
