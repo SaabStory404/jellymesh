@@ -55,6 +55,8 @@ public sealed partial class GaleraDatabaseProvider : IJellyfinDatabaseProvider
                 // Pomelo refuses to translate them. The model's own list columns keep their explicit
                 // JSON converters (GaleraModelConvention), so this changes query translation only.
                 .EnablePrimitiveCollectionsSupport())
+            // /health: CanConnect runs SELECT 1 on the pooled connection, not a new unpooled one per probe.
+            .ReplaceService<Microsoft.EntityFrameworkCore.Storage.IRelationalDatabaseCreator, GaleraDatabaseCreator>()
             .ConfigureWarnings(w => w.Ignore(RelationalEventId.NonTransactionalMigrationOperationWarning)
                 .Ignore(RelationalEventId.MultipleCollectionIncludeWarning));
     }
@@ -127,13 +129,61 @@ public sealed partial class GaleraDatabaseProvider : IJellyfinDatabaseProvider
     public Task DeleteBackup(string key) => Task.CompletedTask;
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// FOREIGN_KEY_CHECKS is session state. With <c>ConnectionReset=false</c> a pooled connection keeps it
+    /// for its next user, so the checks are switched back on in a finally on the same (explicitly opened)
+    /// connection, and if even that fails the pool is cleared so this session is never handed out again.
+    /// </remarks>
     public async Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames)
     {
+        ArgumentNullException.ThrowIfNull(dbContext);
         ArgumentNullException.ThrowIfNull(tableNames);
-        var sql = "SET FOREIGN_KEY_CHECKS = 0;\n"
-            + string.Join('\n', tableNames.Select(t => $"DELETE FROM `{t}`;"))
-            + "\nSET FOREIGN_KEY_CHECKS = 1;";
-        await dbContext.Database.ExecuteSqlRawAsync(sql).ConfigureAwait(false);
+        var database = dbContext.Database;
+        await database.OpenConnectionAsync().ConfigureAwait(false);
+        try
+        {
+            await PurgeAsync(
+                sql => database.ExecuteSqlRawAsync(sql),
+                tableNames,
+                () => MySqlConnector.MySqlConnection.ClearPool((MySqlConnector.MySqlConnection)database.GetDbConnection())).ConfigureAwait(false);
+        }
+        finally
+        {
+            await database.CloseConnectionAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Deletes every row of <paramref name="tableNames"/> with foreign-key checks off, and always turns
+    /// them back on afterwards. All statements must run on one connection.
+    /// </summary>
+    /// <param name="execute">Runs one SQL statement on the connection.</param>
+    /// <param name="tableNames">Tables to empty.</param>
+    /// <param name="discardConnection">Called when the checks could not be restored: the connection must not be reused.</param>
+    /// <returns>A task.</returns>
+    internal static async Task PurgeAsync(Func<string, Task> execute, IEnumerable<string> tableNames, Action discardConnection)
+    {
+        await execute("SET FOREIGN_KEY_CHECKS = 0").ConfigureAwait(false);
+        try
+        {
+            var deletes = string.Join('\n', tableNames.Select(t => $"DELETE FROM `{t}`;"));
+            if (deletes.Length > 0)
+            {
+                await execute(deletes).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            try
+            {
+                await execute("SET FOREIGN_KEY_CHECKS = 1").ConfigureAwait(false);
+            }
+            catch
+            {
+                discardConnection();
+                throw;
+            }
+        }
     }
 
     /// <summary>
