@@ -590,6 +590,30 @@ if [ -n "$NATIVE" ]; then
   left=$(ls "$T/outsh" | grep -c "^$STEM2")
   ka=present; [ -e "$KA2" ] || ka=removed
   echo "shared: orphan-expired ffmpeg_gone=$gone after=$((SECONDS - t0))s files_left=$left keepalive=$ka"
+  echo "== 21e: a throttler-paused job whose shim dies is resumed (u) by the agent"
+  # Stock ffmpeg has no p/u keys (case 11 fakes the pause with SIGSTOP), so this checks the key
+  # stream itself: a wrapper records what the agent writes to ffmpeg's stdin, then runs ffmpeg.
+  mkdir -p "$T/keys"
+  printf '#!/bin/sh\nexec 3<&0\n( cat <&3 > "%s/keys/$$" ) &\nexec ffmpeg "$@" < /dev/null\n' "$T" > "$T/ff-keys"
+  chmod +x "$T/ff-keys"
+  TC_KIND=cpu TC_NAME=keys TC_FFMPEG="$T/ff-keys" TC_LOG="$T/agent.log" TC_PORT=19922 TC_ORPHAN_IDLE_SECS=4 \
+    $AGENT >> "$T/agent.log" 2>&1 &
+  AGK=$!
+  listening 19922
+  rm -f "$T/outsh/${STEM}"*
+  ( while :; do touch "$KA"; sleep 1; done ) &
+  TOUCH=$!
+  ( until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done; printf p; sleep 60 ) \
+    | TC_WORKERS=keys=127.0.0.1:19922 JELLYMESH_KEEPALIVE="$KA" $SHIM "${SH_ARGS[@]}" 2>/dev/null &
+  SHK=$!
+  until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done
+  sleep 2
+  kill -9 "$SHK"
+  sleep 3
+  resumed=$(grep -l '^pu$' "$T"/keys/* 2>/dev/null | wc -l)
+  kill "$TOUCH" 2>/dev/null
+  echo "shared: paused-detach keys_pu=$resumed detach_logged=$(grep -c 'detaching: ffmpeg keeps writing' "$T/agent.log")"
+  kill "$AGK" 2>/dev/null
   kill "$AGSH" 2>/dev/null
 fi
 

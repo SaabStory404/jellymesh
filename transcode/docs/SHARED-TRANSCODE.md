@@ -112,7 +112,15 @@ replica serves them. Segments:
 - Both replicas: the same `TranscodingTempPath` (a subdirectory of the scratch mount, never its
   root: CONTRACT.md rule 1), `JELLYMESH_SHARED_TRANSCODE_DIR=1`, and the NFS mount options from
   CONTRACT.md (`actimeo=1` keeps lease and keepalive mtimes visible within ~1 s across nodes).
-- `HOSTNAME` must differ between replicas (it does: pod names). Lease tokens and the cleanup guard use it.
+- `HOSTNAME` must differ between replicas (it does: pod names). Lease tokens and the cleanup guard
+  use it: a replica treats a fresh lease whose token names its own host as its own output and may
+  delete it. With Deployments a restarted replica gets a new name; the lab's StatefulSet keeps the
+  name across restarts (the weaker case), which is safe only because a freshly started replica has
+  no job for that output and never runs the per-job delete for it.
+- Cost of a detached job: nothing throttles it (no owner, no `p`), and `EnableSegmentDeletion` never
+  runs on it (no owner job). MEASURED in jm-lab: each orphan wrote 287-315 segments (~15 min of
+  video) in the ~2.5 min between detach and expiry, holding its pool units at full speed until the
+  viewer stopped + 60 s.
 - Agents: `TC_OUTPUT_ROOT` must contain the transcode directory (it already does: `/transcodes`).
 - Mixed versions: a new shim against an old agent sends a field the old agent ignores (no detach,
   takeover unanswered -> follow after 8 s). An old shim against a new agent never sends a keepalive
