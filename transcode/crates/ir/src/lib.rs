@@ -317,9 +317,23 @@ pub fn render(args: &[String], backend: Backend, o: &TranslateOpts) -> Translate
     t
 }
 
-/// Target average bitrate as a percentage of the client's cap (`-maxrate`). Both cards were
-/// calibrated at 95% (MEASURED P0: Arc 94-97% delivered, never over; P4 96-105%).
+/// Target average bitrate as a percentage of the effective cap (`min(-maxrate, rung)`), QSV.
+/// MEASURED P0/P5/P5.1: the Arc delivers 94-97% of the cap at 95%, never over.
 pub const RC_TARGET_PCT: u64 = 95;
+/// Same for NVENC. The P4 delivers 7-9% **above** its `-b:v` (P5.1 lab, sample-b, VBV loose:
+/// 8183 kbps for 7600, 6492 for 6080, 4587 for 4275), so at 95% a binding 4M cap came out at
+/// 99.7-101.3% of the cap. At 90% it delivered 96.5-98.4% of a 4M cap and 7874 kbps against the
+/// Arc's 7559 at the 1080p h264 rung.
+pub const NVENC_TARGET_PCT: u64 = 90;
+
+/// The target percentage for `backend` (see `RC_TARGET_PCT`, `NVENC_TARGET_PCT`).
+pub fn target_pct(backend: Backend) -> u64 {
+    if backend == Backend::Nvenc {
+        NVENC_TARGET_PCT
+    } else {
+        RC_TARGET_PCT
+    }
+}
 /// Calibrated preset per backend (calibration README recommendation). Single-job cost vs the old
 /// `veryfast`/`p2` (MEASURED P0, min over titles at 8M): Arc 11.5x vs 11.1x realtime, P4 4.48x vs
 /// 4.56x.
@@ -373,7 +387,7 @@ fn is_opt(a: &str, base: &str) -> bool {
 /// 16-22% of the cap, VMAF 87 at 8 Mbps, identical at every rung). This replaces the quality
 /// target with a bitrate target, adds `rc_options`, and sets the calibrated preset.
 ///
-/// Target (P5.1): `RC_TARGET_PCT`% of `min(cap, rung)`, where `rung` is the ladder's
+/// Target (P5.1): `target_pct(backend)`% of `min(cap, rung)`, where `rung` is the ladder's
 /// cap-equivalent for the output codec/size/rate (`ladder::rung`). Without the ladder P5 aimed
 /// at 95% of whatever the client allowed: ~58 Mbit/s for a 1080p LAN client capped at 61.6M.
 /// - `-maxrate cap` with cap > 0: Jellyfin's `-maxrate`/`-bufsize` are kept exactly (they are
@@ -419,7 +433,7 @@ pub fn apply_rate_control(args: &mut Vec<String>, backend: Backend, rung: Option
     let mut set: Vec<String> = Vec::with_capacity(opts.len() + 2);
     if !args.iter().any(|a| is_opt(a, "-b:v") || a == "-vb") {
         set.push("-b:v".into());
-        set.push((eff.saturating_mul(RC_TARGET_PCT) / 100).to_string());
+        set.push((eff.saturating_mul(target_pct(backend)) / 100).to_string());
     }
     set.extend(opts.iter().map(|s| s.to_string()));
     // The quality target goes; the rate-control set takes its slot (else follows -maxrate's value).
@@ -1467,7 +1481,7 @@ mod tests {
                     "-preset",
                     "p5",
                     "-b:v",
-                    "7600000",
+                    "7200000",
                     "-rc",
                     "vbr",
                     "-tune",
@@ -1493,7 +1507,7 @@ mod tests {
                     "-preset",
                     "p5",
                     "-b:v",
-                    "6080000",
+                    "5760000",
                     "-rc",
                     "vbr",
                     "-tune",
@@ -1613,9 +1627,9 @@ mod tests {
         });
         for (enc, b, want) in [
             ("libx264", Backend::Qsv, "7600000"),
-            ("libx264", Backend::Nvenc, "7600000"),
+            ("libx264", Backend::Nvenc, "7200000"),
             ("libx265", Backend::Qsv, "6080000"),
-            ("libx265", Backend::Nvenc, "6080000"),
+            ("libx265", Backend::Nvenc, "5760000"),
         ] {
             let o = TranslateOpts {
                 source: src,
@@ -1625,9 +1639,10 @@ mod tests {
             assert_eq!(opt(&out, "-b:v").as_deref(), Some(want), "{enc} {b}");
             assert_eq!(opt(&out, "-maxrate").as_deref(), Some("61599184"));
             assert_eq!(opt(&out, "-bufsize").as_deref(), Some("123198368"));
-            // A remote client below the rung: 95% of its cap, as in P5.
+            // A remote client below the rung: target_pct of its cap.
             let out = render(&jf_cap(enc, Some(4_000_000)), b, &o).args;
-            assert_eq!(opt(&out, "-b:v").as_deref(), Some("3800000"), "{enc} {b}");
+            let t = (4_000_000 * target_pct(b) / 100).to_string();
+            assert_eq!(opt(&out, "-b:v"), Some(t), "{enc} {b}");
             assert_eq!(opt(&out, "-maxrate").as_deref(), Some("4000000"));
             // Legacy ignores the ladder.
             let l = render_rc(&jf_cap(enc, Some(61_599_184)), b, RateControl::Legacy);
@@ -1647,7 +1662,7 @@ mod tests {
             ] {
                 let a = jf_cap(enc, cap);
                 let out = render_rc(&a, b, RateControl::Calibrated);
-                let t = (r * RC_TARGET_PCT / 100).to_string();
+                let t = (r * target_pct(b) / 100).to_string();
                 assert_eq!(opt(&out, "-b:v"), Some(t), "{enc} {b} {cap:?}");
                 assert_eq!(opt(&out, "-maxrate"), Some(r.to_string()));
                 assert_eq!(opt(&out, "-bufsize"), Some((2 * r).to_string()));
