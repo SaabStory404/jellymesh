@@ -18,7 +18,7 @@ jobs:
   # Transcode pool native control plane (transcode): lint, unit + parity
   # tests, static musl build, and the shim<->agent protocol suite run against
   # the native binaries (transcode/spike/proto_test.sh, 21 cases: 1-16, 17a,
-  # 17b, 18, 19, 20 (20 itself run in four steps, 20a-20d), 21a-21d shared dir).
+  # 17b, 18, 19, 20 (20 itself run in four steps, 20a-20d), 21a-21e shared dir).
   tcpool:
     name: tcpool
     runs-on: ubuntu-latest
@@ -126,6 +126,8 @@ jobs:
           grep -q 'shared: takeover exit=0 old_ffmpeg=gone seek_segment=yes took_over_logged=1' "$out"
           grep -q 'shared: attached-takeover old_exit=0 new_exit=0 seek_segment=yes' "$out"
           grep -q 'shared: orphan-expired ffmpeg_gone=yes .* files_left=0 keepalive=removed' "$out"
+          # a throttler-paused (p) job whose shim dies gets u from the agent
+          grep -q 'shared: paused-detach keys_pu=1' "$out"
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
