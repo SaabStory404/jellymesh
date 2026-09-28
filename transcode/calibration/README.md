@@ -161,11 +161,17 @@ which is P4's measurement, not P0's.
 |---|---|---|
 | `h264_qsv` | `-b:v 0.95*cap -extbrc 1`, Jellyfin's `-maxrate`/`-bufsize` kept | `medium` |
 | `hevc_qsv` | same + `-look_ahead_depth 40 -b_strategy 1` | `medium` |
-| `h264_nvenc` | `-b:v 0.95*cap -rc vbr -tune hq -multipass fullres -b_ref_mode middle` | `p5` |
-| `hevc_nvenc` | `-b:v 0.95*cap -rc vbr -tune hq -multipass fullres` | `p5` |
+| `h264_nvenc` | `-b:v 0.90*cap -rc vbr -tune hq -multipass fullres -b_ref_mode middle` | `p5` |
+| `hevc_nvenc` | `-b:v 0.90*cap -rc vbr -tune hq -multipass fullres` | `p5` |
 | CPU, stream copy, no `-maxrate`, AV1 | unchanged | |
 
 Two changes from the P0 recommendation above, both MEASURED in this run:
+- **NVENC targets 90% of the cap, not 95% (pool-r1, 2026-09-28).** MEASURED (P5.1 lab, sample-b,
+  P4): NVENC delivers 7-9% above its `-b:v` (8183 kbps for 7600, 6492 for 6080, 4587 for 4275),
+  so 95% of a binding 4M cap came out at 99.7-101.3% of it; 90% delivered 96.5-98.4%. The Arc
+  stays at 95% (94-97% delivered, never over). pool-r1 cap check (MEASURED 2026-09-28, both cards,
+  2160p-class sources -> 1080p h264/hevc, 20 s): 4M cap Arc 94.1-96.1%, P4 93.5-98.4%; 60M cap Arc
+  93.0-95.7%, P4 81.1-82.6%; never over. Raw rows: `2026-09-28-pool-r1.csv`.
 - **No `-cq` hybrid on NVENC.** `-rc vbr -cq 23/28 -b:v 0.95cap` behaves like the old `-cq`: it
   stops at its quality target, delivering **49–60% of the cap at 15M (h264) and 25–55% at 8M/15M
   (hevc)**. Rejected.

@@ -65,7 +65,11 @@ ATTACHED, and nobody to send `q`), so that case detaches too.
 `TC_DETACH=0` turns detaching off; `TC_ORPHAN_MAX_SECS` (6 h) caps a detached job. Metrics:
 `tcpool_jobs_total{outcome="detached"|"taken_over"|"orphan_expired"}`, and the gauge
 `tcpool_orphans_paused` (detached jobs the agent holds paused right now). An agent drain (SIGTERM)
-still ends detached jobs after their next segment, like any job.
+still ends detached jobs after their next segment, like any job. A paused job (the agent's orphan
+throttle, or Jellyfin's throttler on an attached job) gets `u` first, and nothing pauses it again
+while draining, so it reaches that segment instead of being killed at the drain deadline (pool-r1;
+proto cases 21g/21h). A DV7->8.1 converted job throttles like any other: the edge and the keys are
+ffmpeg#2's, the HLS writer (`dv81_it` pins it).
 
 ## Throttling a detached job
 

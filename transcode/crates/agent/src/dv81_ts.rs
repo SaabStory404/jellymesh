@@ -160,11 +160,11 @@ where
             self.carry = pkt;
             self.carry.clear();
         }
-        let mut chunks = data.chunks_exact(TS_PACKET);
-        for pkt in &mut chunks {
+        let (pkts, rest) = data.as_chunks::<TS_PACKET>();
+        for pkt in pkts {
             self.packet(pkt, out)?;
         }
-        self.carry.extend_from_slice(chunks.remainder());
+        self.carry.extend_from_slice(rest);
         Ok(())
     }
 
@@ -511,7 +511,7 @@ mod tests {
         let mut pmt_info = Vec::new();
         let mut pes: Vec<Vec<u8>> = Vec::new();
         let mut ccs = Vec::new();
-        for p in ts.chunks_exact(TS_PACKET) {
+        for p in ts.as_chunks::<TS_PACKET>().0 {
             assert_eq!(p[0], SYNC);
             let pid = (u16::from(p[1] & 0x1f) << 8) | u16::from(p[2]);
             let (_, payload) = split_packet(p, (p[3] >> 4) & 3).unwrap();
@@ -606,7 +606,9 @@ mod tests {
         }
         // PCR adaptation field survives on each PES's first packet.
         let first_video = out
-            .chunks_exact(TS_PACKET)
+            .as_chunks::<TS_PACKET>()
+            .0
+            .iter()
             .find(|p| p[1] & 0x1f == 0x01 && p[1] & 0x40 != 0)
             .unwrap();
         assert_eq!(&first_video[4..12], &[7, 0x50, 1, 2, 3, 4, 5, 6]);

@@ -18,7 +18,7 @@ jobs:
   # Transcode pool native control plane (transcode): lint, unit + parity
   # tests, static musl build, and the shim<->agent protocol suite run against
   # the native binaries (transcode/spike/proto_test.sh, 21 cases: 1-16, 17a,
-  # 17b, 18, 19, 20 (20 itself run in four steps, 20a-20d), 21a-21f shared dir).
+  # 17b, 18, 19, 20 (20 itself run in four steps, 20a-20d), 21a-21h shared dir).
   tcpool:
     name: tcpool
     runs-on: ubuntu-latest
@@ -132,6 +132,10 @@ jobs:
           # too far ahead (the lead then stays put), resumes when the viewer catches up, pauses
           # again, runs unthrottled once the position goes stale, and the sidecar is cleaned up
           grep -q 'shared: throttle keys=pupu bounded=yes repaused=yes stale_resume_after=[0-9]*s runs_after=yes sidecar=removed .*stale_logged=1' "$out"
+          # agent drain (SIGTERM) resumes a paused job so it ends at its next segment: an
+          # orphan paused by the agent's throttle, and an attached job paused by Jellyfin
+          grep -q 'shared: drain-paused-orphan keys=pu next_segment=yes drained_logged=1 ' "$out"
+          grep -q 'shared: drain-paused-attached keys=pu next_segment=yes drained_logged=1 ' "$out"
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
