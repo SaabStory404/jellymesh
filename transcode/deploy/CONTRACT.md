@@ -137,9 +137,11 @@ Jellyfin waiting on a segment that already exists.
 ## Shared transcode directory (optional, `JELLYMESH_SHARED_TRANSCODE_DIR=1`)
 
 Both replicas may instead share **one** `TranscodingTempPath` (still a subdirectory, never the
-root). Jellyfin (bughunt patch 14) then sets `JELLYMESH_KEEPALIVE` on each HLS ffmpeg; the shim
+root). Jellyfin (bughunt patch 16) then sets `JELLYMESH_KEEPALIVE` on each HLS ffmpeg; the shim
 forwards it and the agent keeps the job running if that replica dies (`TC_DETACH`,
-`TC_ORPHAN_IDLE_SECS`, `TC_ORPHAN_PAUSED_SECS`, `TC_ORPHAN_MAX_SECS`). Roll agents before Jellyfin.
+`TC_ORPHAN_IDLE_SECS`, `TC_ORPHAN_PAUSED_SECS`, `TC_ORPHAN_MAX_SECS`), throttling it against the
+viewer's position (`TC_ORPHAN_LEAD_MAX_SECS`, `TC_ORPHAN_LEAD_RESUME_SECS`, `TC_ORPHAN_POS_STALE_SECS`).
+Roll agents before Jellyfin.
 Details: `transcode/docs/SHARED-TRANSCODE.md`.
 
 ## Two rules about the scratch directory

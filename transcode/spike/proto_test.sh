@@ -614,6 +614,60 @@ if [ -n "$NATIVE" ]; then
   kill "$TOUCH" 2>/dev/null
   echo "shared: paused-detach keys_pu=$resumed detach_logged=$(grep -c 'detaching: ffmpeg keeps writing' "$T/agent.log")"
   kill "$AGK" 2>/dev/null
+
+  echo "== 21f: a detached job throttles itself against the viewer's position (<keepalive>.seg)"
+  # The wrapper turns the agent's p/u keys into SIGSTOP/SIGCONT (stock ffmpeg has no p/u; the
+  # jellyfin-ffmpeg the agents run does), so the segment lead is real, not just the key stream.
+  # Limits scaled down: pause above 6 s (2 segments) ahead, resume below 4 s, position stale 5 s.
+  mkdir -p "$T/keys2"
+  printf '#!/bin/bash\nexec 3<&0\n( while IFS= read -r -n1 k <&3; do printf %%s "$k" >> "%s/keys2/$$"; case "$k" in p) kill -STOP $$;; u) kill -CONT $$;; esac; done ) &\nexec ffmpeg "$@" < /dev/null\n' "$T" > "$T/ff-stop"
+  chmod +x "$T/ff-stop"
+  TC_KIND=cpu TC_NAME=thr TC_FFMPEG="$T/ff-stop" TC_LOG="$T/agent.log" TC_PORT=19923 TC_ORPHAN_IDLE_SECS=4 \
+    TC_ORPHAN_LEAD_MAX_SECS=6 TC_ORPHAN_LEAD_RESUME_SECS=4 TC_ORPHAN_POS_STALE_SECS=5 \
+    $AGENT >> "$T/agent.log" 2>&1 &
+  AGT=$!
+  listening 19923
+  rm -f "$T/outsh/${STEM}"*
+  SEGF="$KA.seg"
+  echo 0 > "$SEGF"
+  newest() { grep -v '^#' "$T/outsh/${STEM}.m3u8" 2>/dev/null | tail -1 | sed -E "s/^${STEM}([0-9]+)\.ts$/\1/"; }
+  keys2() { cat "$T"/keys2/* 2>/dev/null; }
+  ( while :; do touch "$KA"; sleep 1; done ) &
+  TOUCH=$!
+  ( while :; do touch "$SEGF"; sleep 1; done ) &
+  SEGT=$!
+  sleep 60 | TC_WORKERS=thr=127.0.0.1:19923 JELLYMESH_KEEPALIVE="$KA" $SHIM "${SH_ARGS[@]}" 2>/dev/null &
+  SHT=$!
+  until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done
+  kill -9 "$SHT"
+  # viewer parked at segment 0: the job pauses once the output is > 2 segments ahead
+  t0=$SECONDS
+  until [ "$(keys2)" = p ] || [ $((SECONDS - t0)) -gt 30 ]; do sleep 0.5; done
+  sleep 1; n1=$(newest); sleep 6; n2=$(newest)
+  bounded=no; [ -n "$n1" ] && [ "$n1" = "$n2" ] && [ "$n2" -le 4 ] && bounded=yes
+  # the viewer catches up: resume, then pause again once > 2 segments ahead of it
+  kill "$SEGT"; echo "$n2" > "$SEGF"
+  ( while :; do touch "$SEGF"; sleep 1; done ) &
+  SEGT=$!
+  t0=$SECONDS
+  until [ "$(keys2)" = pup ] || [ $((SECONDS - t0)) -gt 30 ]; do sleep 0.5; done
+  sleep 1; n3=$(newest)
+  repaused=no; [ "$(keys2)" = pup ] && [ "$n3" -gt "$n2" ] && [ $((n3 - n2)) -le 4 ] && repaused=yes
+  # position goes stale while the keepalive still says playing: unknown -> unthrottled (u)
+  kill "$SEGT"
+  t0=$SECONDS
+  until [ "$(keys2)" = pupu ] || [ $((SECONDS - t0)) -gt 20 ]; do sleep 0.5; done
+  stale=$((SECONDS - t0))
+  sleep 4; n4=$(newest)
+  runs=no; [ -n "$n4" ] && [ "$n4" -gt "$n3" ] && runs=yes
+  gauge=$(grep -c "resuming ffmpeg (newest segment [0-9]*, viewer at $n2, lead unknown)" "$T/agent.log")
+  # viewer gone: expires and removes the sidecar with the keepalive
+  kill "$TOUCH"
+  t0=$SECONDS
+  while [ -e "$SEGF" ] && [ $((SECONDS - t0)) -lt 20 ]; do sleep 0.5; done
+  seg_left=present; [ -e "$SEGF" ] || seg_left=removed
+  echo "shared: throttle keys=$(keys2) bounded=$bounded repaused=$repaused stale_resume_after=${stale}s runs_after=$runs sidecar=$seg_left (newest $n1/$n2 -> $n3 -> $n4, stale_logged=$gauge)"
+  kill "$AGT" 2>/dev/null
   kill "$AGSH" 2>/dev/null
 fi
 

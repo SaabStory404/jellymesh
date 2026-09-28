@@ -15,11 +15,15 @@
 //! whichever Jellyfin replica receives a segment request or a progress ping for that session.
 //! Content: `paused` or `playing`. Jellyfin passes its path to ffmpeg (the shim) in the
 //! `JELLYMESH_KEEPALIVE` environment variable, and the shim forwards it in `Job.keepalive_path`.
+//!
+//! Next to it, `<keepalive>.seg` (bughunt patch 16): the index of the last segment any replica
+//! served a request for; mtime = when. A detached job reads it to stay a bounded distance ahead
+//! of its viewer (see [`orphan_throttle`]); nothing else depends on it.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// Env var Jellyfin (bughunt patch 14, shared mode) sets on every HLS ffmpeg it starts.
+/// Env var Jellyfin (bughunt patch 16, shared mode) sets on every HLS ffmpeg it starts.
 pub const KEEPALIVE_ENV: &str = "JELLYMESH_KEEPALIVE";
 
 /// `<dir>/<stem>.tcpool.lock` for a playlist `<dir>/<stem>.m3u8`.
@@ -94,9 +98,313 @@ pub fn orphan_expired(
     now.duration_since(last).unwrap_or_default() > limit
 }
 
+/// `<keepalive>.seg`: the viewer's position sidecar (see the module docs).
+pub fn position_path(keepalive: &Path) -> PathBuf {
+    let mut p = keepalive.as_os_str().to_owned();
+    p.push(".seg");
+    PathBuf::from(p)
+}
+
+/// The last segment index a replica served a request for, and when (the file's mtime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Position {
+    pub index: u64,
+    pub touched: SystemTime,
+}
+
+/// Reads the position sidecar. Missing, unreadable, empty or garbled (a torn write) -> `None`.
+pub fn read_position(path: &Path) -> Option<Position> {
+    let touched = std::fs::metadata(path).ok()?.modified().ok()?;
+    let index = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+    Some(Position { index, touched })
+}
+
+/// The newest segment index listed in an HLS playlist `<dir>/<stem>.m3u8` (the last URI line,
+/// named `<stem><index>.<ext>`). Reads only the tail: ffmpeg rewrites the playlist whole (via a
+/// temp file + rename) after each segment, so its last URI is the newest complete segment of
+/// this very job (unlike a directory scan, which would also see an earlier writer's files).
+pub fn newest_segment(playlist: &Path, stem: &str) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(playlist).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(4096);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let uri = text
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|l| !l.is_empty() && !l.starts_with('#'))?;
+    let name = uri.rsplit('/').next()?;
+    let num = name.strip_prefix(stem)?.split('.').next()?;
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    num.parse().ok()
+}
+
+/// The HLS segment length in seconds (`-hls_time`), if the argv sets a positive one.
+pub fn segment_seconds(args: &[String]) -> Option<f64> {
+    let i = args.iter().position(|a| a == "-hls_time")?;
+    let v: f64 = args.get(i + 1)?.parse().ok()?;
+    (v.is_finite() && v > 0.0).then_some(v)
+}
+
+/// What a detached job's watcher should do with its ffmpeg this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Throttle {
+    /// Send `p`: the output is more than `lead_max` ahead of the viewer.
+    Pause,
+    /// Send `u`: the viewer is within `lead_resume` of the output, or its position is unknown
+    /// (then a detached job runs unthrottled, as it did before the position sidecar existed).
+    Resume,
+    /// Keep the current state (between the two thresholds: hysteresis).
+    Leave,
+}
+
+/// Limits for [`orphan_throttle`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThrottleLimits {
+    /// Pause when the output leads the viewer by more than this. Zero disables throttling.
+    pub lead_max: Duration,
+    /// Resume when the lead drops below this.
+    pub lead_resume: Duration,
+    /// A position older than this, while the keepalive says `playing`, is unknown.
+    pub pos_stale: Duration,
+}
+
+/// The viewer's position if it can be trusted: fresh (within `pos_stale`), or any age while the
+/// keepalive says the client is paused (a paused viewer requests nothing).
+pub fn usable_position(
+    now: SystemTime,
+    pos: Option<Position>,
+    ka: Option<Keepalive>,
+    pos_stale: Duration,
+) -> Option<Position> {
+    let pos = pos?;
+    let client_paused = ka.is_some_and(|k| k.paused);
+    (client_paused || now.duration_since(pos.touched).unwrap_or_default() <= pos_stale)
+        .then_some(pos)
+}
+
+/// The throttling decision for a detached job (Jellyfin's own throttler did this while the job
+/// had an owner): keep the output at most `lead_max` ahead of the last segment the viewer asked
+/// for, with hysteresis down to `lead_resume`.
+///
+/// `paused` is whether ffmpeg is paused now. `newest` is the newest segment written, `pos` the
+/// viewer's last requested segment, `seg_secs` the segment length. A paused client (keepalive
+/// `paused`) keeps its last position however old it is, so a job stays paused under a paused
+/// viewer. If the position is unknown (no sidecar, no segment length, no playlist yet, or a
+/// `playing` client whose position went stale, see [`usable_position`]) the job runs
+/// unthrottled, the behaviour before the sidecar existed.
+pub fn orphan_throttle(
+    now: SystemTime,
+    paused: bool,
+    newest: Option<u64>,
+    pos: Option<Position>,
+    ka: Option<Keepalive>,
+    seg_secs: Option<f64>,
+    lim: ThrottleLimits,
+) -> Throttle {
+    let unknown = if paused {
+        Throttle::Resume
+    } else {
+        Throttle::Leave
+    };
+    if lim.lead_max.is_zero() {
+        return unknown;
+    }
+    let pos = usable_position(now, pos, ka, lim.pos_stale);
+    let (Some(newest), Some(pos), Some(seg)) = (newest, pos, seg_secs) else {
+        return unknown;
+    };
+    let lead = newest.saturating_sub(pos.index) as f64 * seg;
+    if !paused && lead > lim.lead_max.as_secs_f64() {
+        Throttle::Pause
+    } else if paused && lead < lim.lead_resume.as_secs_f64() {
+        Throttle::Resume
+    } else {
+        Throttle::Leave
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lim() -> ThrottleLimits {
+        ThrottleLimits {
+            lead_max: Duration::from_secs(60),
+            lead_resume: Duration::from_secs(30),
+            pos_stale: Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn throttle_hysteresis() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let pos = |i| {
+            Some(Position {
+                index: i,
+                touched: t0,
+            })
+        };
+        let playing = Some(Keepalive {
+            touched: t0,
+            paused: false,
+        });
+        let th = |paused, newest, p| {
+            orphan_throttle(t0, paused, Some(newest), p, playing, Some(3.0), lim())
+        };
+        // 3 s segments: 60 s = 20 segments, 30 s = 10
+        assert_eq!(th(false, 110, pos(100)), Throttle::Leave);
+        assert_eq!(
+            th(false, 120, pos(100)),
+            Throttle::Leave,
+            "exactly at the limit"
+        );
+        assert_eq!(th(false, 121, pos(100)), Throttle::Pause);
+        assert_eq!(th(true, 121, pos(100)), Throttle::Leave, "already paused");
+        assert_eq!(
+            th(true, 111, pos(100)),
+            Throttle::Leave,
+            "between the thresholds"
+        );
+        assert_eq!(th(true, 109, pos(100)), Throttle::Resume);
+        assert_eq!(th(false, 109, pos(100)), Throttle::Leave, "already running");
+        // the viewer is past the output (it waits for a segment): never pause
+        assert_eq!(th(false, 90, pos(100)), Throttle::Leave);
+        assert_eq!(th(true, 90, pos(100)), Throttle::Resume);
+        // a seek back inside the written range: pause again
+        assert_eq!(th(false, 300, pos(10)), Throttle::Pause);
+        // disabled
+        let off = ThrottleLimits {
+            lead_max: Duration::ZERO,
+            ..lim()
+        };
+        assert_eq!(
+            orphan_throttle(t0, true, Some(500), pos(0), playing, Some(3.0), off),
+            Throttle::Resume
+        );
+        assert_eq!(
+            orphan_throttle(t0, false, Some(500), pos(0), playing, Some(3.0), off),
+            Throttle::Leave
+        );
+    }
+
+    #[test]
+    fn throttle_unknown_position_runs_unthrottled() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let s = Duration::from_secs;
+        let playing = Some(Keepalive {
+            touched: t0,
+            paused: false,
+        });
+        let paused_ka = Some(Keepalive {
+            touched: t0,
+            paused: true,
+        });
+        let fresh = Some(Position {
+            index: 0,
+            touched: t0,
+        });
+        let old = Some(Position {
+            index: 0,
+            touched: t0 - s(61),
+        });
+        for (newest, pos, seg) in [
+            (None, fresh, Some(3.0)),
+            (Some(500), None, Some(3.0)),
+            (Some(500), fresh, None),
+        ] {
+            assert_eq!(
+                orphan_throttle(t0, true, newest, pos, playing, seg, lim()),
+                Throttle::Resume
+            );
+            assert_eq!(
+                orphan_throttle(t0, false, newest, pos, playing, seg, lim()),
+                Throttle::Leave
+            );
+        }
+        // stale while playing (or no keepalive at all) -> unknown -> resume
+        assert_eq!(
+            orphan_throttle(t0, true, Some(500), old, playing, Some(3.0), lim()),
+            Throttle::Resume
+        );
+        assert_eq!(
+            orphan_throttle(t0, true, Some(500), old, None, Some(3.0), lim()),
+            Throttle::Resume
+        );
+        // a paused client keeps its (old) position: stay paused / pause
+        assert_eq!(
+            orphan_throttle(t0, true, Some(500), old, paused_ka, Some(3.0), lim()),
+            Throttle::Leave
+        );
+        assert_eq!(
+            orphan_throttle(t0, false, Some(500), old, paused_ka, Some(3.0), lim()),
+            Throttle::Pause
+        );
+        // a position "from the future" (clock skew) is fresh
+        let fut = Some(Position {
+            index: 0,
+            touched: t0 + s(100),
+        });
+        assert_eq!(
+            orphan_throttle(t0, false, Some(500), fut, playing, Some(3.0), lim()),
+            Throttle::Pause
+        );
+    }
+
+    #[test]
+    fn position_and_playlist_files() {
+        let d = std::env::temp_dir().join(format!("tcpool-pos-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let ka = d.join("sess");
+        let sp = position_path(&ka);
+        assert_eq!(sp, d.join("sess.seg"));
+        assert!(read_position(&sp).is_none());
+        std::fs::write(&sp, "42\n").unwrap();
+        assert_eq!(read_position(&sp).unwrap().index, 42);
+        std::fs::write(&sp, "").unwrap();
+        assert!(read_position(&sp).is_none(), "a torn write is unknown");
+        std::fs::write(&sp, "-3").unwrap();
+        assert!(read_position(&sp).is_none());
+
+        let stem = "0123456789abcdef0123456789abcdef";
+        let pl = d.join(format!("{stem}.m3u8"));
+        assert!(newest_segment(&pl, stem).is_none());
+        std::fs::write(&pl, "#EXTM3U\n#EXT-X-TARGETDURATION:3\n").unwrap();
+        assert!(newest_segment(&pl, stem).is_none(), "no segment yet");
+        let mut body = String::from("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:12\n");
+        for i in 12..2000 {
+            body.push_str(&format!("#EXTINF:3.000000,\n{stem}{i}.ts\n"));
+        }
+        std::fs::write(&pl, &body).unwrap();
+        assert_eq!(newest_segment(&pl, stem), Some(1999));
+        body.push_str("#EXT-X-ENDLIST\n");
+        std::fs::write(&pl, &body).unwrap();
+        assert_eq!(newest_segment(&pl, stem), Some(1999), "ENDLIST is a tag");
+        std::fs::write(&pl, format!("#EXTINF:3,\n/abs/dir/{stem}7.mp4\n")).unwrap();
+        assert_eq!(newest_segment(&pl, stem), Some(7));
+        std::fs::write(&pl, "#EXTINF:3,\nffffffffffffffffffffffffffffffff7.ts\n").unwrap();
+        assert!(
+            newest_segment(&pl, stem).is_none(),
+            "another output's segment"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn hls_time() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(segment_seconds(&a(&["-hls_time", "3"])), Some(3.0));
+        assert_eq!(segment_seconds(&a(&["-hls_time", "6.5", "x"])), Some(6.5));
+        assert_eq!(segment_seconds(&a(&["-hls_time", "0"])), None);
+        assert_eq!(segment_seconds(&a(&["-hls_time"])), None);
+        assert_eq!(segment_seconds(&a(&["-f", "hls"])), None);
+    }
 
     #[test]
     fn siblings() {

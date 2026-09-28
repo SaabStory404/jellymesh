@@ -13,6 +13,11 @@
 //!   lease token) -> ffmpeg killed, lease freed, outputs left to the new writer;
 //! - ffmpeg finishes on its own -> lease freed; the outputs stay (they are being served) until
 //!   the keepalive goes stale, then deleted.
+//!
+//! While detached nobody sends Jellyfin's throttler keys any more, so the agent throttles the job
+//! itself against the viewer's last requested segment (the `<keepalive>.seg` sidecar any replica
+//! writes on a segment request): `p` once the output is `lead_max` ahead, `u` again below
+//! `lead_resume`, `u` when the position is unknown (see `shared::orphan_throttle`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,8 +40,24 @@ pub struct Detach {
     pub stem: String,
     /// The lease holder token read at job start: the lease is "ours" while it still says this.
     pub token: String,
+    /// `<dir>/<stem>.m3u8`: its last URI is the newest segment this job wrote.
+    pub playlist: PathBuf,
+    /// `<keepalive>.seg`: the viewer's last requested segment (any replica writes it).
+    pub position: PathBuf,
+    /// `-hls_time`, if the argv has one (no segment length -> never throttled).
+    pub seg_secs: Option<f64>,
     detached_at: Mutex<Option<SystemTime>>,
     taken_over: AtomicBool,
+}
+
+/// One throttle tick's inputs and decision, for the watcher's log line.
+#[derive(Debug, Clone, Copy)]
+pub struct ThrottleTick {
+    pub action: shared::Throttle,
+    pub newest: Option<u64>,
+    pub viewer: Option<u64>,
+    /// Output lead over the viewer in seconds, when both ends are known.
+    pub lead_secs: Option<f64>,
 }
 
 impl Detach {
@@ -64,10 +85,14 @@ impl Detach {
         let Ok(token) = fs::read_to_string(&lease) else {
             return Ok(None); // shim ran unleased: a second writer can't be excluded, run attached
         };
+        let keepalive = PathBuf::from(keepalive);
         Ok(Some(Detach {
             takeover: shared::takeover_path(pl),
             lease,
-            keepalive: PathBuf::from(keepalive),
+            position: shared::position_path(&keepalive),
+            keepalive,
+            playlist: PathBuf::from(pl),
+            seg_secs: shared::segment_seconds(args),
             dir,
             stem,
             token,
@@ -131,6 +156,27 @@ impl Detach {
             )
     }
 
+    /// Whether to pause or resume a detached job's ffmpeg now (`paused`: is it paused).
+    pub fn throttle(&self, cfg: &Config, paused: bool, now: SystemTime) -> ThrottleTick {
+        let newest = shared::newest_segment(&self.playlist, &self.stem);
+        let pos = shared::read_position(&self.position);
+        let ka = shared::read_keepalive(&self.keepalive);
+        let lim = cfg.orphan_throttle;
+        let action = shared::orphan_throttle(now, paused, newest, pos, ka, self.seg_secs, lim);
+        // For the log: the lead the decision used (unknown when the position is stale).
+        let usable = shared::usable_position(now, pos, ka, lim.pos_stale);
+        let lead_secs = match (newest, usable, self.seg_secs) {
+            (Some(n), Some(p), Some(s)) => Some((n as f64 - p.index as f64) * s),
+            _ => None,
+        };
+        ThrottleTick {
+            action,
+            newest,
+            viewer: pos.map(|p| p.index),
+            lead_secs,
+        }
+    }
+
     /// Free the lease if it is still ours.
     pub fn release(&self) {
         if lease_is_ours(&self.lease, &self.token) {
@@ -146,6 +192,7 @@ impl Detach {
         }
         let n = delete_prefix(&self.dir, &self.stem);
         let _ = fs::remove_file(&self.keepalive);
+        let _ = fs::remove_file(&self.position);
         n
     }
 }
@@ -331,6 +378,50 @@ mod tests {
         assert!(!d.mark_detached());
         assert!(!d.expired(&cfg, SystemTime::now()));
         assert!(d.expired(&cfg, later));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn throttle_reads_playlist_and_position() {
+        let root = tmp("thr");
+        let dir = root.join("jf");
+        fs::create_dir_all(dir.join(".jellymesh-alive")).unwrap();
+        fs::write(dir.join(format!("{STEM}.tcpool.lock")), "t").unwrap();
+        let cfg = cfg_for(&root);
+        let ka = dir.join(".jellymesh-alive/s1");
+        fs::write(&ka, "playing").unwrap();
+        let mut args = args_for(&dir);
+        args.splice(0..0, ["-hls_time".to_string(), "3".to_string()]);
+        let d = Detach::from_job(&cfg, &args, &ka.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.seg_secs, Some(3.0));
+        assert_eq!(d.position, dir.join(".jellymesh-alive/s1.seg"));
+        let now = SystemTime::now();
+        // no playlist, no position: unknown
+        let t = d.throttle(&cfg, false, now);
+        assert_eq!(t.action, shared::Throttle::Leave);
+        assert_eq!(d.throttle(&cfg, true, now).action, shared::Throttle::Resume);
+        let mut pl = String::from("#EXTM3U\n");
+        for i in 0..=40 {
+            pl.push_str(&format!("#EXTINF:3,\n{STEM}{i}.ts\n"));
+        }
+        fs::write(dir.join(format!("{STEM}.m3u8")), pl).unwrap();
+        fs::write(&d.position, "5").unwrap();
+        let t = d.throttle(&cfg, false, SystemTime::now());
+        assert_eq!(t.action, shared::Throttle::Pause);
+        assert_eq!(
+            (t.newest, t.viewer, t.lead_secs),
+            (Some(40), Some(5), Some(105.0))
+        );
+        fs::write(&d.position, "35").unwrap();
+        assert_eq!(
+            d.throttle(&cfg, true, SystemTime::now()).action,
+            shared::Throttle::Resume
+        );
+        // cleanup takes the sidecar with the keepalive
+        assert!(d.cleanup() > 0);
+        assert!(!d.position.exists() && !ka.exists());
         let _ = fs::remove_dir_all(&root);
     }
 

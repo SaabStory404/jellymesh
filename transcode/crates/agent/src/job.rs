@@ -428,7 +428,9 @@ pub async fn run_job(
         let stdin_tx = stdin_detach.clone();
         let cfg = cfg.clone();
         tokio::spawn(async move {
-            let mut unpaused = false;
+            // Counts this job in `tcpool_orphans_paused` while the agent holds it paused; the
+            // guard's Drop undoes that when the watcher returns or is aborted at job end.
+            let mut held = crate::metrics::OrphanPausedGuard::new(ctl.state.clone());
             loop {
                 if ctl.done.load(Ordering::SeqCst) {
                     return;
@@ -440,11 +442,33 @@ pub async fn run_job(
                     return;
                 }
                 if d.is_detached() {
-                    if !unpaused {
-                        unpaused = true;
-                        if ctl.paused.swap(false, Ordering::SeqCst) {
-                            let _ = stdin_tx.send(Some(b"u".to_vec())).await;
-                        }
+                    // Nobody sends Jellyfin's throttler keys any more: keep the output a bounded
+                    // lead ahead of the viewer ourselves (a job Jellyfin had paused when its
+                    // replica died is resumed here too, unless the viewer is far behind).
+                    let paused = ctl.paused.load(Ordering::SeqCst);
+                    let t = d.throttle(&cfg, paused, std::time::SystemTime::now());
+                    let key: Option<&[u8]> = match t.action {
+                        tcpool_ir::shared::Throttle::Pause => Some(b"p"),
+                        tcpool_ir::shared::Throttle::Resume => Some(b"u"),
+                        tcpool_ir::shared::Throttle::Leave => None,
+                    };
+                    if let Some(key) = key {
+                        let pause = key == b"p";
+                        ctl.paused.store(pause, Ordering::SeqCst);
+                        held.set(pause);
+                        let _ = stdin_tx.send(Some(key.to_vec())).await;
+                        crate::log(format_args!(
+                            "detached output {}: {} (newest segment {}, viewer at {}, lead {})",
+                            d.stem,
+                            if pause {
+                                "pausing ffmpeg"
+                            } else {
+                                "resuming ffmpeg"
+                            },
+                            t.newest.map_or("?".into(), |n| n.to_string()),
+                            t.viewer.map_or("?".into(), |n| n.to_string()),
+                            t.lead_secs.map_or("unknown".into(), |l| format!("{l:.0}s")),
+                        ));
                     }
                     if d.expired(&cfg, std::time::SystemTime::now()) {
                         ctl.end(

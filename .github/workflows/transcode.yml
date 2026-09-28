@@ -18,7 +18,7 @@ jobs:
   # Transcode pool native control plane (transcode): lint, unit + parity
   # tests, static musl build, and the shim<->agent protocol suite run against
   # the native binaries (transcode/spike/proto_test.sh, 21 cases: 1-16, 17a,
-  # 17b, 18, 19, 20 (20 itself run in four steps, 20a-20d), 21a-21e shared dir).
+  # 17b, 18, 19, 20 (20 itself run in four steps, 20a-20d), 21a-21f shared dir).
   tcpool:
     name: tcpool
     runs-on: ubuntu-latest
@@ -68,7 +68,7 @@ jobs:
           bin="$PWD/target/x86_64-unknown-linux-musl/release"
           out="$RUNNER_TEMP/proto.out"
           AGENT="$bin/tcpool-agent" SHIM="$bin/tcpool-shim" TC_PROTO_DIR="$RUNNER_TEMP/proto" \
-            timeout 600 bash spike/proto_test.sh > "$out" 2>&1 || true
+            timeout 720 bash spike/proto_test.sh > "$out" 2>&1 || true
           grep -E "^==|exit=|shim gone|ffmpeg (fenced|gone|STILL)|^batch:|^preempt-|^affinity:|^shared:" "$out"
           # every case must report its expected outcome
           test "$(grep -c '^exit=0' "$out")" -eq 7
@@ -128,6 +128,10 @@ jobs:
           grep -q 'shared: orphan-expired ffmpeg_gone=yes .* files_left=0 keepalive=removed' "$out"
           # a throttler-paused (p) job whose shim dies gets u from the agent
           grep -q 'shared: paused-detach keys_pu=1' "$out"
+          # a detached job throttles itself against the viewer's position sidecar: pauses when
+          # too far ahead (the lead then stays put), resumes when the viewer catches up, pauses
+          # again, runs unthrottled once the position goes stale, and the sidecar is cleaned up
+          grep -q 'shared: throttle keys=pupu bounded=yes repaused=yes stale_resume_after=[0-9]*s runs_after=yes sidecar=removed .*stale_logged=1' "$out"
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4

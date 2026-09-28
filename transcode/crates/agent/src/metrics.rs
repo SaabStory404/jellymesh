@@ -154,6 +154,42 @@ pub struct Metrics {
     /// job id -> last observed `speed=` factor, while the job is running and not paused.
     job_speed: Mutex<HashMap<u64, f64>>,
     next_job_id: AtomicU64,
+    /// Detached jobs the agent currently holds paused (shared transcode dir throttle).
+    orphans_paused: AtomicU64,
+}
+
+/// Counts one detached job in `tcpool_orphans_paused` while `set(true)`; Drop releases it, so an
+/// aborted watcher task never leaves the gauge high.
+pub struct OrphanPausedGuard {
+    state: std::sync::Arc<crate::State>,
+    counted: bool,
+}
+
+impl OrphanPausedGuard {
+    pub fn new(state: std::sync::Arc<crate::State>) -> Self {
+        OrphanPausedGuard {
+            state,
+            counted: false,
+        }
+    }
+
+    pub fn set(&mut self, paused: bool) {
+        if paused != self.counted {
+            let g = &self.state.metrics.orphans_paused;
+            if paused {
+                g.fetch_add(1, Ordering::Relaxed);
+            } else {
+                g.fetch_sub(1, Ordering::Relaxed);
+            }
+            self.counted = paused;
+        }
+    }
+}
+
+impl Drop for OrphanPausedGuard {
+    fn drop(&mut self) {
+        self.set(false);
+    }
 }
 
 /// How a job that carried the P5 DV7 -> 8.1 signal ended up (`tcpool_dv81_total`). Exactly one
@@ -199,6 +235,7 @@ impl Default for Metrics {
             job_seconds: Histogram::new(&DURATION_BUCKETS),
             job_speed: Mutex::new(HashMap::new()),
             next_job_id: AtomicU64::new(1),
+            orphans_paused: AtomicU64::new(0),
         }
     }
 }
@@ -391,6 +428,13 @@ pub fn render(state: &State) -> String {
         out,
         "tcpool_draining{{{labels}}} {}",
         *state.drain.borrow() as u8
+    );
+
+    let _ = writeln!(out, "# TYPE tcpool_orphans_paused gauge");
+    let _ = writeln!(
+        out,
+        "tcpool_orphans_paused{{{labels}}} {}",
+        state.metrics.orphans_paused.load(Ordering::Relaxed)
     );
 
     let _ = writeln!(out, "# TYPE tcpool_build_info gauge");

@@ -1,6 +1,6 @@
 # Shared transcode directory across Jellyfin replicas
 
-Status: implemented behind `JELLYMESH_SHARED_TRANSCODE_DIR=1` (Jellyfin, bughunt patch 14) and an
+Status: implemented behind `JELLYMESH_SHARED_TRANSCODE_DIR=1` (Jellyfin, bughunt patch 16) and an
 additive protocol field (pool). Off by default; with the flag unset both sides behave exactly as before.
 
 ## Goal
@@ -32,6 +32,7 @@ the token is `host:pid:nanos`. What changes is who keeps the lease alive and how
 <transcode dir>/<stem>.tcpool.takeover         takeover request: the holder token it wants gone
 <transcode dir>/<stem>.worker                  seek-affinity pin (unchanged)
 <transcode dir>/.jellymesh-alive/<PlaySessionId>   session keepalive: "playing" | "paused", mtime = last seen
+<transcode dir>/.jellymesh-alive/<PlaySessionId>.seg   viewer position: last requested segment index, mtime = when
 ```
 
 Jellyfin passes the keepalive path to ffmpeg (the shim) in `JELLYMESH_KEEPALIVE`; the shim sends it
@@ -44,7 +45,8 @@ in `Job.keepalive_path` (proto field 4). The agent validates it under `TC_OUTPUT
  ATTACHED ----------------------------------------------> DETACHED (only if keepalive_path set, a lease on disk,
     |  (unchanged: stdin keys, stderr, heartbeats)          |         and a 16+ hex-char output stem)
     |                                                       |  ffmpeg keeps writing; stderr drained, not forwarded;
-    |                                                       |  a throttler-paused ffmpeg is sent `u`
+    |                                                       |  the agent throttles it (p/u) against the
+    |                                                       |  viewer position; unknown position -> `u`
     |                                                       |
     +-- takeover file names our token --> TAKEN_OVER <------+  kill ffmpeg, free the lease, keep the files
     |                                                       +-- keepalive stale (TC_ORPHAN_IDLE_SECS 60, or
@@ -61,8 +63,35 @@ supervisor that restarts it in the same container would otherwise leave the shim
 ATTACHED, and nobody to send `q`), so that case detaches too.
 
 `TC_DETACH=0` turns detaching off; `TC_ORPHAN_MAX_SECS` (6 h) caps a detached job. Metrics:
-`tcpool_jobs_total{outcome="detached"|"taken_over"|"orphan_expired"}`. An agent drain (SIGTERM) still
-ends detached jobs after their next segment, like any job.
+`tcpool_jobs_total{outcome="detached"|"taken_over"|"orphan_expired"}`, and the gauge
+`tcpool_orphans_paused` (detached jobs the agent holds paused right now). An agent drain (SIGTERM)
+still ends detached jobs after their next segment, like any job.
+
+## Throttling a detached job
+
+While a job has an owner, Jellyfin's throttler (`EnableThrottling`) pauses ffmpeg (`p`) once it is
+far enough ahead of the client and resumes it (`u`) when the client catches up. A detached job has
+no owner, so the agent does the same, once a second, against the viewer's position:
+
+- **Position**: every segment request, on any replica, writes the requested index to
+  `.jellymesh-alive/<PlaySessionId>.seg` (write to a temp file + rename, so a reader never sees a
+  torn value; rewritten when the index changes, else at most every 2 s).
+- **Output edge**: the last URI in the job's own playlist (`<stem>.m3u8`, read from the tail;
+  ffmpeg replaces it whole after each segment). A directory scan would also count an earlier
+  writer's segments.
+- **Decision** (`tcpool_ir::shared::orphan_throttle`): lead = (edge - position) x `-hls_time`.
+  Pause above `TC_ORPHAN_LEAD_MAX_SECS` (60 s; `0` = never throttle), resume below
+  `TC_ORPHAN_LEAD_RESUME_SECS` (30 s). The gap between the two keeps it from flapping every segment.
+- **Unknown position -> unthrottled** (the behaviour before the sidecar existed): no sidecar (a
+  Jellyfin without this change), no `-hls_time`, no playlist yet, or a position older than
+  `TC_ORPHAN_POS_STALE_SECS` (60 s) while the keepalive says `playing`. A paused client
+  (keepalive `paused`) keeps its last position however old: the job stays paused under a paused
+  viewer, and expires after `TC_ORPHAN_PAUSED_SECS` as before.
+- A job Jellyfin had paused when its replica died stays paused if the viewer is still far behind
+  (resumed at once if the position is unknown, as before).
+- A replica that serves a segment the job has not written yet waits for it only while the
+  writer is fresh (patch 03's window), so the resume threshold must leave the job time to write
+  again: 30 s of lead at resume is several segments at pool speed.
 
 ## Cross-replica keepalive (the kill-timer blocker)
 
@@ -117,10 +146,12 @@ replica serves them. Segments:
   delete it. With Deployments a restarted replica gets a new name; the lab's StatefulSet keeps the
   name across restarts (the weaker case), which is safe only because a freshly started replica has
   no job for that output and never runs the per-job delete for it.
-- Cost of a detached job: nothing throttles it (no owner, no `p`), and `EnableSegmentDeletion` never
-  runs on it (no owner job). MEASURED in jm-lab: each orphan wrote 287-315 segments (~15 min of
-  video) in the ~2.5 min between detach and expiry, holding its pool units at full speed until the
-  viewer stopped + 60 s.
+- Cost of a detached job: the agent throttles it (see "Throttling a detached job"), so it runs
+  at most ~60 s of video ahead of its viewer, like an owned job under Jellyfin's throttler. Before
+  that (the jm7 draft) it ran unthrottled: MEASURED in jm-lab, each orphan wrote 287-315 segments
+  (~15 min of video) in the ~2.5 min between detach and expiry. A paused job still counts its
+  units in the agent's admission (it is still a running job), but it no longer uses the encoder.
+  `EnableSegmentDeletion` never runs on it (no owner job).
 - Agents: `TC_OUTPUT_ROOT` must contain the transcode directory (it already does: `/transcodes`).
 - Mixed versions: a new shim against an old agent sends a field the old agent ignores (no detach,
   takeover unanswered -> follow after 8 s). An old shim against a new agent never sends a keepalive
