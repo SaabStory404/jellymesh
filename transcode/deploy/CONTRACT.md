@@ -134,6 +134,14 @@ The scratch `mountOptions` are load-bearing: `nfsvers=4.2, lookupcache=positive,
 the defaults a freshly written segment stayed invisible to other nodes for 12–23 s, which is
 Jellyfin waiting on a segment that already exists.
 
+## Shared transcode directory (optional, `JELLYMESH_SHARED_TRANSCODE_DIR=1`)
+
+Both replicas may instead share **one** `TranscodingTempPath` (still a subdirectory, never the
+root). Jellyfin (bughunt patch 14) then sets `JELLYMESH_KEEPALIVE` on each HLS ffmpeg; the shim
+forwards it and the agent keeps the job running if that replica dies (`TC_DETACH`,
+`TC_ORPHAN_IDLE_SECS`, `TC_ORPHAN_PAUSED_SECS`, `TC_ORPHAN_MAX_SECS`). Roll agents before Jellyfin.
+Details: `transcode/docs/SHARED-TRANSCODE.md`.
+
 ## Two rules about the scratch directory
 
 1. **`TranscodingTempPath` must be a subdirectory**, one per Jellyfin identity (e.g.

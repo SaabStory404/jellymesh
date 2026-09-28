@@ -77,6 +77,46 @@ index 31394c7f4..1237f757b 100644
      }
  
      /// <summary>
+diff --git a/Jellyfin.Api/Controllers/PlaystateController.cs b/Jellyfin.Api/Controllers/PlaystateController.cs
+index 4ff1eef41..42c4c5f13 100644
+--- a/Jellyfin.Api/Controllers/PlaystateController.cs
++++ b/Jellyfin.Api/Controllers/PlaystateController.cs
+@@ -220,10 +220,27 @@ public class PlaystateController : BaseJellyfinApiController
+     {
+         playbackProgressInfo.PlayMethod = ValidatePlayMethod(playbackProgressInfo.PlayMethod, playbackProgressInfo.PlaySessionId);
+         playbackProgressInfo.SessionId = await RequestHelpers.GetSessionId(_sessionManager, _userManager, HttpContext).ConfigureAwait(false);
++        PingSharedTranscode(playbackProgressInfo);
+         await _sessionManager.OnPlaybackProgress(playbackProgressInfo).ConfigureAwait(false);
+         return NoContent();
+     }
+ 
++    /// <summary>
++    /// JellyMesh shared transcode dir: record the client's liveness (and paused state) before the
++    /// progress event fans out. The kill timer otherwise only hears about progress through the
++    /// PlaybackProgress event, and a subscriber that throws first (MEASURED: the Playback Reporting
++    /// plugin, for a session this replica never saw start) stops it from ever running -- which is
++    /// the normal case on the replica a client fails over to.
++    /// </summary>
++    /// <param name="info">The progress report.</param>
++    private void PingSharedTranscode(PlaybackProgressInfo info)
++    {
++        if (SharedTranscodeDir.Enabled && !string.IsNullOrEmpty(info.PlaySessionId))
++        {
++            _transcodeManager.PingTranscodingJob(info.PlaySessionId, info.IsPaused);
++        }
++    }
++
+     /// <summary>
+     /// Pings a playback session.
+     /// </summary>
+@@ -388,6 +405,7 @@ public class PlaystateController : BaseJellyfinApiController
+ 
+         playbackProgressInfo.PlayMethod = ValidatePlayMethod(playbackProgressInfo.PlayMethod, playbackProgressInfo.PlaySessionId);
+         playbackProgressInfo.SessionId = await RequestHelpers.GetSessionId(_sessionManager, _userManager, HttpContext).ConfigureAwait(false);
++        PingSharedTranscode(playbackProgressInfo);
+         await _sessionManager.OnPlaybackProgress(playbackProgressInfo).ConfigureAwait(false);
+         return NoContent();
+     }
 diff --git a/MediaBrowser.Controller/MediaEncoding/SharedTranscodeDir.cs b/MediaBrowser.Controller/MediaEncoding/SharedTranscodeDir.cs
 new file mode 100644
 index 000000000..836e59c52

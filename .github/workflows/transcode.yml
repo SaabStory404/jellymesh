@@ -18,7 +18,7 @@ jobs:
   # Transcode pool native control plane (transcode): lint, unit + parity
   # tests, static musl build, and the shim<->agent protocol suite run against
   # the native binaries (transcode/spike/proto_test.sh, 21 cases: 1-16, 17a,
-  # 17b, 18, 19, 20 (20 itself run in four steps, 20a-20d)).
+  # 17b, 18, 19, 20 (20 itself run in four steps, 20a-20d), 21a-21d shared dir).
   tcpool:
     name: tcpool
     runs-on: ubuntu-latest
@@ -69,7 +69,7 @@ jobs:
           out="$RUNNER_TEMP/proto.out"
           AGENT="$bin/tcpool-agent" SHIM="$bin/tcpool-shim" TC_PROTO_DIR="$RUNNER_TEMP/proto" \
             timeout 600 bash spike/proto_test.sh > "$out" 2>&1 || true
-          grep -E "^==|exit=|shim gone|ffmpeg (fenced|gone|STILL)|^batch:|^preempt-|^affinity:" "$out"
+          grep -E "^==|exit=|shim gone|ffmpeg (fenced|gone|STILL)|^batch:|^preempt-|^affinity:|^shared:" "$out"
           # every case must report its expected outcome
           test "$(grep -c '^exit=0' "$out")" -eq 7
           grep -q 'shim gone after [5-8] s' "$out"
@@ -119,6 +119,13 @@ jobs:
           # the code in this log line is the agent's raw signal-derived value (-9), not the
           # masked 247 the shim process actually exits with (see the `stall exit=247` line above)
           grep -q 'affinity cleared: worker affb exited -9 after the first segment' "$out"
+          # Shared transcode dir (docs/SHARED-TRANSCODE.md): the shim dies, the same ffmpeg keeps
+          # writing and the agent keeps the lease fresh; a seek from another replica takes the
+          # output over (orphaned or attached holder); a stale keepalive ends and cleans up
+          grep -q 'shared: detached same_ffmpeg=yes growing=yes lease_fresh=yes' "$out"
+          grep -q 'shared: takeover exit=0 old_ffmpeg=gone seek_segment=yes took_over_logged=1' "$out"
+          grep -q 'shared: attached-takeover old_exit=0 new_exit=0 seek_segment=yes' "$out"
+          grep -q 'shared: orphan-expired ffmpeg_gone=yes .* files_left=0 keepalive=removed' "$out"
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
