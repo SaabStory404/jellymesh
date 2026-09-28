@@ -209,7 +209,19 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
 - [x] Command allowlist (134 real commands pass, 11 attacks rejected) — case 13
 - [x] mTLS (pool CA, client certs required, drain on cert rotation, plaintext health port) — case 14
 - [x] Metrics: agent :9903, sync :9904; alert rules `transcode/deploy/alerts.yaml` (sub A, merged)
-- [~] Fuzzing + property tests + bypass hunt (sub B, branch `tcpool-fuzz`)
+- [x] Fuzzing + property tests + bypass hunt (branch `p2-fuzz`; no `tcpool-fuzz` branch existed on
+      origin to merge from -- checked and confirmed absent). 4 cargo-fuzz targets (`validate`,
+      `render`, `filters`, `trickplay`) over the IR parser/validator/renderer, each run 10 min
+      (4 parallel workers, `-timeout=10`) against the existing seed corpus: 13.1M/2.5M/3.0M/7.9M
+      total execs, 0 crashes/timeouts/OOMs, coverage converged (cov 454/1147/787/496 edges). Added
+      a small hand-crafted `trickplay` seed corpus (4 files, ~200 B) -- none existed before; the
+      libFuzzer-grown corpora (11 MB minimized via `cargo fuzz cmin`, 213 MB raw) were both over
+      the size bar and, in the minimized case, dropped all 529 original hand-curated seeds as
+      redundant, so neither was committed; the original committed corpus is unchanged. CI gets a
+      separate `fuzz-smoke` job in `transcode.yml` (nightly toolchain, cached `cargo-fuzz`, each
+      target 60 s against the committed corpus, fails the job on any crash). Property tests
+      (`crates/ir/tests/properties.rs`, 4 cases) and the allowlist/bypass suite already existed
+      and are green under `cargo test --locked`
 - [~] cert-manager certs, DaemonSets per GPU label, headless-Service DNS discovery, PDBs, JellyMesh contract (sub C)
 - [x] Batch/priority class (decision 3), trickplay only: routes at `Priority::Batch` behind `TC_BATCH=1` (unset by
       default, so this ships dark). Keyframe extraction needs no pool routing -- Jellyfin never spawns `ffmpeg`

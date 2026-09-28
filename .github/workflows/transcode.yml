@@ -145,3 +145,71 @@ jobs:
             transcode/target/x86_64-unknown-linux-musl/release/tcpool-agent
             transcode/target/x86_64-unknown-linux-musl/release/tcpool-shim
             transcode/target/x86_64-unknown-linux-musl/release/tcpool-sync
+
+  # Fuzz smoke: each cargo-fuzz target against the committed seed corpus for a short, fixed
+  # time, on nightly (cargo-fuzz requires the nightly-only sanitizer/coverage instrumentation).
+  # Separate job/toolchain from `tcpool` above so a stable-toolchain failure there can't mask a
+  # fuzz regression, and vice versa. `cargo fuzz run` exits non-zero on any crash/timeout/OOM
+  # found in the corpus or the short run, which is this job's pass/fail signal.
+  fuzz-smoke:
+    name: fuzz-smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_FUZZ_VERSION: "0.13.2"
+    defaults:
+      run:
+        working-directory: transcode
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Nightly toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup +nightly component add rust-src
+          rustc +nightly --version
+
+      - name: Cache cargo-fuzz binary
+        id: cargo-fuzz-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ runner.os }}-${{ env.CARGO_FUZZ_VERSION }}
+
+      - name: Install cargo-fuzz
+        if: steps.cargo-fuzz-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+
+      - name: Fuzz target cache
+        uses: actions/cache@v4
+        with:
+          path: transcode/fuzz/target
+          key: tcpool-fuzz-${{ runner.os }}-${{ hashFiles('transcode/fuzz/Cargo.lock') }}
+
+      - name: cargo +nightly fuzz build
+        run: cargo +nightly fuzz build
+
+      # 60 s per target against the corpus already committed under fuzz/corpus/<target>/ --
+      # long enough to replay the whole seed set and spend the remainder mutating, short enough
+      # to keep this job fast. A crash, timeout (-timeout=10) or OOM makes cargo-fuzz exit
+      # non-zero, which fails the step.
+      - name: fuzz validate (60s)
+        run: cargo +nightly fuzz run validate fuzz/corpus/validate -- -max_total_time=60 -timeout=10
+
+      - name: fuzz render (60s)
+        run: cargo +nightly fuzz run render fuzz/corpus/render -- -max_total_time=60 -timeout=10
+
+      - name: fuzz filters (60s)
+        run: cargo +nightly fuzz run filters fuzz/corpus/filters -- -max_total_time=60 -timeout=10
+
+      - name: fuzz trickplay (60s)
+        run: cargo +nightly fuzz run trickplay fuzz/corpus/trickplay -- -max_total_time=60 -timeout=10
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-artifacts
+          path: transcode/fuzz/artifacts/
