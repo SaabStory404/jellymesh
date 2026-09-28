@@ -371,7 +371,12 @@ pub async fn run_job(
                                 }
                                 let _ = stdin_tx.send(Some(b)).await;
                             }
-                            Some(client_msg::Msg::StdinClose(_)) => {
+                            // A detachable job keeps ffmpeg's stdin open (the StdinClose falls
+                            // through to `_`): the agent itself sends p/u once detached. Jellyfin
+                            // closes the shim's stdin only when it is going away (MEASURED in
+                            // jm-lab: a pod delete closes it before the connection drops), and
+                            // ffmpeg ignores stdin EOF.
+                            Some(client_msg::Msg::StdinClose(_)) if ctl.detach.is_none() => {
                                 let _ = stdin_tx.send(None).await;
                             }
                             _ => {}

@@ -641,9 +641,14 @@ if [ -n "$NATIVE" ]; then
   TOUCH=$!
   ( while :; do touch "$SEGF"; sleep 1; done ) &
   SEGT=$!
-  sleep 60 | TC_WORKERS=thr=127.0.0.1:19923 JELLYMESH_KEEPALIVE="$KA" $SHIM "${SH_VOD[@]}" 2>/dev/null &
+  # As when Jellyfin dies: the shim's stdin hits EOF first (it forwards StdinClose), then the
+  # shim goes. The agent must keep ffmpeg's stdin open for its own p/u (jm-lab: a pod delete
+  # closed it and the orphan never paused).
+  ( until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done ) \
+    | TC_WORKERS=thr=127.0.0.1:19923 JELLYMESH_KEEPALIVE="$KA" $SHIM "${SH_VOD[@]}" 2>/dev/null &
   SHT=$!
   until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done
+  sleep 1
   kill -9 "$SHT"
   # viewer parked at segment 0: the job pauses once the output is > 2 segments ahead
   t0=$SECONDS
