@@ -7,6 +7,7 @@
 //! (`corpus/goldens/spike-translate.json`); deliberate improvements come after, as golden updates.
 
 pub mod filters;
+pub mod shared;
 pub mod validate;
 
 use std::fmt;

@@ -1,6 +1,7 @@
 //! One job: admission, ffmpeg lifecycle, heartbeats, fencing, and the CPU-filter re-run.
 
 use crate::config::Config;
+use crate::detach::Detach;
 use crate::probe::source_height;
 use crate::State;
 use std::process::Stdio;
@@ -45,6 +46,10 @@ enum Ended {
     Drained,
     /// A PLAYBACK admission preempted this BATCH job (before or after it produced any output).
     Preempted,
+    /// Shared transcode dir: another replica's shim took this output over (a seek there).
+    TakenOver,
+    /// Shared transcode dir: detached, and the session keepalive went stale (viewer gone).
+    Orphaned,
 }
 
 /// Why a BATCH job is refused outright before admission is even attempted, or `None` to proceed.
@@ -87,6 +92,8 @@ fn final_outcome(code: i32, fenced: bool, ended: Option<Ended>) -> (crate::metri
         // planned handoff to another worker, not a failure -- keep it out of exit_error.
         Some(Ended::Drained) => (crate::metrics::Outcome::Drained, false),
         Some(Ended::Preempted) => (crate::metrics::Outcome::Preempted, true),
+        Some(Ended::TakenOver) => (crate::metrics::Outcome::TakenOver, false),
+        Some(Ended::Orphaned) => (crate::metrics::Outcome::OrphanExpired, false),
         None => (crate::metrics::Outcome::ExitError, false),
     }
 }
@@ -107,6 +114,8 @@ struct Ctl {
     /// Kept only to reach `state.metrics` from `note_stderr`; a cheap Arc clone.
     state: Arc<State>,
     job_id: u64,
+    /// Shared transcode dir: set when this job may outlive its shim (see `detach`).
+    detach: Option<Arc<Detach>>,
 }
 
 impl Ctl {
@@ -115,6 +124,30 @@ impl Ctl {
             crate::log(format_args!("fencing: {why}; killing ffmpeg"));
             let _ = self.kill.send(true);
         }
+    }
+
+    /// The shim is gone (stream closed, send failed, or silent past `fence_after`). A detachable
+    /// job keeps running (returns true); any other job is fenced (returns false).
+    fn shim_lost(&self, why: &str) -> bool {
+        if let Some(d) = &self.detach {
+            if self.done.load(Ordering::SeqCst) || self.fenced.load(Ordering::SeqCst) {
+                return false;
+            }
+            if d.mark_detached() {
+                crate::log(format_args!(
+                    "shim lost ({why}); detaching: ffmpeg keeps writing {} for the other replicas",
+                    d.stem
+                ));
+                self.state.metrics.inc(crate::metrics::Outcome::Detached);
+            }
+            return true;
+        }
+        self.fence(why);
+        false
+    }
+
+    fn is_detached(&self) -> bool {
+        self.detach.as_ref().is_some_and(|d| d.is_detached())
     }
 
     /// End the job ourselves. Unlike fencing, the shim still gets an `exit`, so Jellyfin
@@ -252,6 +285,20 @@ pub async fn run_job(
     let job_id = state.metrics.new_job_id();
     let started = Instant::now();
 
+    // Shared transcode dir: may this job outlive its shim? (PLAYBACK only; needs the shim's
+    // keepalive path and a lease on disk.) Any problem -> run attached, exactly as before.
+    let detach = if batch {
+        None
+    } else {
+        let mapped: Vec<String> = job.args.iter().map(|a| map_path(a, &cfg.pathmap)).collect();
+        match Detach::from_job(cfg, &mapped, &map_path(&job.keepalive_path, &cfg.pathmap)) {
+            Ok(d) => d.map(Arc::new),
+            Err(e) => {
+                crate::log(format_args!("not detachable: {e}"));
+                None
+            }
+        }
+    };
     let (kill_tx, kill_rx) = watch::channel(false);
     let ctl = Arc::new(Ctl {
         fenced: AtomicBool::new(false),
@@ -264,6 +311,7 @@ pub async fn run_job(
         ended: std::sync::Mutex::new(None),
         state: state.clone(),
         job_id,
+        detach: detach.clone(),
     });
 
     // A4: "preempted before start" -- the preempt handle exists (it was registered atomically
@@ -286,6 +334,7 @@ pub async fn run_job(
                     fenced: false,
                     gpu_filters: false,
                     preempted: true,
+                    taken_over: false,
                 })))
                 .await;
             drop(guard);
@@ -295,6 +344,9 @@ pub async fn run_job(
 
     let (stdin_tx, stdin_rx) = mpsc::channel::<Option<Vec<u8>>>(64);
     let stdin_rx = Arc::new(Mutex::new(stdin_rx));
+    // The detach watcher's own handle on ffmpeg's stdin (it may need to send `u` after the
+    // reader, which owns `stdin_tx`, has gone with the shim).
+    let stdin_detach = stdin_tx.clone();
 
     // Client -> us: stdin keys, heartbeats. Stream end or error = shim gone -> fence.
     let reader = {
@@ -323,7 +375,7 @@ pub async fn run_job(
                         }
                     }
                     _ => {
-                        ctl.fence("shim closed the connection");
+                        ctl.shim_lost("shim closed the connection");
                         return;
                     }
                 }
@@ -337,8 +389,11 @@ pub async fn run_job(
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
+                if ctl.is_detached() {
+                    return;
+                }
                 if ctl.last_heard.lock().await.elapsed() > fence_after {
-                    ctl.fence(&format!(
+                    ctl.shim_lost(&format!(
                         "no frame from shim for {}s",
                         fence_after.as_secs_f64()
                     ));
@@ -358,12 +413,51 @@ pub async fn run_job(
                     .await
                     .is_err()
                 {
-                    ctl.fence("shim unreachable");
+                    ctl.shim_lost("shim unreachable");
                     return;
                 }
             }
         })
     };
+
+    // Shared transcode dir: heartbeat the output lease from the agent too (so it stays fresh
+    // when the shim dies with its replica), honour takeover requests, unpause a detached ffmpeg
+    // (nobody is left to send Jellyfin's `u`), and end a detached job whose viewer is gone.
+    let detach_watch = detach.clone().map(|d| {
+        let ctl = ctl.clone();
+        let stdin_tx = stdin_detach.clone();
+        let cfg = cfg.clone();
+        tokio::spawn(async move {
+            let mut unpaused = false;
+            loop {
+                if ctl.done.load(Ordering::SeqCst) {
+                    return;
+                }
+                d.heartbeat();
+                if d.takeover_requested() {
+                    d.set_taken_over();
+                    ctl.end(Ended::TakenOver, "another replica took this output over");
+                    return;
+                }
+                if d.is_detached() {
+                    if !unpaused {
+                        unpaused = true;
+                        if ctl.paused.swap(false, Ordering::SeqCst) {
+                            let _ = stdin_tx.send(Some(b"u".to_vec())).await;
+                        }
+                    }
+                    if d.expired(&cfg, std::time::SystemTime::now()) {
+                        ctl.end(
+                            Ended::Orphaned,
+                            "detached and the session keepalive went stale",
+                        );
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    });
 
     // Progress watchdog: ffmpeg's `time=` must advance unless Jellyfin paused it. A stalled
     // encode under a healthy agent would otherwise hang the session (it keeps heartbeating).
@@ -547,15 +641,40 @@ pub async fn run_job(
     // one. This only ever widens the send for a job that was preempted (a
     // PLAYBACK job's `ended` can never be `Preempted`: only a BATCH reservation gets a preempt
     // handle), so PLAYBACK behavior (`if !fenced`) is unchanged.
-    if !fenced || preempted {
+    let taken_over = detach.as_ref().is_some_and(|d| d.was_taken_over());
+    if (!fenced || preempted) && !ctl.is_detached() {
         let _ = tx
             .send(msg(server_msg::Msg::Exit(Exit {
                 code,
                 fenced,
                 gpu_filters: rendered.gpu_filters,
                 preempted,
+                taken_over,
             })))
             .await;
+    }
+    if let Some(d) = &detach {
+        if let Some(h) = &detach_watch {
+            h.abort();
+        }
+        if taken_over || d.is_detached() {
+            // Attached jobs leave the lease to their shim (unchanged); a taken-over or detached
+            // job frees it here so the next writer (or nobody) can take it.
+            d.release();
+        }
+        if d.is_detached() && !taken_over {
+            if ctl.ended() == Some(Ended::Orphaned) {
+                let n = d.cleanup();
+                crate::log(format_args!(
+                    "detached output {}: viewer gone, removed {n} files",
+                    d.stem
+                ));
+            } else {
+                // Finished (or failed) on its own while still being served: delete the outputs
+                // only once the viewer is gone.
+                tokio::spawn(crate::detach::linger_then_cleanup(cfg.clone(), d.clone()));
+            }
+        }
     }
     crate::log(format_args!(
         "exit {code}{}",
@@ -569,6 +688,7 @@ pub async fn run_job(
         h.abort();
     }
     reader.abort();
+    drop(stdin_detach);
     drop(guard);
 }
 
@@ -581,13 +701,15 @@ async fn pump(mut from: impl tokio::io::AsyncRead + Unpin, tx: Tx, ctl: Arc<Ctl>
                 if stderr {
                     ctl.note_stderr(&buf[..n]);
                 }
+                if ctl.is_detached() {
+                    continue; // keep draining ffmpeg's pipes; nobody to forward them to
+                }
                 let m = if stderr {
                     server_msg::Msg::Stderr(buf[..n].to_vec())
                 } else {
                     server_msg::Msg::Stdout(buf[..n].to_vec())
                 };
-                if tx.send(msg(m)).await.is_err() {
-                    ctl.fence("shim unreachable");
+                if tx.send(msg(m)).await.is_err() && !ctl.shim_lost("shim unreachable") {
                     return;
                 }
             }

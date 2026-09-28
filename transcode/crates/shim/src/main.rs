@@ -61,6 +61,10 @@ const DEAD_AFTER: Duration = Duration::from_secs(6);
 const HELLO_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Accepted/Busy arrives after the agent's ffprobe of the source (bounded at 10 s there).
 const ADMIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Shared transcode dir: how long a takeover waits for the current writer (an agent polls the
+/// request every second) to stop and free the lease before falling back to `follow()` (an agent
+/// that predates takeover never answers).
+const TAKEOVER_WAIT: Duration = Duration::from_secs(8);
 
 fn real_ffmpeg() -> String {
     std::env::var("TC_FFMPEG_REAL")
@@ -423,6 +427,8 @@ enum Attempt {
     /// `run_batch`); a PLAYBACK job's agent-side job task never has a preempt handle to trigger.
     Exited(i32, bool),
     Lost(String),
+    /// Shared transcode dir: another replica's shim took this output over (`Exit.taken_over`).
+    TakenOver,
 }
 
 type StdinSink = Arc<Mutex<Option<mpsc::Sender<ClientMsg>>>>;
@@ -455,6 +461,7 @@ async fn attempt(
     priority: Priority,
     admit_timeout: Duration,
     affinity_path: Option<&Path>,
+    keepalive: &str,
 ) -> Attempt {
     let (tx, rx) = mpsc::channel::<ClientMsg>(64);
     let cwd = std::env::current_dir()
@@ -464,6 +471,7 @@ async fn attempt(
         args: args.to_vec(),
         cwd,
         priority: priority as i32,
+        keepalive_path: keepalive.to_string(),
     };
     if tx
         .send(ClientMsg {
@@ -541,6 +549,7 @@ async fn attempt(
                 Some(server_msg::Msg::Stdout(b)) => {
                     let _ = std::io::stdout().write_all(&b);
                 }
+                Some(server_msg::Msg::Exit(e)) if e.taken_over => break Attempt::TakenOver,
                 Some(server_msg::Msg::Exit(e)) => break Attempt::Exited(e.code, e.preempted),
                 _ => {}
             },
@@ -604,6 +613,15 @@ async fn run(args: Vec<String>) -> Outcome {
     let sink: StdinSink = Arc::new(Mutex::new(None));
     start_stdin_pump(sink.clone());
     let pl = playlist(&args).unwrap_or_default().to_string();
+    // Shared transcode dir (docs/SHARED-TRANSCODE.md): patched Jellyfin names the session
+    // keepalive file here. Its presence means (a) the agent may keep this job running if this
+    // replica dies, and (b) a held lease on this output is taken over rather than followed:
+    // Jellyfin only starts an ffmpeg for an output another replica is writing when it needs a
+    // different position (a seek), which following would never deliver.
+    let keepalive = std::env::var(tcpool_ir::shared::KEEPALIVE_ENV)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_default();
     let lease = loop {
         match lease::try_acquire(&pl) {
             lease::Acquire::Held(l) => break Some(l),
@@ -612,11 +630,23 @@ async fn run(args: Vec<String>) -> Outcome {
                 break None;
             }
             lease::Acquire::Busy => {
+                if !keepalive.is_empty() {
+                    if let Some(l) = lease::take_over(&pl, TAKEOVER_WAIT).await {
+                        log(&format!("took output {pl} over from another replica"));
+                        break Some(l);
+                    }
+                }
                 if let Some(o) = follow(&args, &pl).await {
                     return o;
                 }
             }
         }
+    };
+    // Unleased jobs never detach: without the lease a second writer could not be kept out.
+    let keepalive = if lease.is_some() {
+        keepalive
+    } else {
+        String::new()
     };
     let finish = |o: Outcome| {
         if let Some(l) = &lease {
@@ -683,6 +713,7 @@ async fn run(args: Vec<String>) -> Outcome {
                 priority_for(tcpool_ir::Shape::Hls),
                 ADMIT_TIMEOUT,
                 affinity::enabled().then_some(affinity_path.as_path()),
+                &keepalive,
             )
             .await
             {
@@ -694,6 +725,16 @@ async fn run(args: Vec<String>) -> Outcome {
                 }
                 Attempt::Exited(0, _) => {
                     log(&format!("worker {} finished with exit code 0", w.label()));
+                    return finish(Outcome::Exit(0));
+                }
+                Attempt::TakenOver => {
+                    // The output now belongs to the other replica's writer: leave its files
+                    // (no remove_partials) and its affinity pin alone, and tell Jellyfin this
+                    // ffmpeg is done. `finish` only frees the lease if it still names us.
+                    log(&format!(
+                        "worker {}: output taken over by another replica; exiting 0",
+                        w.label()
+                    ));
                     return finish(Outcome::Exit(0));
                 }
                 r => {
@@ -940,6 +981,7 @@ async fn run_batch(args: Vec<String>) -> Outcome {
             priority_for(tcpool_ir::Shape::Trickplay),
             remaining,
             None, // BATCH never writes seek affinity
+            "",   // nor detaches (shared-dir keepalive is PLAYBACK only)
         )
         .await
         {
@@ -975,6 +1017,12 @@ async fn run_batch(args: Vec<String>) -> Outcome {
             }
             Attempt::Exited(c, false) => {
                 return batch_pool_failure(&args, &format!("on worker {} exited {c}", w.label()));
+            }
+            Attempt::TakenOver => {
+                return batch_pool_failure(
+                    &args,
+                    &format!("on worker {} was taken over", w.label()),
+                );
             }
             Attempt::Lost(e) => {
                 return batch_pool_failure(
