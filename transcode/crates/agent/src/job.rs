@@ -169,6 +169,9 @@ impl Ctl {
 
     fn note_stderr(&self, chunk: &[u8]) {
         let text = String::from_utf8_lossy(chunk);
+        if let Some(d) = &self.detach {
+            d.note_stderr(&text); // which segment ffmpeg is on (the detached-job throttle's edge)
+        }
         if text.contains("time=") {
             if let Some(t) = text.rsplit("time=").next() {
                 let v: String = t.chars().take_while(|c| !c.is_whitespace()).collect();

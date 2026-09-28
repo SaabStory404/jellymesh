@@ -630,13 +630,18 @@ if [ -n "$NATIVE" ]; then
   rm -f "$T/outsh/${STEM}"*
   SEGF="$KA.seg"
   echo 0 > "$SEGF"
-  newest() { grep -v '^#' "$T/outsh/${STEM}.m3u8" 2>/dev/null | tail -1 | sed -E "s/^${STEM}([0-9]+)\.ts$/\1/"; }
+  # Jellyfin's shape: a VOD playlist (ffmpeg writes it only at the end) and temp_file segments,
+  # so the agent must learn the edge from ffmpeg's stderr, not from the playlist
+  SH_VOD=(-re -i "$T/src.mkv" -c:v libx264 -preset ultrafast -force_key_frames "expr:gte(t,n_forced*3)" -f hls
+          -hls_time 3 -hls_segment_type mpegts -start_number 0 -hls_segment_filename "$T/outsh/${STEM}%d.ts"
+          -hls_playlist_type vod -hls_list_size 0 -hls_flags temp_file "$T/outsh/${STEM}.m3u8")
+  newest() { ls "$T/outsh" | sed -n -E "s/^${STEM}([0-9]+)\.ts$/\1/p" | sort -n | tail -1; }
   keys2() { cat "$T"/keys2/* 2>/dev/null; }
   ( while :; do touch "$KA"; sleep 1; done ) &
   TOUCH=$!
   ( while :; do touch "$SEGF"; sleep 1; done ) &
   SEGT=$!
-  sleep 60 | TC_WORKERS=thr=127.0.0.1:19923 JELLYMESH_KEEPALIVE="$KA" $SHIM "${SH_ARGS[@]}" 2>/dev/null &
+  sleep 60 | TC_WORKERS=thr=127.0.0.1:19923 JELLYMESH_KEEPALIVE="$KA" $SHIM "${SH_VOD[@]}" 2>/dev/null &
   SHT=$!
   until [ -e "$T/outsh/${STEM}0.ts" ]; do sleep 0.2; done
   kill -9 "$SHT"

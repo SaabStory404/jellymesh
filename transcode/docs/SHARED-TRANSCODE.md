@@ -76,9 +76,12 @@ no owner, so the agent does the same, once a second, against the viewer's positi
 - **Position**: every segment request, on any replica, writes the requested index to
   `.jellymesh-alive/<PlaySessionId>.seg` (write to a temp file + rename, so a reader never sees a
   torn value; rewritten when the index changes, else at most every 2 s).
-- **Output edge**: the last URI in the job's own playlist (`<stem>.m3u8`, read from the tail;
-  ffmpeg replaces it whole after each segment). A directory scan would also count an earlier
-  writer's segments.
+- **Output edge**: the segment ffmpeg last announced opening on stderr
+  (`Opening '<stem>N.ts.tmp' for writing`, info level, once per segment): N-1 is complete. Not
+  the playlist: with Jellyfin's `-hls_playlist_type vod` ffmpeg writes it only when the encode
+  ends (MEASURED in jm-lab and with ffmpeg 8.1; the first lab run of this throttle found no
+  playlist at all mid-stream). Not a directory scan: an earlier writer's segments of the same
+  output may still be there.
 - **Decision** (`tcpool_ir::shared::orphan_throttle`): lead = (edge - position) x `-hls_time`.
   Pause above `TC_ORPHAN_LEAD_MAX_SECS` (60 s; `0` = never throttle), resume below
   `TC_ORPHAN_LEAD_RESUME_SECS` (30 s). The gap between the two keeps it from flapping every segment.

@@ -119,26 +119,21 @@ pub fn read_position(path: &Path) -> Option<Position> {
     Some(Position { index, touched })
 }
 
-/// The newest segment index listed in an HLS playlist `<dir>/<stem>.m3u8` (the last URI line,
-/// named `<stem><index>.<ext>`). Reads only the tail: ffmpeg rewrites the playlist whole (via a
-/// temp file + rename) after each segment, so its last URI is the newest complete segment of
-/// this very job (unlike a directory scan, which would also see an earlier writer's files).
-pub fn newest_segment(playlist: &Path, stem: &str) -> Option<u64> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(playlist).ok()?;
-    let len = f.metadata().ok()?.len();
-    let start = len.saturating_sub(4096);
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::with_capacity((len - start) as usize);
-    f.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    let uri = text
-        .lines()
-        .map(str::trim)
-        .rev()
-        .find(|l| !l.is_empty() && !l.starts_with('#'))?;
-    let name = uri.rsplit('/').next()?;
-    let num = name.strip_prefix(stem)?.split('.').next()?;
+/// The segment index in one line of ffmpeg's stderr announcing that the HLS muxer opens a
+/// segment of this output: `[hls @ 0x..] Opening '<dir>/<stem><index>.ts.tmp' for writing`
+/// (info level, printed for every segment; `.tmp` with `-hls_flags temp_file`).
+///
+/// This is how the agent knows how far its own ffmpeg has got. The playlist cannot tell: with
+/// Jellyfin's `-hls_playlist_type vod` ffmpeg writes it only at the very end (MEASURED, ffmpeg
+/// 8.1). Neither can the directory: an earlier writer's segments of the same output may still
+/// be there. Opening segment N means segments up to N-1 are complete.
+pub fn opened_segment(line: &str, stem: &str) -> Option<u64> {
+    let rest = &line[line.find("Opening '")? + "Opening '".len()..];
+    let path = &rest[..rest.find("' for writing")?];
+    let name = path.rsplit('/').next()?;
+    let tail = name.strip_prefix(stem)?;
+    let end = tail.find('.')?;
+    let num = &tail[..end];
     if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -196,7 +191,7 @@ pub fn usable_position(
 /// `paused` is whether ffmpeg is paused now. `newest` is the newest segment written, `pos` the
 /// viewer's last requested segment, `seg_secs` the segment length. A paused client (keepalive
 /// `paused`) keeps its last position however old it is, so a job stays paused under a paused
-/// viewer. If the position is unknown (no sidecar, no segment length, no playlist yet, or a
+/// viewer. If the position is unknown (no sidecar, no segment length, no segment written yet, or a
 /// `playing` client whose position went stale, see [`usable_position`]) the job runs
 /// unthrottled, the behaviour before the sidecar existed.
 pub fn orphan_throttle(
@@ -358,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn position_and_playlist_files() {
+    fn position_file() {
         let d = std::env::temp_dir().join(format!("tcpool-pos-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let ka = d.join("sess");
@@ -372,28 +367,31 @@ mod tests {
         std::fs::write(&sp, "-3").unwrap();
         assert!(read_position(&sp).is_none());
 
-        let stem = "0123456789abcdef0123456789abcdef";
-        let pl = d.join(format!("{stem}.m3u8"));
-        assert!(newest_segment(&pl, stem).is_none());
-        std::fs::write(&pl, "#EXTM3U\n#EXT-X-TARGETDURATION:3\n").unwrap();
-        assert!(newest_segment(&pl, stem).is_none(), "no segment yet");
-        let mut body = String::from("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:12\n");
-        for i in 12..2000 {
-            body.push_str(&format!("#EXTINF:3.000000,\n{stem}{i}.ts\n"));
-        }
-        std::fs::write(&pl, &body).unwrap();
-        assert_eq!(newest_segment(&pl, stem), Some(1999));
-        body.push_str("#EXT-X-ENDLIST\n");
-        std::fs::write(&pl, &body).unwrap();
-        assert_eq!(newest_segment(&pl, stem), Some(1999), "ENDLIST is a tag");
-        std::fs::write(&pl, format!("#EXTINF:3,\n/abs/dir/{stem}7.mp4\n")).unwrap();
-        assert_eq!(newest_segment(&pl, stem), Some(7));
-        std::fs::write(&pl, "#EXTINF:3,\nffffffffffffffffffffffffffffffff7.ts\n").unwrap();
-        assert!(
-            newest_segment(&pl, stem).is_none(),
-            "another output's segment"
-        );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn opened_segment_lines() {
+        let stem = "0123456789abcdef0123456789abcdef";
+        let l = |s: &str| format!("[hls @ 0x55da9b417c40] Opening '{s}' for writing");
+        assert_eq!(
+            opened_segment(&l(&format!("/transcodes/jf/{stem}12.ts.tmp")), stem),
+            Some(12)
+        );
+        assert_eq!(
+            opened_segment(&l(&format!("/transcodes/jf/{stem}0.ts")), stem),
+            Some(0)
+        );
+        assert_eq!(
+            opened_segment(&l(&format!("/t/{stem}7.mp4")), stem),
+            Some(7)
+        );
+        // the playlist itself, an fMP4 init segment, another output, noise: none
+        assert!(opened_segment(&l(&format!("/t/{stem}.m3u8.tmp")), stem).is_none());
+        assert!(opened_segment(&l(&format!("/t/{stem}-1.mp4")), stem).is_none());
+        assert!(opened_segment(&l("/t/ffffffffffffffffffffffffffffffff3.ts.tmp"), stem).is_none());
+        assert!(opened_segment("frame= 100 fps=50 time=00:00:04.00 speed=2x", stem).is_none());
+        assert!(opened_segment(&format!("Opening '/t/{stem}3.ts.tmp"), stem).is_none());
     }
 
     #[test]

@@ -21,7 +21,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -40,8 +40,10 @@ pub struct Detach {
     pub stem: String,
     /// The lease holder token read at job start: the lease is "ours" while it still says this.
     pub token: String,
-    /// `<dir>/<stem>.m3u8`: its last URI is the newest segment this job wrote.
-    pub playlist: PathBuf,
+    /// The segment ffmpeg last announced opening (`shared::opened_segment`), -1 before the first.
+    opened: AtomicI64,
+    /// The unterminated tail of the last stderr chunk (a line split across two reads).
+    stderr_carry: Mutex<String>,
     /// `<keepalive>.seg`: the viewer's last requested segment (any replica writes it).
     pub position: PathBuf,
     /// `-hls_time`, if the argv has one (no segment length -> never throttled).
@@ -91,7 +93,8 @@ impl Detach {
             lease,
             position: shared::position_path(&keepalive),
             keepalive,
-            playlist: PathBuf::from(pl),
+            opened: AtomicI64::new(-1),
+            stderr_carry: Mutex::new(String::new()),
             seg_secs: shared::segment_seconds(args),
             dir,
             stem,
@@ -156,9 +159,37 @@ impl Detach {
             )
     }
 
+    /// Feed ffmpeg's stderr (every chunk, attached or not): tracks the segment it is writing.
+    pub fn note_stderr(&self, text: &str) {
+        let mut carry = self.stderr_carry.lock().unwrap_or_else(|p| p.into_inner());
+        let joined = std::mem::take(&mut *carry) + text;
+        let (complete, rest) = match joined.rfind('\n') {
+            Some(i) => joined.split_at(i + 1),
+            None => ("", joined.as_str()),
+        };
+        for line in complete.lines() {
+            if let Some(n) = shared::opened_segment(line, &self.stem) {
+                self.opened.store(n as i64, Ordering::SeqCst);
+            }
+        }
+        // Carry the unterminated rest into the next chunk, bounded (progress lines end in '\r',
+        // not '\n', so the rest can grow; an "Opening" line is far shorter than the bound).
+        let mut start = rest.len().saturating_sub(2048);
+        while !rest.is_char_boundary(start) {
+            start += 1;
+        }
+        *carry = rest[start..].to_string();
+    }
+
+    /// The newest segment this job's ffmpeg completed (it has opened the next one).
+    pub fn newest_written(&self) -> Option<u64> {
+        let n = self.opened.load(Ordering::SeqCst);
+        (n >= 1).then(|| n as u64 - 1)
+    }
+
     /// Whether to pause or resume a detached job's ffmpeg now (`paused`: is it paused).
     pub fn throttle(&self, cfg: &Config, paused: bool, now: SystemTime) -> ThrottleTick {
-        let newest = shared::newest_segment(&self.playlist, &self.stem);
+        let newest = self.newest_written();
         let pos = shared::read_position(&self.position);
         let ka = shared::read_keepalive(&self.keepalive);
         let lim = cfg.orphan_throttle;
@@ -382,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn throttle_reads_playlist_and_position() {
+    fn throttle_reads_stderr_and_position() {
         let root = tmp("thr");
         let dir = root.join("jf");
         fs::create_dir_all(dir.join(".jellymesh-alive")).unwrap();
@@ -398,15 +429,29 @@ mod tests {
         assert_eq!(d.seg_secs, Some(3.0));
         assert_eq!(d.position, dir.join(".jellymesh-alive/s1.seg"));
         let now = SystemTime::now();
-        // no playlist, no position: unknown
+        // no segment opened yet, no position: unknown
         let t = d.throttle(&cfg, false, now);
         assert_eq!(t.action, shared::Throttle::Leave);
         assert_eq!(d.throttle(&cfg, true, now).action, shared::Throttle::Resume);
-        let mut pl = String::from("#EXTM3U\n");
-        for i in 0..=40 {
-            pl.push_str(&format!("#EXTINF:3,\n{STEM}{i}.ts\n"));
+        // A stale file of an earlier writer far ahead is not this job's progress.
+        fs::write(dir.join(format!("{STEM}900.ts")), "old").unwrap();
+        // ffmpeg's stderr, split mid-line across reads, with '\r' progress lines between
+        let out = dir.display().to_string();
+        let mut err = String::new();
+        for i in 0..=41 {
+            err.push_str(&format!(
+                "frame={i} fps=90 time=00:00:0{} speed=3x\r[hls @ 0x1] Opening '{out}/{STEM}{i}.ts.tmp' for writing\n",
+                i % 10
+            ));
         }
-        fs::write(dir.join(format!("{STEM}.m3u8")), pl).unwrap();
+        err.push_str(&format!(
+            "[hls @ 0x1] Opening '{out}/{STEM}.m3u8.tmp' for writing\n"
+        ));
+        let bytes = err.as_bytes();
+        for chunk in bytes.chunks(37) {
+            d.note_stderr(&String::from_utf8_lossy(chunk));
+        }
+        assert_eq!(d.newest_written(), Some(40), "opened 41 => 0..=40 complete");
         fs::write(&d.position, "5").unwrap();
         let t = d.throttle(&cfg, false, SystemTime::now());
         assert_eq!(t.action, shared::Throttle::Pause);
