@@ -1,0 +1,35 @@
+# Service identities for the pool. Minimal on purpose: neither process talks to the Kubernetes
+# API, so neither gets a token, and there is no Role or RoleBinding in this directory to audit.
+#
+# Checked, not assumed:
+#   - tcpool-agent: reads its whole configuration from TC_* env (crates/agent/src/config.rs) and
+#     discovers nothing through the API. Liveness is the kubelet's gRPC probe.
+#   - tcpool-sync: its Jellyfin offer writes go to Jellyfin's own REST API over HTTP with a
+#     Jellyfin API key (`JF_URL` / `JF_API_KEY` -> `MediaBrowser Token="..."`, see
+#     crates/sync/src/main.rs), NOT to the Kubernetes API. The api-key arrives in the
+#     `tcpool-sync` Secret, which is created out of band (CONTRACT "Secrets") because it is a
+#     Jellyfin credential, not a cluster one.
+#
+# So the "does sync need API access?" question in the task is answered by the code: no. If a
+# future change makes sync write a ConfigMap or a Lease for singleton election, it will need a
+# namespace-scoped Role then - and that Role belongs in this file, with the reason.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tcpool-agent
+  namespace: media
+  labels:
+    app.kubernetes.io/name: tcpool-agent
+    app.kubernetes.io/part-of: tcpool
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tcpool-sync
+  namespace: media
+  labels:
+    app.kubernetes.io/name: tcpool-sync
+    app.kubernetes.io/part-of: tcpool
+automountServiceAccountToken: false

@@ -1,6 +1,7 @@
 ---
-# Transcode pool (transcode/): lint, unit + parity + property tests, static musl build, and the
-# shim<->agent protocol suite against the native binaries.
+# Transcode pool (transcode/): lint, unit + parity + property tests, static musl build, the
+# shim<->agent protocol suite against the native binaries, and a cargo-fuzz smoke run over the
+# IR parser (the security and correctness boundary).
 name: transcode
 
 on:
@@ -93,3 +94,85 @@ jobs:
             transcode/target/x86_64-unknown-linux-musl/release/tcpool-agent
             transcode/target/x86_64-unknown-linux-musl/release/tcpool-shim
             transcode/target/x86_64-unknown-linux-musl/release/tcpool-sync
+
+  # Fuzz smoke for tcpool-ir (transcode/fuzz, a separate workspace so nightly + libfuzzer never
+  # leak into the stable build above). Each of the three targets runs for a bounded 120 s against
+  # the seeded corpora in transcode/fuzz/corpus: validate() and render()/translate() over the
+  # 134-command Jellyfin corpus, and the filter parser over the corpus filter chains. This is a
+  # smoke run, not a proof -- it keeps the parser from regressing while the weekly chaos CronJob
+  # (P2 checklist) does the long runs. Any libFuzzer crash artifact fails the job and is uploaded.
+  fuzz:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: transcode/fuzz
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Nightly toolchain
+        run: |
+          # cargo-fuzz builds with -Zsanitizer=address, which only nightly accepts, and it is the
+          # `cargo` on PATH that it re-invokes -- so every fuzz command below goes through
+          # `cargo +nightly`. No musl target and no rust-src needed for the smoke run.
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly --version
+          rustc +nightly --version
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-fuzz
+            transcode/fuzz/target
+          key: tcpool-fuzz-${{ runner.os }}-cargo-fuzz-0.13.2-${{ hashFiles('transcode/fuzz/Cargo.lock') }}
+
+      - name: cargo-fuzz
+        run: |
+          if ! command -v cargo-fuzz >/dev/null; then
+            # Pinned: the tool decides the sanitizer flags and the artifact layout this job reads.
+            cargo install cargo-fuzz --locked --version 0.13.2
+          fi
+          cargo +nightly fuzz --version
+          cargo +nightly fuzz list
+
+      - name: Fuzz smoke (validate, render, filters)
+        run: |
+          set -uo pipefail
+          # Work on a copy of the seeded corpora: libFuzzer appends its own finds to the corpus
+          # directory it is given, and the checked-in seed set should stay exactly what the
+          # corpus test uses.
+          work="$RUNNER_TEMP/seeds"
+          status=0
+          for t in validate render filters; do
+            echo "::group::cargo fuzz run $t"
+            mkdir -p "$work/$t"
+            seeds="$(ls -A corpus/$t | wc -l)"
+            echo "$t: $seeds seed files"
+            cp -n corpus/$t/* "$work/$t/" 2>/dev/null || true
+            # A crash makes cargo fuzz exit non-zero; keep going so all three targets report.
+            cargo +nightly fuzz run "$t" "$work/$t" -- -max_total_time=120 -rss_limit_mb=4096 || {
+              echo "::error::$t failed (crash or timeout)"
+              status=1
+            }
+            echo "::endgroup::"
+            if [ -n "$(ls -A artifacts/$t 2>/dev/null)" ]; then
+              echo "::error::$t wrote crash artifacts:"
+              ls -l artifacts/$t
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcpool-fuzz-artifacts
+          path: transcode/fuzz/artifacts
+          if-no-files-found: ignore

@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- JellyMesh Transcode Pool: the read-only operator view of the GPU transcode pool (PLAN §11,
+       P3). Same plugin shape as leader/ (Jellyfin 12.1, BasePlugin + IPluginServiceRegistrator);
+       the additions are the embedded dashboard page and one controller that proxies tcpool-sync's
+       /status so the browser never has to reach a cluster-internal address itself.
+       Jellyfin adds every plugin assembly as an MVC application part
+       (Jellyfin.Server/Extensions/ApiServiceCollectionExtensions.cs), which is what makes the
+       controller discoverable. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <RootNamespace>JellyMesh.TranscodePool</RootNamespace>
+    <AssemblyName>JellyMesh.TranscodePool</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Provided by the server at runtime; not copied into the plugin folder. -->
+    <PackageReference Include="Jellyfin.Controller" Version="12.1.0" ExcludeAssets="runtime" />
+    <PackageReference Include="Jellyfin.Model" Version="12.1.0" ExcludeAssets="runtime" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- ControllerBase, [ApiController], [Authorize]: resolved from the server's shared framework
+         at runtime, never copied into the plugin folder (a framework reference, not a package). -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The dashboard page. The SDK only globs *.resx, so the html is listed by hand; its logical
+         resource name is JellyMesh.TranscodePool.Configuration.statusPage.html, which Plugin.cs
+         passes to Jellyfin as the PluginPageInfo.EmbeddedResourcePath. -->
+    <EmbeddedResource Include="Configuration/statusPage.html">
+      <LogicalName>JellyMesh.TranscodePool.Configuration.statusPage.html</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>

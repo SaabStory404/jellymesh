@@ -1,0 +1,306 @@
+<div id="tcPoolPage" data-role="page" class="page type-interior pluginConfigurationPage" data-title="Transcode Pool">
+    <div data-role="content">
+        <div class="content-primary">
+            <h2>Transcode Pool</h2>
+            <p class="fieldDescription">
+                What <code>tcpool-sync</code> last reconciled, read from its <code>/status</code> view.
+                Jellyfin runs with hardware acceleration <strong>none</strong> and the shim sends every HLS
+                transcode to the pool, so this page is the only place the dashboard can show which card is
+                serving a job and which codecs the pool will accept.
+                Read-only (PLAN &sect;11, P3) &mdash; drain and HEVC/AV1 intent controls are not implemented yet.
+            </p>
+
+            <div id="tcPoolBanner" class="tcPoolBanner" hidden></div>
+
+            <div id="tcPoolTotals" class="tcPoolTiles" hidden>
+                <div class="tcPoolTile"><div class="tcPoolTileValue" id="tcPoolCap">&mdash;</div><div class="tcPoolTileLabel">capacity (units)</div></div>
+                <div class="tcPoolTile"><div class="tcPoolTileValue" id="tcPoolUsed">&mdash;</div><div class="tcPoolTileLabel">in use (units)</div></div>
+                <div class="tcPoolTile"><div class="tcPoolTileValue" id="tcPoolLive">&mdash;</div><div class="tcPoolTileLabel">workers live / configured</div></div>
+                <div class="tcPoolTile"><div class="tcPoolTileValue" id="tcPoolSurvivable">&mdash;</div><div class="tcPoolTileLabel">survives losing one card</div></div>
+                <div class="tcPoolTile"><div class="tcPoolTileValue" id="tcPoolEmergency">&mdash;</div><div class="tcPoolTileLabel">emergency mode</div></div>
+            </div>
+
+            <h3>Codec offers</h3>
+            <p class="fieldDescription">
+                <code>effective = your choice AND the pool can</code>. &ldquo;Why&rdquo; names the deciding half, so
+                &ldquo;you turned it off&rdquo; is never confused with &ldquo;the pool cannot do it&rdquo;.
+            </p>
+            <table class="paperList tcPoolTable" id="tcPoolOffers"><tbody></tbody></table>
+
+            <h3>Workers</h3>
+            <p class="fieldDescription">
+                <em>draining</em> is not reported yet: the agent's <code>Caps</code> message has no draining field,
+                so a worker that has stopped answering Hello reads as <em>down</em> &mdash; check the notes below.
+            </p>
+            <table class="paperList tcPoolTable" id="tcPoolWorkers"><tbody></tbody></table>
+
+            <h3>What sync cannot see yet</h3>
+            <ul id="tcPoolNotes" class="tcPoolNotes"></ul>
+
+            <p class="fieldDescription">
+                <span id="tcPoolMeta">&mdash;</span>
+                <button is="emby-button" type="button" class="raised button-submit" id="tcPoolRefresh">Refresh</button>
+            </p>
+        </div>
+    </div>
+
+    <style>
+        #tcPoolPage .tcPoolBanner {
+            padding: .8em 1em;
+            margin: 1em 0;
+            border-left: 4px solid #cc0000;
+            background: rgba(204, 0, 0, .08);
+            white-space: pre-wrap;
+        }
+        #tcPoolPage .tcPoolBanner.tcPoolWarn { border-left-color: #b8860b; background: rgba(184, 134, 11, .10); }
+        #tcPoolPage .tcPoolTiles { display: flex; flex-wrap: wrap; gap: .75em; margin: 1em 0; }
+        #tcPoolPage .tcPoolTile {
+            min-width: 9em;
+            padding: .6em .9em;
+            border-radius: 4px;
+            background: rgba(127, 127, 127, .12);
+        }
+        #tcPoolPage .tcPoolTileValue { font-size: 1.5em; line-height: 1.2; }
+        #tcPoolPage .tcPoolTileLabel { font-size: .84em; opacity: .8; }
+        #tcPoolPage .tcPoolTable { width: 100%; }
+        #tcPoolPage .tcPoolTable td, #tcPoolPage .tcPoolTable th { text-align: left; vertical-align: top; padding: .4em .6em; }
+        #tcPoolPage .tcPoolState { font-weight: 600; }
+        #tcPoolPage .tcPoolState-up { color: #2e7d32; }
+        #tcPoolPage .tcPoolState-down { color: #cc0000; }
+        #tcPoolPage .tcPoolState-never_seen { color: #b8860b; }
+        #tcPoolPage .tcPoolOff, #tcPoolPage .tcPoolMuted { opacity: .65; }
+        #tcPoolPage .tcPoolNotes { margin: 0 0 1em 1.2em; padding: 0; opacity: .8; }
+    </style>
+
+    <script type="text/javascript">
+        (function () {
+            'use strict';
+
+            var REFRESH_MS = 10000;
+            var timer = null;
+
+            function el(tag, className, text) {
+                var node = document.createElement(tag);
+                if (className) {
+                    node.className = className;
+                }
+                if (text !== undefined && text !== null) {
+                    node.textContent = String(text);
+                }
+                return node;
+            }
+
+            function cell(row, text, className) {
+                row.appendChild(el('td', className || null, text));
+            }
+
+            function details(row, text) {
+                var td = el('td');
+                td.appendChild(el('div', null, text));
+                row.appendChild(td);
+                return td;
+            }
+
+            // ApiClient (jellyfin-web) resolves the URL and attaches the admin token. The reject
+            // value is the XHR, whose body is our controller's { error, sync_base_url } on 502.
+            function readStatus() {
+                var url = ApiClient.getUrl('TcPool/Status');
+                return new Promise(function (resolve, reject) {
+                    ApiClient.getJSON(url).then(resolve, function (xhr) {
+                        var message = null;
+                        try {
+                            var body = (xhr && xhr.responseJSON) ? xhr.responseJSON : JSON.parse((xhr && xhr.responseText) || 'null');
+                            if (body && body.error) {
+                                message = body.error;
+                            }
+                        } catch (ignored) {
+                            message = null;
+                        }
+                        reject(new Error(message || ('the pool view could not be read (HTTP ' + ((xhr && xhr.status) || '?') + ')')));
+                    });
+                });
+            }
+
+            function fmtUnits(value) {
+                if (typeof value !== 'number' || !isFinite(value)) {
+                    return '—';
+                }
+                return (Math.round(value * 100) / 100).toString();
+            }
+
+            function fmtAge(seconds) {
+                if (typeof seconds !== 'number' || seconds < 0) {
+                    return 'never';
+                }
+                if (seconds < 60) {
+                    return seconds + ' s ago';
+                }
+                if (seconds < 3600) {
+                    return Math.round(seconds / 60) + ' min ago';
+                }
+                return Math.round(seconds / 3600) + ' h ago';
+            }
+
+            function fmtClock(unix) {
+                if (!unix) {
+                    return 'never';
+                }
+                return new Date(unix * 1000).toLocaleTimeString();
+            }
+
+            function renderOffers(offers) {
+                var body = document.querySelector('#tcPoolOffers tbody');
+                body.innerHTML = '';
+                var head = el('tr');
+                ['Codec', 'Jellyfin option', 'Your choice', 'Offered', 'Why'].forEach(function (label) {
+                    head.appendChild(el('th', null, label));
+                });
+                body.appendChild(head);
+
+                (offers || []).forEach(function (offer) {
+                    var row = el('tr');
+                    cell(row, offer.token || '—');
+                    cell(row, offer.option || '—');
+
+                    // intent/effective are the two halves the dashboard must not conflate; the
+                    // reason string sync sends is already the human expansion of `cause`.
+                    cell(row, offer.intent ? 'on' : 'off', offer.intent ? null : 'tcPoolMuted');
+                    cell(row, offer.effective ? 'yes' : 'no', offer.effective ? 'tcPoolState-up' : 'tcPoolState-down');
+
+                    var why = offer.reason || offer.cause || '';
+                    if (offer.lacking && offer.lacking.length) {
+                        why += ' (missing on: ' + offer.lacking.join(', ') + ')';
+                    }
+                    details(row, why);
+                    body.appendChild(row);
+                });
+            }
+
+            function renderWorkers(workers) {
+                var body = document.querySelector('#tcPoolWorkers tbody');
+                body.innerHTML = '';
+                var head = el('tr');
+                ['Worker', 'State', 'Card', 'Found via', 'Outputs', 'Units used / capacity', 'Last seen'].forEach(function (label) {
+                    head.appendChild(el('th', null, label));
+                });
+                body.appendChild(head);
+
+                (workers || []).forEach(function (worker) {
+                    var row = el('tr');
+                    cell(row, worker.name || worker.addr || '—');
+                    cell(row, worker.state || '—', 'tcPoolState tcPoolState-' + (worker.state || 'unknown'));
+                    cell(row, worker.kind || '—');
+                    cell(row, worker.source || '—');
+
+                    var outputs = details(row, (worker.outputs && worker.outputs.length) ? worker.outputs.join(', ') : 'none reported');
+
+                    cell(row, fmtUnits(worker.units_used) + ' / ' + fmtUnits(worker.capacity_units)
+                        + '  (' + fmtUnits(worker.units_free) + ' free)');
+                    cell(row, fmtAge(worker.age_seconds));
+
+                    // A worker that is only persisted, or never seen, is why an offer can still be
+                    // held down by a card that is gone; say so on the row.
+                    if (worker.state !== 'up') {
+                        outputs.appendChild(el('div', 'tcPoolMuted',
+                            worker.state === 'never_seen'
+                                ? 'has never answered Hello; capabilities are assumed, not measured'
+                                : 'not answering; capabilities are its last report'));
+                    }
+                    body.appendChild(row);
+                });
+            }
+
+            function renderNotes(notes) {
+                var list = document.querySelector('#tcPoolNotes');
+                list.innerHTML = '';
+                (notes || []).forEach(function (note) {
+                    list.appendChild(el('li', null, note));
+                });
+            }
+
+            function renderMeta(status, checkedUnix) {
+                document.querySelector('#tcPoolMeta').textContent =
+                    'synced ' + fmtClock(status.synced_unix)
+                    + ', last config write ' + fmtClock(status.last_success_unix)
+                    + '; schema ' + status.schema
+                    + '; read at ' + fmtClock(checkedUnix) + '.';
+            }
+
+            function showError(message, baseUrl) {
+                var banner = document.querySelector('#tcPoolBanner');
+                banner.hidden = false;
+                banner.className = 'tcPoolBanner';
+                banner.textContent = 'Pool view unavailable: ' + message
+                    + (baseUrl ? '\n(sync base URL: ' + baseUrl + ')' : '');
+                document.querySelector('#tcPoolTotals').hidden = true;
+                document.querySelector('#tcPoolMeta').textContent = '—';
+            }
+
+            function render(status, checkedUnix) {
+                var banner = document.querySelector('#tcPoolBanner');
+                banner.hidden = true;
+                document.querySelector('#tcPoolTotals').hidden = false;
+
+                document.querySelector('#tcPoolCap').textContent = fmtUnits(status.pool && status.pool.capacity_units);
+                document.querySelector('#tcPoolUsed').textContent = fmtUnits(status.pool && status.pool.units_used);
+                document.querySelector('#tcPoolLive').textContent = status.workers_live + ' / ' + status.workers_configured;
+                document.querySelector('#tcPoolSurvivable').textContent = (status.pool && status.pool.survivable) ? 'yes' : 'no';
+
+                // `emergency` is null until sync reads the scheduling agent's metrics (:9903); a
+                // missing property must read as "unknown", never as "not in emergency".
+                var emergency = document.querySelector('#tcPoolEmergency');
+                if (status.emergency === true) {
+                    emergency.textContent = 'EMERGENCY';
+                    emergency.className = 'tcPoolTileValue tcPoolState-down';
+                } else if (status.emergency === false) {
+                    emergency.textContent = 'normal';
+                    emergency.className = 'tcPoolTileValue tcPoolState-up';
+                } else {
+                    emergency.textContent = 'unknown';
+                    emergency.className = 'tcPoolTileValue tcPoolState-never_seen';
+                }
+
+                renderOffers(status.offers);
+                renderWorkers(status.workers);
+                renderNotes(status.notes);
+                renderMeta(status, checkedUnix);
+
+                if (status.emergency === null || status.emergency === undefined) {
+                    var warn = document.querySelector('#tcPoolBanner');
+                    warn.hidden = false;
+                    warn.className = 'tcPoolBanner tcPoolWarn';
+                    warn.textContent = 'Emergency mode is unknown: sync does not read the scheduling agent\'s metrics yet. '
+                        + 'Check Grafana/Kuma for pool alerts.';
+                }
+            }
+
+            function refresh() {
+                return readStatus().then(function (status) {
+                    render(status, Math.floor(Date.now() / 1000));
+                }, function (error) {
+                    showError(error && error.message ? error.message : String(error));
+                });
+            }
+
+            function start() {
+                refresh();
+                if (timer) {
+                    clearInterval(timer);
+                }
+                timer = setInterval(refresh, REFRESH_MS);
+            }
+
+            function stop() {
+                if (timer) {
+                    clearInterval(timer);
+                    timer = null;
+                }
+            }
+
+            var page = document.querySelector('#tcPoolPage');
+            page.addEventListener('pageshow', start);
+            page.addEventListener('pagehide', stop);
+            document.querySelector('#tcPoolRefresh').addEventListener('click', refresh);
+        })();
+    </script>
+</div>

@@ -1,0 +1,117 @@
+# Pool mTLS: its own CA, its own leaves. See deploy/CONTRACT.md "Secrets".
+#
+# Why not the cluster step-ca (PLAN §1 "certificates from the existing step-ca" is superseded):
+# a CA that signs nothing else means every certificate it issued is, by construction, a pool
+# identity. That is the property the agent's server-side `client_ca_root` check relies on
+# (crates/proto/src/tls.rs): "a cert from this CA" and "a pool client" are the same statement.
+#
+# Chains: tcpool-selfsign (Issuer, self-signed) -> tcpool-ca (Certificate, isCA) -> tcpool-ca-issuer
+# (Issuer) -> the two leaves. cert-manager does NOT reissue leaves when the CA rotates, so a CA
+# rotation means deleting tcpool-agent-tls and tcpool-client-tls in the same change (CONTRACT
+# "Secrets"). The CA itself is long-lived precisely so that is rare.
+#
+# RSA 2048 / PKCS8 with rotationPolicy: Always is a deliberate choice, not a default: ECDSA is a
+# measured change (CONTRACT), and `Always` makes the rotation path - which the agent exercises by
+# watching the three files' mtime and draining (crates/agent/src/main.rs) - the one that is tested
+# in the lab, not an untested code path.
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: tcpool-selfsign
+  namespace: media
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tcpool-ca
+  namespace: media
+spec:
+  isCA: true
+  commonName: tcpool-ca
+  secretName: tcpool-ca
+  duration: 8760h # 1 year; the leaves are what rotate.
+  renewBefore: 720h
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS8
+    rotationPolicy: Always
+  usages:
+    - cert sign
+    - crl sign
+  issuerRef:
+    name: tcpool-selfsign
+    kind: Issuer
+    group: cert-manager.io
+---
+# The CA Issuer. Named `tcpool-ca-issuer`, not `tcpool-ca`, so that no reader has to remember
+# whether a `tcpool-ca` reference means the Certificate or the Issuer.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: tcpool-ca-issuer
+  namespace: media
+spec:
+  ca:
+    secretName: tcpool-ca
+---
+# Agent server identity. The SANs are load-bearing:
+#   - `tcpool-agent` is the default TC_TLS_SERVER_NAME every client verifies against
+#     (crates/proto/src/tls.rs DEFAULT_SERVER_NAME), and it is what lets a shim dial a bare pod IP.
+#   - the Service names are what a client sees when it dials the headless Service instead.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tcpool-agent-tls
+  namespace: media
+spec:
+  secretName: tcpool-agent-tls
+  commonName: tcpool-agent
+  dnsNames:
+    - tcpool-agent
+    - tcpool-agents
+    - tcpool-agents.media.svc.cluster.local
+  duration: 2160h # 90 d
+  renewBefore: 720h # 30 d
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS8
+    rotationPolicy: Always
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  issuerRef:
+    name: tcpool-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+---
+# One client identity, shared by the shim (in the Jellyfin pod) and tcpool-sync. Client auth only:
+# it can present itself, it cannot be dialled.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tcpool-client-tls
+  namespace: media
+spec:
+  secretName: tcpool-client-tls
+  commonName: tcpool-client
+  duration: 2160h # 90 d
+  renewBefore: 720h # 30 d
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS8
+    rotationPolicy: Always
+  usages:
+    - client auth
+    - digital signature
+    - key encipherment
+  issuerRef:
+    name: tcpool-ca-issuer
+    kind: Issuer
+    group: cert-manager.io

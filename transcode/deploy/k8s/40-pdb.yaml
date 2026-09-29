@@ -1,0 +1,54 @@
+# One PodDisruptionBudget per class, so a node drain evicts one agent at a time instead of all of
+# them at once (PLAN §2 "Graceful drain", §10 P2 drain drill).
+#
+# `maxUnavailable: 1`, never `minAvailable: 1`. With minAvailable, a class that currently runs a
+# single pod - which is the normal case here: one Arc node, one P4 node, one CPU node - can never
+# be evicted, `kubectl drain` blocks, and the operator's next move is `--disable-eviction`, which
+# is worse than no PDB at all. maxUnavailable says "these may go away one by one"; the agent's own
+# preStop + ~13.5 s bounded drain is what makes losing one harmless, and the shim's re-run covers
+# the segment in flight.
+#
+# Voluntary only: this bounds `kubectl drain` and the eviction API. A node that dies takes its pods
+# with it regardless, which is the case the fencing lease exists for.
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tcpool-agent-qsv
+  namespace: media
+  labels:
+    app.kubernetes.io/part-of: tcpool
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tcpool-agent
+      tcpool.io/class: qsv
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tcpool-agent-nvenc
+  namespace: media
+  labels:
+    app.kubernetes.io/part-of: tcpool
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tcpool-agent
+      tcpool.io/class: nvenc
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tcpool-agent-cpu
+  namespace: media
+  labels:
+    app.kubernetes.io/part-of: tcpool
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tcpool-agent
+      tcpool.io/class: cpu

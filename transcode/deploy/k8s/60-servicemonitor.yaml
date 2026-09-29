@@ -1,0 +1,55 @@
+# OPTIONAL. This cluster has no monitoring.coreos.com CRDs - `kubectl api-resources` lists none,
+# and its scrapes come from the vmagent `vm-scrape-config` ConfigMap in ns `monitoring` (whose
+# existing jobs use static targets and pod SD, e.g. `placer.media.svc.cluster.local.:8080` and the
+# gpu-exporter pod-SD job). **Applying this file to that cluster fails with "no matches for kind
+# ServiceMonitor".** It is here for a cluster that does run the Prometheus operator.
+#
+# deploy/k8s/README.md has the two things that actually wire up scraping here: the pod-SD job
+# block to merge into `vm-scrape-config`, and the `prometheus.io/*` annotations already on the
+# agent pod templates. Use exactly one of the three mechanisms - annotations, the pod-SD job, or
+# these ServiceMonitors - or a metric gets scraped twice and every `rate()` in alerts.yaml
+# doubles.
+#
+# The rules these targets feed are transcode/deploy/alerts.yaml.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tcpool-agents
+  namespace: media
+  labels:
+    app.kubernetes.io/part-of: tcpool
+spec:
+  namespaceSelector:
+    matchNames: [media]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tcpool-agent
+  endpoints:
+    # Port 9903. Any path returns the same exposition (crates/agent/src/metrics.rs does not parse
+    # the request), so /metrics is convention rather than a requirement.
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tcpool-sync
+  namespace: media
+  labels:
+    app.kubernetes.io/part-of: tcpool
+spec:
+  namespaceSelector:
+    matchNames: [media]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tcpool-sync
+  endpoints:
+    # Port 9904, from the Jellyfin pod's sync sidecar. Needs the label and named port in
+    # jellyfin-patch.md; until that lands this monitor has no endpoints.
+    - port: sync-metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
