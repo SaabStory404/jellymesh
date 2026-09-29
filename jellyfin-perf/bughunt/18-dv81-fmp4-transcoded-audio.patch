@@ -1,0 +1,267 @@
+diff --git a/Jellyfin.Api/Controllers/DynamicHlsController.cs b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+index d81f196ec..3cd191d30 100644
+--- a/Jellyfin.Api/Controllers/DynamicHlsController.cs
++++ b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+@@ -177,7 +177,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+         [FromQuery] int? minSegments,
+         [FromQuery] string? mediaSourceId,
+         [FromQuery] string? deviceId,
+-        [FromQuery][RegularExpression(EncodingHelper.ContainerValidationRegexStr)] string? audioCodec,
++        [FromQuery][RegularExpression(EncodingHelper.AudioCodecListValidationRegexStr)] string? audioCodec,
+         [FromQuery] bool? enableAutoStreamCopy,
+         [FromQuery] bool? allowVideoStreamCopy,
+         [FromQuery] bool? allowAudioStreamCopy,
+@@ -417,7 +417,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+         [FromQuery] int? minSegments,
+         [FromQuery, Required] string mediaSourceId,
+         [FromQuery] string? deviceId,
+-        [FromQuery][RegularExpression(EncodingHelper.ContainerValidationRegexStr)] string? audioCodec,
++        [FromQuery][RegularExpression(EncodingHelper.AudioCodecListValidationRegexStr)] string? audioCodec,
+         [FromQuery] bool? enableAutoStreamCopy,
+         [FromQuery] bool? allowVideoStreamCopy,
+         [FromQuery] bool? allowAudioStreamCopy,
+@@ -590,7 +590,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+         [FromQuery] int? minSegments,
+         [FromQuery, Required] string mediaSourceId,
+         [FromQuery] string? deviceId,
+-        [FromQuery][RegularExpression(EncodingHelper.ContainerValidationRegexStr)] string? audioCodec,
++        [FromQuery][RegularExpression(EncodingHelper.AudioCodecListValidationRegexStr)] string? audioCodec,
+         [FromQuery] bool? enableAutoStreamCopy,
+         [FromQuery] bool? allowVideoStreamCopy,
+         [FromQuery] bool? allowAudioStreamCopy,
+@@ -757,7 +757,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+         [FromQuery] int? minSegments,
+         [FromQuery] string? mediaSourceId,
+         [FromQuery] string? deviceId,
+-        [FromQuery][RegularExpression(EncodingHelper.ContainerValidationRegexStr)] string? audioCodec,
++        [FromQuery][RegularExpression(EncodingHelper.AudioCodecListValidationRegexStr)] string? audioCodec,
+         [FromQuery] bool? enableAutoStreamCopy,
+         [FromQuery] bool? allowVideoStreamCopy,
+         [FromQuery] bool? allowAudioStreamCopy,
+@@ -926,7 +926,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+         [FromQuery] int? minSegments,
+         [FromQuery] string? mediaSourceId,
+         [FromQuery] string? deviceId,
+-        [FromQuery][RegularExpression(EncodingHelper.ContainerValidationRegexStr)] string? audioCodec,
++        [FromQuery][RegularExpression(EncodingHelper.AudioCodecListValidationRegexStr)] string? audioCodec,
+         [FromQuery] bool? enableAutoStreamCopy,
+         [FromQuery] bool? allowVideoStreamCopy,
+         [FromQuery] bool? allowAudioStreamCopy,
+@@ -1104,7 +1104,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+         [FromQuery] int? minSegments,
+         [FromQuery] string? mediaSourceId,
+         [FromQuery] string? deviceId,
+-        [FromQuery][RegularExpression(EncodingHelper.ContainerValidationRegexStr)] string? audioCodec,
++        [FromQuery][RegularExpression(EncodingHelper.AudioCodecListValidationRegexStr)] string? audioCodec,
+         [FromQuery] bool? enableAutoStreamCopy,
+         [FromQuery] bool? allowVideoStreamCopy,
+         [FromQuery] bool? allowAudioStreamCopy,
+@@ -1286,7 +1286,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+         [FromQuery] int? minSegments,
+         [FromQuery] string? mediaSourceId,
+         [FromQuery] string? deviceId,
+-        [FromQuery][RegularExpression(EncodingHelper.ContainerValidationRegexStr)] string? audioCodec,
++        [FromQuery][RegularExpression(EncodingHelper.AudioCodecListValidationRegexStr)] string? audioCodec,
+         [FromQuery] bool? enableAutoStreamCopy,
+         [FromQuery] bool? allowVideoStreamCopy,
+         [FromQuery] bool? allowAudioStreamCopy,
+@@ -1801,9 +1801,24 @@ public class DynamicHlsController : BaseJellyfinApiController
+                 Path.GetFileNameWithoutExtension(outputPath));
+         }
+ 
++        // JELLYMESH bughunt 18 (gh-14): "disabled" leaves an encoded audio track's encoder-priming
++        // delay (MEASURED -2048 for libfdk_aac) as a negative first PTS/DTS. TS tolerates that; fMP4
++        // writes it straight into the first fragment's MOOF::TRAF::TFDT (an unsigned 64-bit field),
++        // which media3's FragmentedMp4Extractor rejects as "Top bit not zero". "make_non_negative"
++        // shifts only a stream whose timestamps actually go negative, and shifts every stream in the
++        // job by the same amount, so a copied video track and a transcoded audio track already at the
++        // same origin (both driven by the same -ss-seeked segment start) stay aligned -- unlike
++        // "make_zero", it does not force the *first* timestamp of an already-nonnegative segment
++        // (e.g. a mid-file -ss restart) down to zero, so it does not disturb segment-to-segment PTS
++        // continuity. TS keeps "disabled" (unchanged; TS has shipped this way and media3's TS path
++        // does not hit the tfdt sign check).
++        var avoidNegativeTsArg = string.Equals(segmentContainer, "mp4", StringComparison.OrdinalIgnoreCase)
++            ? "make_non_negative"
++            : "disabled";
++
+         return string.Format(
+             CultureInfo.InvariantCulture,
+-            "{0} {1} -map_metadata -1 -map_chapters -1 -threads {2} {3} {4} {5} -copyts -avoid_negative_ts disabled -max_muxing_queue_size {6} -f hls -max_delay 5000000 -hls_time {7} -hls_segment_type {8} -start_number {9}{10} -hls_segment_filename \"{11}\" {12} -y \"{13}\"",
++            "{0} {1} -map_metadata -1 -map_chapters -1 -threads {2} {3} {4} {5} -copyts -avoid_negative_ts {14} -max_muxing_queue_size {6} -f hls -max_delay 5000000 -hls_time {7} -hls_segment_type {8} -start_number {9}{10} -hls_segment_filename \"{11}\" {12} -y \"{13}\"",
+             inputModifier,
+             _encodingHelper.GetInputArgument(state, _encodingOptions, segmentContainer),
+             threads,
+@@ -1817,7 +1832,8 @@ public class DynamicHlsController : BaseJellyfinApiController
+             baseUrlParam,
+             outputTsArg.EscapeProcessArgument(),
+             hlsArguments,
+-            outputPath.EscapeProcessArgument()).Trim();
++            outputPath.EscapeProcessArgument(),
++            avoidNegativeTsArg).Trim();
+     }
+ 
+     /// <summary>
+diff --git a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+index deeb0a77d..9c725614b 100644
+--- a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
++++ b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+@@ -41,6 +41,18 @@ namespace MediaBrowser.Controller.MediaEncoding
+         /// </summary>
+         public const string ContainerValidationRegexStr = @"^[a-zA-Z0-9\-\._,|]{0,40}$";
+ 
++        /// <summary>
++        /// JELLYMESH bughunt 18 (gh-14): same character class as <see cref="ContainerValidationRegexStr"/>,
++        /// for the <c>audioCodec</c> query parameter specifically. That parameter is a comma-separated
++        /// candidate list a client sends (not a single codec name), so it legitimately runs longer than
++        /// 40 characters -- e.g. the official Android TV app's fMP4-profile audio codec list is 42
++        /// characters and was rejected outright (master.m3u8 HTTP 400) by the shared 40-character limit.
++        /// Raised to 128, which comfortably fits the longest currently-supported HLS audio codec list
++        /// (<see cref="MediaEncoding.EncodingHelper"/>'s mp4/ts codec sets) doubled over, while still
++        /// bounding the field against abuse.
++        /// </summary>
++        public const string AudioCodecListValidationRegexStr = @"^[a-zA-Z0-9\-\._,|]{0,128}$";
++
+         /// <summary>
+         /// The level validation regex string.
+         /// This regular expression matches strings representing a double.
+diff --git a/MediaBrowser.Model/Dlna/StreamBuilder.cs b/MediaBrowser.Model/Dlna/StreamBuilder.cs
+index 7d7939d62..4a54f2dd0 100644
+--- a/MediaBrowser.Model/Dlna/StreamBuilder.cs
++++ b/MediaBrowser.Model/Dlna/StreamBuilder.cs
+@@ -836,24 +836,30 @@ namespace MediaBrowser.Model.Dlna
+                 {
+                     SetStreamInfoOptionsFromTranscodingProfile(item, playlistItem, transcodingProfile);
+ 
+-                    // JELLYMESH_DOVI_P7_TO_81 (bughunt 17): a profile-7 source that this job will serve
+-                    // as profile 8.1 goes out as fMP4 HLS, not MPEG-TS. Only the dvvC box of an fMP4
+-                    // init segment marks the 8.1 stream as Dolby Vision to the player: media3's
+-                    // TsExtractor/H265Reader always report video/hevc, so Android TV decodes the base
+-                    // layer as HDR10; Apple requires fMP4 for HEVC and Dolby Vision. It also lifts the
+-                    // TS-only HLS audio list below, so a TrueHD track the client declares is copied
+-                    // instead of transcoded. UseMostCompatibleTranscodingProfile (the client's retry
+-                    // after a failed playback) keeps TS.
++                    // JELLYMESH_DOVI_P7_TO_81 (bughunt 17, extended by bughunt 18 / gh-14): a profile-7
++                    // source that this job will serve as profile 8.1 goes out as fMP4 HLS, not MPEG-TS,
++                    // whether or not the audio is copied. Only the dvvC box of an fMP4 init segment
++                    // marks the 8.1 stream as Dolby Vision to the player: media3's TsExtractor/H265Reader
++                    // always report video/hevc, so Android TV decodes the base layer as HDR10; Apple
++                    // requires fMP4 for HEVC and Dolby Vision. It also lifts the TS-only HLS audio codec
++                    // list, so a TrueHD track the client declares is copied instead of transcoded when
++                    // it can be. UseMostCompatibleTranscodingProfile (the client's retry after a failed
++                    // playback) keeps TS.
++                    //
++                    // bughunt 17 originally gated this on WillCopyAudio(...) too: Jellyfin's fMP4 argv
++                    // (-copyts -avoid_negative_ts disabled) gave an encoded AAC/AC-3 track a negative
++                    // first tfdt (the encoder priming, MEASURED -2048 for libfdk_aac), which media3's
++                    // FragmentedMp4Extractor rejected ("Top bit not zero"), so an audio transcode stayed
++                    // on TS (HDR10) rather than failing to play. bughunt 18 fixes that at the source
++                    // (DynamicHlsController.GetSegmentCommandLineArguments uses "make_non_negative" for
++                    // mp4 segment output instead of "disabled"), so the gate -- and the audio-codec-list
++                    // trim-to-TS it required to stay under the old 40-character cap -- are no longer
++                    // needed; that cap itself is raised for audioCodec in bughunt 18
++                    // (EncodingHelper.AudioCodecListValidationRegexStr).
+                     var transcodingContainer = transcodingProfile.Container;
+-                    // Only when the audio is copied too: Jellyfin's fMP4 argv (-copyts
+-                    // -avoid_negative_ts disabled) gives an encoded AAC/AC-3 track a negative first
+-                    // tfdt (the encoder priming, MEASURED -2048 for libfdk_aac), which media3's
+-                    // FragmentedMp4Extractor rejects ("Top bit not zero"), so an audio transcode
+-                    // stays on TS (HDR10, as before) rather than failing to play.
+                     var doviP7ToP81Fmp4 = !item.UseMostCompatibleTranscodingProfile
+                         && string.Equals(transcodingContainer, "ts", StringComparison.OrdinalIgnoreCase)
+-                        && WillConvertDoviP7ToP81(options, item, videoStream, transcodingProfile, "mp4")
+-                        && WillCopyAudio(options, item, audioStream, candidateAudioStreams, playlistItem, transcodingProfile.AudioCodec, "mp4");
++                        && WillConvertDoviP7ToP81(options, item, videoStream, transcodingProfile, "mp4");
+                     if (doviP7ToP81Fmp4)
+                     {
+                         transcodingContainer = "mp4";
+@@ -863,20 +869,6 @@ namespace MediaBrowser.Model.Dlna
+ 
+                     BuildStreamVideoItem(playlistItem, options, item, videoStream, audioStream, candidateAudioStreams, transcodingContainer, transcodingProfile.VideoCodec, transcodingProfile.AudioCodec);
+ 
+-                    // More than one audio codec left means the audio is transcoded, not copied: keep
+-                    // the target list the TS profile would have had. The mp4 list can be longer
+-                    // than DynamicHlsController accepts (AudioCodec is limited to 40 characters;
+-                    // the Android TV app's list filtered for mp4 is 42) and would then fail the
+-                    // whole playback with HTTP 400.
+-                    if (doviP7ToP81Fmp4 && playlistItem.AudioCodecs.Count > 1)
+-                    {
+-                        var tsAudioCodecs = playlistItem.AudioCodecs.Where(codec => _supportedHlsAudioCodecsTs.Contains(codec)).ToList();
+-                        if (tsAudioCodecs.Count > 0)
+-                        {
+-                            playlistItem.AudioCodecs = tsAudioCodecs;
+-                        }
+-                    }
+-
+                     playlistItem.PlayMethod = PlayMethod.Transcode;
+ 
+                     if (subtitleStream is not null)
+@@ -952,34 +944,6 @@ namespace MediaBrowser.Model.Dlna
+             return !Has(VideoRangeType.DOVIWithEL) && (Has(VideoRangeType.DOVI) || Has(VideoRangeType.DOVIWithHDR10));
+         }
+ 
+-        /// <summary>
+-        /// Bughunt 17: whether BuildStreamVideoItem, called for an HLS item with segments in
+-        /// <paramref name="container"/>, would copy the audio stream rather than transcode it (or
+-        /// there is no audio). The same checks, in the same order, as its audio part.
+-        /// </summary>
+-        private bool WillCopyAudio(MediaOptions options, MediaSourceInfo item, MediaStream? audioStream, IEnumerable<MediaStream> candidateAudioStreams, StreamInfo playlistItem, string? profileAudioCodecs, string container)
+-        {
+-            if (audioStream is null)
+-            {
+-                return true;
+-            }
+-
+-            var audioCodecs = ContainerHelper.Split(profileAudioCodecs).ToList();
+-            if (audioCodecs.Count == 0)
+-            {
+-                audioCodecs.Add(audioStream.Codec);
+-            }
+-
+-            var hlsAudioCodecs = string.Equals(container, "mp4", StringComparison.OrdinalIgnoreCase) ? _supportedHlsAudioCodecsMp4 : _supportedHlsAudioCodecsTs;
+-            audioCodecs = audioCodecs.Where(codec => hlsAudioCodecs.Contains(codec)).ToList();
+-
+-            var stream = candidateAudioStreams.FirstOrDefault(s => ContainerHelper.ContainsContainer(audioCodecs, false, s.Codec));
+-            return stream is not null
+-                && !(stream.Channels > (playlistItem.TranscodingMaxAudioChannels ?? int.MaxValue))
+-                && GetCompatibilityAudioCodec(options, item, container, stream, null, true, false) == 0
+-                && !playlistItem.TranscodeReasons.HasFlag(TranscodeReason.ContainerBitrateExceedsLimit);
+-        }
+-
+         private (TranscodingProfile? Profile, PlayMethod? PlayMethod) GetVideoTranscodeProfile(
+             MediaSourceInfo item,
+             MediaOptions options,
+diff --git a/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Fmp4Tests.cs b/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Fmp4Tests.cs
+index 9329cb7c0..dcde4f9b8 100644
+--- a/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Fmp4Tests.cs
++++ b/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Fmp4Tests.cs
+@@ -50,19 +50,22 @@ public class StreamBuilderDoviP7ToP81Fmp4Tests
+     }
+ 
+     [Fact]
+-    public void ConvertedSource_AudioTranscoded_StaysOnTs()
++    public void ConvertedSource_AudioTranscoded_ServedAsFmp4()
+     {
+-        // No audio stream may be copied here, so the audio would be encoded. Jellyfin's fMP4 argv
+-        // starts an encoded track at a negative tfdt (encoder priming), which media3 cannot parse,
+-        // and this profile's mp4 audio list ("aac,ac3,alac,dts,eac3,flac,mp3,opus,truehd", 42
+-        // characters) is longer than DynamicHlsController's 40-character AudioCodec limit. So the
+-        // job stays on TS (HDR10, as before) with the TS audio targets.
++        // bughunt 18 (gh-14): no audio stream may be copied here, so the audio is encoded. Before
++        // bughunt 18 this stayed on TS, because Jellyfin's fMP4 argv started an encoded track at a
++        // negative tfdt (encoder priming), which media3 could not parse, and this profile's mp4
++        // audio list ("aac,ac3,alac,dts,eac3,flac,mp3,opus,truehd", 42 characters) was longer than
++        // DynamicHlsController's 40-character AudioCodec limit. bughunt 18 fixes the negative tfdt
++        // at the ffmpeg argv level (avoid_negative_ts make_non_negative for mp4 segments) and raises
++        // the AudioCodec cap to 128 characters, so the job now takes the fMP4 path -- and the full
++        // mp4 audio codec list, not a TS-only subset -- like a copyable audio track does.
+         var info = Build(enabled: true, DoviCapableExcluded, noDefaultAudio: true);
+ 
+         Assert.NotNull(info);
+         Assert.Equal(PlayMethod.Transcode, info.PlayMethod);
+-        Assert.Equal("ts", info.Container, StringComparer.OrdinalIgnoreCase);
+-        Assert.Equal(["aac", "ac3", "eac3", "mp3"], info.AudioCodecs);
++        Assert.Equal("mp4", info.Container, StringComparer.OrdinalIgnoreCase);
++        Assert.Equal(["aac", "ac3", "alac", "dts", "eac3", "flac", "mp3", "opus", "truehd"], info.AudioCodecs);
+     }
+ 
+     [Fact]
