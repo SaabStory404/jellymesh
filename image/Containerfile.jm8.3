@@ -1,0 +1,24 @@
+# jellymesh-jellyfin 12.1-jm8.3: jm8.1 + bughunt 17-18 (DV7->8.1 fMP4 HLS, incl. transcoded audio; gh-14).
+#
+#   overlay/     the 7 assemblies jellyfin-perf/build.sh (BUGHUNT=1, series 00-18) changes, copied over
+#                /usr/lib/jellyfin/bin exactly as jm7/jm8/jm8.1 applied theirs
+#                  17: JELLYMESH_DOVI_P7_TO_81=1: an HLS job that converts a DV profile-7 source to 8.1
+#                      gets fMP4 segments even from a client whose only HLS profile is TS (so the init
+#                      segment's dvvC box marks the stream as Dolby Vision; media3's TS extractor only
+#                      ever reports HEVC), a declared TrueHD track is copied instead of transcoded, and
+#                      the video is tagged hvc1 to match CODECS="hvc1..."+SUPPLEMENTAL-CODECS. Flag off
+#                      = unchanged.
+#                  18: gh-14 -- mp4 HLS segments use -avoid_negative_ts make_non_negative (no negative audio
+#                      tfdt) and audioCodec accepts a 128-char list, so an audio transcode also gets fMP4.
+#                      Flag off = unchanged.
+#
+# Everything else is jm8.1's, unchanged: the pool-r1 shim and sync, the Galera provider,
+# install-plugins.sh and /opt/jellymesh/SHA256SUMS. Agents: any (pool-r1 3ed52b3 recommended); the
+# agent's DV7->8.1 path already writes fMP4 with an hvc1+dvvC sample entry (dv81_it).
+#
+# Build context = a staging dir holding overlay/:
+#   podman build -f image/Containerfile.jm8.3 -t ghcr.io/saabstory404/jellymesh-jellyfin:12.1-jm8.3-lab-gh14 <ctx>
+FROM ghcr.io/saabstory404/jellymesh-jellyfin:12.1-jm8.1@sha256:30949335e3a568fc0efaa9ebc82ed3cf7a9b367808b3bd30bc51ba6ce4acec64
+COPY overlay/ /usr/lib/jellyfin/bin/
+LABEL org.opencontainers.image.source="https://github.com/SaabStory404/jellymesh" \
+      org.opencontainers.image.description="Jellyfin 12.1 + JellyMesh (shared-database HA, cross-node cache invalidation, shared transcode dir) + bughunt patches + transcode-pool shim (DV7->8.1, fMP4 HLS)"
