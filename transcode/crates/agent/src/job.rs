@@ -1,13 +1,17 @@
 //! One job: admission, ffmpeg lifecycle, heartbeats, fencing, and the CPU-filter re-run.
 
 use crate::config::Config;
+use crate::detach::Detach;
 use crate::probe::source_height;
 use crate::State;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tcpool_ir::{first_segment, input_path, is_video_copy, map_path, render, TranslateOpts};
+use tcpool_ir::{
+    add_dv_removal_bsf, first_segment, input_path, is_video_copy, map_path, render,
+    render_trickplay, strip_dv81_signal, wants_dv81, Shape, TranslateOpts,
+};
 use tcpool_proto::{
     client_msg, server_msg, Accepted, Busy, ClientMsg, Exit, Heartbeat, Job, ServerMsg,
 };
@@ -40,6 +44,58 @@ async fn job_weight(cfg: &Config, args: &[String]) -> f64 {
 enum Ended {
     Stalled,
     Drained,
+    /// A PLAYBACK admission preempted this BATCH job (before or after it produced any output).
+    Preempted,
+    /// Shared transcode dir: another replica's shim took this output over (a seek there).
+    TakenOver,
+    /// Shared transcode dir: detached, and the session keepalive went stale (viewer gone).
+    Orphaned,
+}
+
+/// Why a BATCH job is refused outright before admission is even attempted, or `None` to proceed.
+/// A pure function (config in, verdict out) so it's directly unit-testable without a live
+/// gRPC/ffmpeg harness.
+fn batch_refusal_reason(cfg: &Config, batch: bool) -> Option<&'static str> {
+    if !batch {
+        return None;
+    }
+    if !cfg.accept_batch {
+        return Some("batch-disabled"); // A5: this worker opted out of BATCH entirely
+    }
+    if cfg.policy.trickplay_output_root.is_none() {
+        return Some("batch-disabled"); // A2: an unset root refuses BATCH the same way
+    }
+    None
+}
+
+/// The job's final `(metrics outcome, Exit.preempted)`, from ffmpeg's own exit code, whether the
+/// agent fenced it, and whatever `Ended` reason a watchdog recorded (if any). `code == 0` (and
+/// not fenced) proves ffmpeg finished on its own: every watchdog's kill is a SIGKILL via
+/// `Ctl::end`/`Ctl::fence`, and a killed process can never report exit code 0. Checking that
+/// first, ahead of `ended`, makes the result independent of a real but narrow race: `run_ffmpeg`
+/// has one more await after `child.wait()` resolves (draining the stdout/stderr pump tasks,
+/// bounded by a 2s timeout), and a watchdog poll (stall/drain/preempt) landing in that window can
+/// still record an `Ended` reason for a job whose ffmpeg had, in truth, already exited 0. Without
+/// this, e.g. `preempt_watch` recording `Ended::Preempted` in that window would mislabel an
+/// already-successful BATCH job as preempted, causing the shim to discard good output and rerun
+/// locally, and the metrics/alerting to record a false preemption.
+fn final_outcome(code: i32, fenced: bool, ended: Option<Ended>) -> (crate::metrics::Outcome, bool) {
+    if fenced {
+        return (crate::metrics::Outcome::Fenced, false);
+    }
+    if code == 0 {
+        return (crate::metrics::Outcome::ExitOk, false);
+    }
+    match ended {
+        Some(Ended::Stalled) => (crate::metrics::Outcome::Stalled, false),
+        // Drained jobs are killed to end them (a nonzero/signal exit code), but that's a
+        // planned handoff to another worker, not a failure -- keep it out of exit_error.
+        Some(Ended::Drained) => (crate::metrics::Outcome::Drained, false),
+        Some(Ended::Preempted) => (crate::metrics::Outcome::Preempted, true),
+        Some(Ended::TakenOver) => (crate::metrics::Outcome::TakenOver, false),
+        Some(Ended::Orphaned) => (crate::metrics::Outcome::OrphanExpired, false),
+        None => (crate::metrics::Outcome::ExitError, false),
+    }
 }
 
 /// Shared between the tasks of one job.
@@ -58,6 +114,8 @@ struct Ctl {
     /// Kept only to reach `state.metrics` from `note_stderr`; a cheap Arc clone.
     state: Arc<State>,
     job_id: u64,
+    /// Shared transcode dir: set when this job may outlive its shim (see `detach`).
+    detach: Option<Arc<Detach>>,
 }
 
 impl Ctl {
@@ -66,6 +124,30 @@ impl Ctl {
             crate::log(format_args!("fencing: {why}; killing ffmpeg"));
             let _ = self.kill.send(true);
         }
+    }
+
+    /// The shim is gone (stream closed, send failed, or silent past `fence_after`). A detachable
+    /// job keeps running (returns true); any other job is fenced (returns false).
+    fn shim_lost(&self, why: &str) -> bool {
+        if let Some(d) = &self.detach {
+            if self.done.load(Ordering::SeqCst) || self.fenced.load(Ordering::SeqCst) {
+                return false;
+            }
+            if d.mark_detached() {
+                crate::log(format_args!(
+                    "shim lost ({why}); detaching: ffmpeg keeps writing {} for the other replicas",
+                    d.stem
+                ));
+                self.state.metrics.inc(crate::metrics::Outcome::Detached);
+            }
+            return true;
+        }
+        self.fence(why);
+        false
+    }
+
+    fn is_detached(&self) -> bool {
+        self.detach.as_ref().is_some_and(|d| d.is_detached())
     }
 
     /// End the job ourselves. Unlike fencing, the shim still gets an `exit`, so Jellyfin
@@ -87,6 +169,9 @@ impl Ctl {
 
     fn note_stderr(&self, chunk: &[u8]) {
         let text = String::from_utf8_lossy(chunk);
+        if let Some(d) = &self.detach {
+            d.note_stderr(&text); // which segment ffmpeg is on (the detached-job throttle's edge)
+        }
         if text.contains("time=") {
             if let Some(t) = text.rsplit("time=").next() {
                 let v: String = t.chars().take_while(|c| !c.is_whitespace()).collect();
@@ -112,8 +197,31 @@ impl Ctl {
     }
 }
 
-pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientMsg>, tx: Tx) {
+pub async fn run_job(
+    state: Arc<State>,
+    job: Job,
+    shape: Shape,
+    mut inbound: Streaming<ClientMsg>,
+    tx: Tx,
+) {
     let cfg = &state.cfg;
+    // Shape (validated up front in main.rs's Svc::run), not the client-asserted `job.priority`,
+    // decides admission: it can't be spoofed independently of the argv that was already checked.
+    let batch = matches!(shape, Shape::Trickplay);
+    let class = if batch { "batch" } else { "playback" };
+    if let Some(reason) = batch_refusal_reason(cfg, batch) {
+        let (used, cap) = state.usage.snapshot();
+        crate::log(format_args!("busy ({reason}): refusing a batch job"));
+        state.metrics.inc(crate::metrics::Outcome::Busy);
+        let _ = tx
+            .send(msg(server_msg::Msg::Busy(Busy {
+                reason: reason.into(),
+                units_used: used,
+                capacity: cap,
+            })))
+            .await;
+        return;
+    }
     if *state.drain.borrow() {
         let (used, cap) = state.usage.snapshot();
         state.metrics.inc(crate::metrics::Outcome::Busy);
@@ -126,16 +234,31 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
             .await;
         return;
     }
-    let weight = job_weight(cfg, &job.args).await;
-    let Some(guard) = state.usage.reserve(weight) else {
+    // A3: BATCH uses a fixed weight and skips job_weight()'s ffprobe before admission.
+    let weight = if batch {
+        cfg.batch_weight
+    } else {
+        job_weight(cfg, &job.args).await
+    };
+    let guard = if batch {
+        state.usage.reserve_batch(weight)
+    } else {
+        state.usage.reserve_playback(weight)
+    };
+    let Some(guard) = guard else {
         let (used, cap) = state.usage.snapshot();
+        let reason = if batch { "headroom" } else { "capacity" };
         crate::log(format_args!(
-            "busy: refused a {weight}-unit job ({used}/{cap} units)"
+            "busy ({reason}): refused a {weight}-unit {class} job ({used}/{cap} units)"
         ));
-        state.metrics.inc(crate::metrics::Outcome::Busy);
+        state.metrics.inc(if batch {
+            crate::metrics::Outcome::BusyHeadroom
+        } else {
+            crate::metrics::Outcome::Busy
+        });
         let _ = tx
             .send(msg(server_msg::Msg::Busy(Busy {
-                reason: "capacity".into(),
+                reason: reason.into(),
                 units_used: used,
                 capacity: cap,
             })))
@@ -144,7 +267,7 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
     };
     let (used, cap) = state.usage.snapshot();
     crate::log(format_args!(
-        "accepted a {weight}-unit job ({used}/{cap} units)"
+        "accepted a {weight}-unit {class} job ({used}/{cap} units)"
     ));
     if tx
         .send(msg(server_msg::Msg::Accepted(Accepted {
@@ -159,9 +282,26 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
         return; // shim gone before we started: nothing to do
     }
     state.metrics.inc(crate::metrics::Outcome::Accepted);
+    if batch {
+        state.metrics.inc(crate::metrics::Outcome::BatchAccepted);
+    }
     let job_id = state.metrics.new_job_id();
     let started = Instant::now();
 
+    // Shared transcode dir: may this job outlive its shim? (PLAYBACK only; needs the shim's
+    // keepalive path and a lease on disk.) Any problem -> run attached, exactly as before.
+    let detach = if batch {
+        None
+    } else {
+        let mapped: Vec<String> = job.args.iter().map(|a| map_path(a, &cfg.pathmap)).collect();
+        match Detach::from_job(cfg, &mapped, &map_path(&job.keepalive_path, &cfg.pathmap)) {
+            Ok(d) => d.map(Arc::new),
+            Err(e) => {
+                crate::log(format_args!("not detachable: {e}"));
+                None
+            }
+        }
+    };
     let (kill_tx, kill_rx) = watch::channel(false);
     let ctl = Arc::new(Ctl {
         fenced: AtomicBool::new(false),
@@ -174,13 +314,47 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
         ended: std::sync::Mutex::new(None),
         state: state.clone(),
         job_id,
+        detach: detach.clone(),
     });
+
+    // A4: "preempted before start" -- the preempt handle exists (it was registered atomically
+    // with the reservation, before Accepted was even sent) before this check, so a PLAYBACK
+    // admission that preempted us between Accepted and here is caught here, before ffmpeg ever
+    // spawns.
+    if let Some(preempt) = guard.preempt.clone() {
+        if preempt.is_preempted() {
+            crate::log(format_args!("batch job preempted before it started"));
+            ctl.done.store(true, Ordering::SeqCst);
+            state.metrics.inc(crate::metrics::Outcome::Preempted);
+            state
+                .metrics
+                .observe_seconds(started.elapsed().as_secs_f64());
+            let _ = tx
+                .send(msg(server_msg::Msg::Exit(Exit {
+                    // Never spawned; nonzero (mirroring a mid-run SIGKILL's -9) so this can never
+                    // be read as success by `code` alone -- the shim only inspects `preempted`.
+                    code: -9,
+                    fenced: false,
+                    gpu_filters: false,
+                    preempted: true,
+                    taken_over: false,
+                })))
+                .await;
+            drop(guard);
+            return;
+        }
+    }
+
     let (stdin_tx, stdin_rx) = mpsc::channel::<Option<Vec<u8>>>(64);
     let stdin_rx = Arc::new(Mutex::new(stdin_rx));
+    // The detach watcher's own handle on ffmpeg's stdin (it may need to send `u` after the
+    // reader, which owns `stdin_tx`, has gone with the shim).
+    let stdin_detach = stdin_tx.clone();
 
     // Client -> us: stdin keys, heartbeats. Stream end or error = shim gone -> fence.
     let reader = {
         let ctl = ctl.clone();
+        let drain = state.drain.clone();
         tokio::spawn(async move {
             loop {
                 match inbound.message().await {
@@ -190,6 +364,12 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
                             Some(client_msg::Msg::Stdin(b)) => {
                                 // Jellyfin's throttler keys: p = pause, u = resume, q = quit
                                 let key = b.iter().rev().find(|k| matches!(k, b'p' | b'u' | b'q'));
+                                if key == Some(&b'p') && *drain.borrow() {
+                                    // Draining: the job must reach its next segment and end
+                                    // (see `drain_watch`); a pause now would only run out the
+                                    // grace period.
+                                    continue;
+                                }
                                 match key {
                                     Some(b'p') => ctl.paused.store(true, Ordering::SeqCst),
                                     Some(b'u') => ctl.paused.store(false, Ordering::SeqCst),
@@ -198,14 +378,19 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
                                 }
                                 let _ = stdin_tx.send(Some(b)).await;
                             }
-                            Some(client_msg::Msg::StdinClose(_)) => {
+                            // A detachable job keeps ffmpeg's stdin open (the StdinClose falls
+                            // through to `_`): the agent itself sends p/u once detached. Jellyfin
+                            // closes the shim's stdin only when it is going away (MEASURED in
+                            // jm-lab: a pod delete closes it before the connection drops), and
+                            // ffmpeg ignores stdin EOF.
+                            Some(client_msg::Msg::StdinClose(_)) if ctl.detach.is_none() => {
                                 let _ = stdin_tx.send(None).await;
                             }
                             _ => {}
                         }
                     }
                     _ => {
-                        ctl.fence("shim closed the connection");
+                        ctl.shim_lost("shim closed the connection");
                         return;
                     }
                 }
@@ -219,8 +404,11 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
+                if ctl.is_detached() {
+                    return;
+                }
                 if ctl.last_heard.lock().await.elapsed() > fence_after {
-                    ctl.fence(&format!(
+                    ctl.shim_lost(&format!(
                         "no frame from shim for {}s",
                         fence_after.as_secs_f64()
                     ));
@@ -240,18 +428,87 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
                     .await
                     .is_err()
                 {
-                    ctl.fence("shim unreachable");
+                    ctl.shim_lost("shim unreachable");
                     return;
                 }
             }
         })
     };
 
+    // Shared transcode dir: heartbeat the output lease from the agent too (so it stays fresh
+    // when the shim dies with its replica), honour takeover requests, unpause a detached ffmpeg
+    // (nobody is left to send Jellyfin's `u`), and end a detached job whose viewer is gone.
+    let detach_watch = detach.clone().map(|d| {
+        let ctl = ctl.clone();
+        let stdin_tx = stdin_detach.clone();
+        let cfg = cfg.clone();
+        let drain = state.drain.clone();
+        tokio::spawn(async move {
+            // Counts this job in `tcpool_orphans_paused` while the agent holds it paused; the
+            // guard's Drop undoes that when the watcher returns or is aborted at job end.
+            let mut held = crate::metrics::OrphanPausedGuard::new(ctl.state.clone());
+            loop {
+                if ctl.done.load(Ordering::SeqCst) {
+                    return;
+                }
+                d.heartbeat();
+                if d.takeover_requested() {
+                    d.set_taken_over();
+                    ctl.end(Ended::TakenOver, "another replica took this output over");
+                    return;
+                }
+                if d.is_detached() && !*drain.borrow() {
+                    // Nobody sends Jellyfin's throttler keys any more: keep the output a bounded
+                    // lead ahead of the viewer ourselves (a job Jellyfin had paused when its
+                    // replica died is resumed here too, unless the viewer is far behind).
+                    let paused = ctl.paused.load(Ordering::SeqCst);
+                    let t = d.throttle(&cfg, paused, std::time::SystemTime::now());
+                    let key: Option<&[u8]> = match t.action {
+                        tcpool_ir::shared::Throttle::Pause => Some(b"p"),
+                        tcpool_ir::shared::Throttle::Resume => Some(b"u"),
+                        tcpool_ir::shared::Throttle::Leave => None,
+                    };
+                    if let Some(key) = key {
+                        let pause = key == b"p";
+                        ctl.paused.store(pause, Ordering::SeqCst);
+                        held.set(pause);
+                        let _ = stdin_tx.send(Some(key.to_vec())).await;
+                        crate::log(format_args!(
+                            "detached output {}: {} (newest segment {}, viewer at {}, lead {})",
+                            d.stem,
+                            if pause {
+                                "pausing ffmpeg"
+                            } else {
+                                "resuming ffmpeg"
+                            },
+                            t.newest.map_or("?".into(), |n| n.to_string()),
+                            t.viewer.map_or("?".into(), |n| n.to_string()),
+                            t.lead_secs.map_or("unknown".into(), |l| format!("{l:.0}s")),
+                        ));
+                    }
+                } else if *drain.borrow() {
+                    held.set(false); // `drain_watch` resumes it
+                }
+                if d.is_detached() && d.expired(&cfg, std::time::SystemTime::now()) {
+                    ctl.end(
+                        Ended::Orphaned,
+                        "detached and the session keepalive went stale",
+                    );
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    });
+
     // Progress watchdog: ffmpeg's `time=` must advance unless Jellyfin paused it. A stalled
     // encode under a healthy agent would otherwise hang the session (it keeps heartbeating).
     let stall_watch = {
         let ctl = ctl.clone();
-        let (stall, grace) = (cfg.stall_after, cfg.first_progress_grace);
+        // BATCH (trickplay) jobs get their own, much longer pair: see
+        // `Config::batch_stall_after`'s doc comment for why the PLAYBACK-tuned defaults would
+        // false-positive on a healthy, slowly-progressing trickplay job.
+        let (stall, grace) = cfg.stall_limits(batch);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -277,9 +534,12 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
         })
     };
     // Drain: on SIGTERM let the current segment finish, then end the job so Jellyfin restarts
-    // it on another worker (the drill-proven restart path).
+    // it on another worker (the drill-proven restart path). A paused ffmpeg (Jellyfin's
+    // throttler, or the agent's own orphan throttle) writes no next segment, so it is resumed
+    // first (`u`); the reader and the detach watcher stop pausing once draining.
     let drain_watch = {
         let ctl = ctl.clone();
+        let stdin_tx = stdin_detach.clone();
         let mut drain = state.drain.clone();
         let mapped: Vec<String> = job.args.iter().map(|a| map_path(a, &cfg.pathmap)).collect();
         tokio::spawn(async move {
@@ -288,11 +548,29 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
                     return;
                 }
             }
+            if batch {
+                // A jpg sequence has no segment boundary to wait for (last_segment_index is
+                // meaningless here, always None): end it right away so Jellyfin/the shim see a
+                // clean, immediate exit rather than a 10s wait for something that never resolves.
+                ctl.end(
+                    Ended::Drained,
+                    "agent draining (batch job has no segment boundary to wait for)",
+                );
+                return;
+            }
             let base = tcpool_ir::last_segment_index(&mapped);
             let started = Instant::now();
             loop {
                 if ctl.done.load(Ordering::SeqCst) {
                     return;
+                }
+                // Every tick, not once: a `p` already in flight when the drain began (from
+                // Jellyfin or the detach watcher) is undone on the next one.
+                if ctl.paused.swap(false, Ordering::SeqCst) {
+                    crate::log(format_args!(
+                        "agent draining: resuming paused ffmpeg (u) so it reaches its next segment"
+                    ));
+                    let _ = stdin_tx.send(Some(b"u".to_vec())).await;
                 }
                 let now = tcpool_ir::last_segment_index(&mapped);
                 if now > base || started.elapsed() > Duration::from_secs(10) {
@@ -303,30 +581,74 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
             }
         })
     };
+    // Preemption watchdog (BATCH jobs only, `guard.preempt` is `None` for PLAYBACK): poll the
+    // flag `reserve_playback` sets when it preempts this reservation, and end the job the same
+    // way the stall/drain watchdogs do.
+    let preempt_watch = guard.preempt.clone().map(|preempt| {
+        let ctl = ctl.clone();
+        tokio::spawn(async move {
+            loop {
+                if ctl.done.load(Ordering::SeqCst) {
+                    return;
+                }
+                if preempt.is_preempted() {
+                    ctl.end(Ended::Preempted, "preempted by a playback admission");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    });
 
     let opts = TranslateOpts {
         pathmap: cfg.pathmap.clone(),
         gpu_filters: cfg.gpu_filters,
+        rate_control: cfg.rate_control,
     };
     let cwd = map_path(&job.cwd, &cfg.pathmap);
-    let render = |o: &TranslateOpts| {
-        let mut r = render(&job.args, cfg.backend, o);
+    let render_fn = |o: &TranslateOpts| {
+        let mut r = if batch {
+            render_trickplay(&job.args, cfg.backend, o)
+        } else {
+            render(&job.args, cfg.backend, o)
+        };
         if let Some((size, dur)) = cfg.probe_clamp {
             tcpool_ir::clamp_probe(&mut r.args, size, dur);
         }
+        // P5: the DV7->8.1 marker is Jellyfin's request to this agent, never an ffmpeg option
+        // worth keeping; whatever runs below (plain remux, fallback, GPU/CPU re-run) runs
+        // without it.
+        if wants_dv81(&r.args) {
+            r.args = strip_dv81_signal(&r.args);
+        }
         r
     };
-    let mut rendered = render(&opts);
-    let mut code = run_ffmpeg(
-        cfg,
-        &rendered.args,
-        &cwd,
-        &tx,
-        &ctl,
-        kill_rx.clone(),
-        stdin_rx.clone(),
-    )
-    .await;
+    let mut rendered = render_fn(&opts);
+    let mut code = if !batch && wants_dv81(&job.args) {
+        run_dv81(
+            cfg,
+            &state,
+            &rendered.args,
+            &cwd,
+            &tx,
+            &ctl,
+            kill_rx.clone(),
+            stdin_rx.clone(),
+        )
+        .await
+    } else {
+        run_ffmpeg(
+            cfg,
+            &rendered.args,
+            &cwd,
+            &tx,
+            &ctl,
+            kill_rx.clone(),
+            stdin_rx.clone(),
+            None,
+        )
+        .await
+    };
     if code != 0
         && rendered.gpu_filters
         && !ctl.fenced.load(Ordering::SeqCst)
@@ -342,39 +664,70 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
         state
             .metrics
             .inc(crate::metrics::Outcome::GpuFilterFallback);
-        rendered = render(&TranslateOpts {
+        rendered = render_fn(&TranslateOpts {
             gpu_filters: false,
             ..opts.clone()
         });
-        code = run_ffmpeg(cfg, &rendered.args, &cwd, &tx, &ctl, kill_rx, stdin_rx).await;
+        code = run_ffmpeg(
+            cfg,
+            &rendered.args,
+            &cwd,
+            &tx,
+            &ctl,
+            kill_rx,
+            stdin_rx,
+            None,
+        )
+        .await;
     }
     ctl.done.store(true, Ordering::SeqCst);
     let fenced = ctl.fenced.load(Ordering::SeqCst);
-    let outcome = if fenced {
-        crate::metrics::Outcome::Fenced
-    } else {
-        match ctl.ended() {
-            Some(Ended::Stalled) => crate::metrics::Outcome::Stalled,
-            // Drained jobs are killed to end them (a nonzero/signal exit code), but that's a
-            // planned handoff to another worker, not a failure -- keep it out of exit_error.
-            Some(Ended::Drained) => crate::metrics::Outcome::Drained,
-            None if code == 0 => crate::metrics::Outcome::ExitOk,
-            None => crate::metrics::Outcome::ExitError,
-        }
-    };
+    let (outcome, preempted) = final_outcome(code, fenced, ctl.ended());
     state.metrics.inc(outcome);
     state
         .metrics
         .observe_seconds(started.elapsed().as_secs_f64());
     state.metrics.clear_speed(job_id);
-    if !fenced {
+    // A preempted BATCH job must always get an explicit Exit{preempted:true} so the shim can
+    // apply A1's frame-exists split (fall back to a local re-run, or exit non-zero with no
+    // rerun) -- unlike a plain fence, which the shim already treats as "worker gone" without
+    // one. This only ever widens the send for a job that was preempted (a
+    // PLAYBACK job's `ended` can never be `Preempted`: only a BATCH reservation gets a preempt
+    // handle), so PLAYBACK behavior (`if !fenced`) is unchanged.
+    let taken_over = detach.as_ref().is_some_and(|d| d.was_taken_over());
+    if (!fenced || preempted) && !ctl.is_detached() {
         let _ = tx
             .send(msg(server_msg::Msg::Exit(Exit {
                 code,
                 fenced,
                 gpu_filters: rendered.gpu_filters,
+                preempted,
+                taken_over,
             })))
             .await;
+    }
+    if let Some(d) = &detach {
+        if let Some(h) = &detach_watch {
+            h.abort();
+        }
+        if taken_over || d.is_detached() {
+            // Attached jobs leave the lease to their shim (unchanged); a taken-over or detached
+            // job frees it here so the next writer (or nobody) can take it.
+            d.release();
+        }
+        if d.is_detached() && !taken_over {
+            if ctl.ended() == Some(Ended::Orphaned) {
+                let n = d.cleanup();
+                crate::log(format_args!(
+                    "detached output {}: viewer gone, removed {n} files",
+                    d.stem
+                ));
+            } else {
+                // Finished (or failed) on its own while still being served: delete the outputs
+                // only once the viewer is gone.
+                tokio::spawn(crate::detach::linger_then_cleanup(cfg.clone(), d.clone()));
+            }
+        }
     }
     crate::log(format_args!(
         "exit {code}{}",
@@ -384,7 +737,11 @@ pub async fn run_job(state: Arc<State>, job: Job, mut inbound: Streaming<ClientM
     watchdog.abort();
     stall_watch.abort();
     drain_watch.abort();
+    if let Some(h) = preempt_watch {
+        h.abort();
+    }
     reader.abort();
+    drop(stdin_detach);
     drop(guard);
 }
 
@@ -397,13 +754,15 @@ async fn pump(mut from: impl tokio::io::AsyncRead + Unpin, tx: Tx, ctl: Arc<Ctl>
                 if stderr {
                     ctl.note_stderr(&buf[..n]);
                 }
+                if ctl.is_detached() {
+                    continue; // keep draining ffmpeg's pipes; nobody to forward them to
+                }
                 let m = if stderr {
                     server_msg::Msg::Stderr(buf[..n].to_vec())
                 } else {
                     server_msg::Msg::Stdout(buf[..n].to_vec())
                 };
-                if tx.send(msg(m)).await.is_err() {
-                    ctl.fence("shim unreachable");
+                if tx.send(msg(m)).await.is_err() && !ctl.shim_lost("shim unreachable") {
                     return;
                 }
             }
@@ -411,7 +770,343 @@ async fn pump(mut from: impl tokio::io::AsyncRead + Unpin, tx: Tx, ctl: Arc<Ctl>
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// P5: DV profile 7 -> 8.1 remux (transcode/docs/PLAN.md). ffmpeg#1 demuxes the video to MPEG-TS,
+// this process rewrites it (dv81_ts + dv81), ffmpeg#2 muxes Jellyfin's HLS from it plus the
+// source's other streams. ffmpeg#2 reads the video on fd 3 (`pipe:3`), NOT stdin: stdin stays
+// Jellyfin's key channel (p/u/q throttling), exactly as on the plain path.
+// ---------------------------------------------------------------------------------------------
+
+/// The fd ffmpeg#2 reads the rewritten TS from.
+const DV81_FD: i32 = 3;
+/// How much of ffmpeg#1's TS output may pass without an in-band RPU before deciding the source's
+/// RPU is out-of-band (the `hvcE` Block Addition muxing) and running the plain remux. Every DV
+/// frame carries an RPU, so a real in-band source decides on its first frame; the limit only
+/// bounds how long a no-RPU source delays its first segment.
+const DV81_SCAN_BYTES: usize = 32 << 20;
+/// Upper bound on the decision itself (ffmpeg#1 start + the scan), same reasoning. Kept well
+/// inside the playback first-progress grace (`TC_FIRST_PROGRESS_GRACE`, 45 s default): the
+/// grace timer starts before `source_dovi`'s ffprobe (up to 10 s) and this scan, and whatever
+/// ffmpeg runs next (converting or the plain-remux fallback) still has to print its first
+/// `time=` inside it, or the stall watchdog ends the job.
+const DV81_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+
+type Dv81Transform = fn(&[u8]) -> Result<crate::dv81_ts::TransformOut, String>;
+type Dv81Rewriter = crate::dv81_ts::TsRewriter<Dv81Transform>;
+
+fn dv81_transform(data: &[u8]) -> Result<crate::dv81_ts::TransformOut, String> {
+    let (out, st) = crate::dv81::convert_access_unit(data)?;
+    Ok((out, st.rpus, st.dropped_el))
+}
+
+/// ffmpeg#1, past the point where it has proven its output carries in-band RPUs.
+struct Dv81Feed {
+    demux: Child,
+    stdout: tokio::process::ChildStdout,
+    rewriter: Dv81Rewriter,
+    /// Rewritten bytes produced during the scan, not yet written to ffmpeg#2.
+    pending: Vec<u8>,
+    /// ffmpeg#1's output already ended during the scan (a short clip).
+    eof: bool,
+}
+
+enum Dv81Scan {
+    Ready(Box<Dv81Feed>),
+    Fallback(crate::metrics::Dv81Outcome, String),
+    Killed,
+}
+
+/// Why this signaled job cannot convert, before anything is spawned; `Ok` = go.
+async fn dv81_prepare(
+    cfg: &Config,
+    args: &[String],
+) -> Result<
+    (crate::dv81_plan::Plan, crate::dv81_ts::DoviDescriptor),
+    (crate::metrics::Dv81Outcome, String),
+> {
+    use crate::metrics::Dv81Outcome as O;
+    if !is_video_copy(args) {
+        return Err((O::FallbackError, "not a video stream copy".into()));
+    }
+    let input = input_path(args).ok_or((O::FallbackError, "no input".to_string()))?;
+    let Some(src) = crate::probe::source_dovi(cfg, input).await else {
+        return Err((O::FallbackNotP7, "ffprobe failed or timed out".into()));
+    };
+    if src.profile != Some(7) {
+        return Err((
+            O::FallbackNotP7,
+            format!("source DV profile is {:?}, not 7", src.profile),
+        ));
+    }
+    let plan = crate::dv81_plan::plan(
+        args,
+        &crate::dv81_plan::Source {
+            video_index: src.video_index,
+            start_time: src.start_time,
+        },
+        DV81_FD,
+    )
+    .map_err(|e| (O::FallbackError, e))?;
+    Ok((plan, crate::dv81_ts::DoviDescriptor::profile_81(src.level)))
+}
+
+/// Start ffmpeg#1 and read until its output proves (or disproves) in-band RPUs.
+async fn dv81_scan(
+    cfg: &Config,
+    demux_args: &[String],
+    cwd: &str,
+    desc: crate::dv81_ts::DoviDescriptor,
+    kill_rx: &mut watch::Receiver<bool>,
+) -> Dv81Scan {
+    use crate::metrics::Dv81Outcome as O;
+    crate::log(format_args!(
+        "dv81 demux: {} {}",
+        cfg.ffmpeg,
+        demux_args.join(" ")
+    ));
+    let mut cmd = Command::new(&cfg.ffmpeg);
+    cmd.args(demux_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if !cwd.is_empty() && std::path::Path::new(cwd).is_dir() {
+        cmd.current_dir(cwd);
+    }
+    let mut demux = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Dv81Scan::Fallback(O::FallbackError, format!("demux spawn: {e}")),
+    };
+    let Some(mut stdout) = demux.stdout.take() else {
+        return Dv81Scan::Fallback(O::FallbackError, "demux has no stdout".into());
+    };
+    // ffmpeg#1's stderr goes to the agent log, never to the shim (Jellyfin parses ffmpeg#2's).
+    if let Some(mut err) = demux.stderr.take() {
+        tokio::spawn(async move {
+            let mut text = Vec::new();
+            let _ = err.read_to_end(&mut text).await;
+            let text = String::from_utf8_lossy(&text);
+            let text = text.trim();
+            if !text.is_empty() {
+                let tail: String = text
+                    .chars()
+                    .rev()
+                    .take(2000)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                crate::log(format_args!("dv81 demux stderr: {tail}"));
+            }
+        });
+    }
+    let mut rewriter: Dv81Rewriter = crate::dv81_ts::TsRewriter::new(desc, dv81_transform);
+    let mut pending = Vec::new();
+    let mut read_total = 0usize;
+    let mut buf = vec![0u8; 256 << 10];
+    let deadline = tokio::time::Instant::now() + DV81_SCAN_TIMEOUT;
+    loop {
+        if rewriter.stats.rpus > 0 {
+            return Dv81Scan::Ready(Box::new(Dv81Feed {
+                demux,
+                stdout,
+                rewriter,
+                pending,
+                eof: false,
+            }));
+        }
+        if read_total >= DV81_SCAN_BYTES {
+            return Dv81Scan::Fallback(
+                O::FallbackNoRpu,
+                format!(
+                    "no in-band RPU (NAL 62) in the first {} MB ({} video frames)",
+                    DV81_SCAN_BYTES >> 20,
+                    rewriter.stats.video_pes
+                ),
+            );
+        }
+        let n = tokio::select! {
+            r = tokio::time::timeout_at(deadline, stdout.read(&mut buf)) => r,
+            changed = kill_rx.changed() => {
+                if changed.is_err() || *kill_rx.borrow() {
+                    return Dv81Scan::Killed;
+                }
+                continue;
+            }
+        };
+        match n {
+            Err(_) => {
+                return Dv81Scan::Fallback(
+                    O::FallbackError,
+                    format!("no decision within {}s", DV81_SCAN_TIMEOUT.as_secs()),
+                )
+            }
+            Ok(Err(e)) => return Dv81Scan::Fallback(O::FallbackError, format!("demux read: {e}")),
+            Ok(Ok(0)) => {
+                if let Err(e) = rewriter.finish(&mut pending) {
+                    return Dv81Scan::Fallback(O::FallbackError, format!("rewrite: {e}"));
+                }
+                let status = demux.wait().await;
+                if !status.as_ref().is_ok_and(|s| s.success()) {
+                    return Dv81Scan::Fallback(
+                        O::FallbackError,
+                        format!("demux exited {}", exit_code(status)),
+                    );
+                }
+                if rewriter.stats.rpus == 0 {
+                    return Dv81Scan::Fallback(
+                        O::FallbackNoRpu,
+                        format!(
+                            "no in-band RPU (NAL 62) in the whole output ({} video frames)",
+                            rewriter.stats.video_pes
+                        ),
+                    );
+                }
+                return Dv81Scan::Ready(Box::new(Dv81Feed {
+                    demux,
+                    stdout,
+                    rewriter,
+                    pending,
+                    eof: true,
+                }));
+            }
+            Ok(Ok(n)) => {
+                read_total += n;
+                if let Err(e) = rewriter.push(&buf[..n], &mut pending) {
+                    return Dv81Scan::Fallback(O::FallbackError, format!("rewrite: {e}"));
+                }
+            }
+        }
+    }
+}
+
+/// Pump ffmpeg#1 -> rewriter -> ffmpeg#2's fd 3 until ffmpeg#1 ends. `Err` = the conversion
+/// itself failed (bad RPU, ffmpeg#1 died): the caller kills ffmpeg#2 so a truncated stream can
+/// never look like a clean end. ffmpeg#2 going away (Jellyfin quit it) is `Ok`.
+async fn dv81_feed(
+    mut feed: Box<Dv81Feed>,
+    mut out: tokio::net::unix::pipe::Sender,
+) -> Result<crate::dv81_ts::TsStats, String> {
+    if out.write_all(&feed.pending).await.is_err() {
+        return Ok(feed.rewriter.stats);
+    }
+    feed.pending = Vec::new();
+    let mut buf = vec![0u8; 256 << 10];
+    let mut chunk = Vec::with_capacity(512 << 10);
+    while !feed.eof {
+        let n = feed
+            .stdout
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("demux read: {e}"))?;
+        chunk.clear();
+        if n == 0 {
+            feed.rewriter.finish(&mut chunk)?;
+            let status = feed.demux.wait().await;
+            if !status.as_ref().is_ok_and(|s| s.success()) {
+                return Err(format!("demux exited {}", exit_code(status)));
+            }
+            feed.eof = true;
+        } else {
+            feed.rewriter.push(&buf[..n], &mut chunk)?;
+        }
+        if out.write_all(&chunk).await.is_err() {
+            break; // ffmpeg#2 closed its end: it is exiting on its own
+        }
+    }
+    Ok(feed.rewriter.stats)
+}
+
+/// A signaled (DV7 -> 8.1) PLAYBACK job: convert if the gate passes, else run an HDR10-safe
+/// fallback of `args` (Jellyfin's plain remux, marker stripped, `add_dv_removal_bsf` applied --
+/// see that function's doc comment for why a fallback must not just copy whatever DV the source
+/// actually has). Counts exactly one `tcpool_dv81_total` outcome.
+#[allow(clippy::too_many_arguments)]
+async fn run_dv81(
+    cfg: &Config,
+    state: &Arc<State>,
+    args: &[String],
+    cwd: &str,
+    tx: &Tx,
+    ctl: &Arc<Ctl>,
+    mut kill_rx: watch::Receiver<bool>,
+    stdin_rx: Arc<Mutex<mpsc::Receiver<Option<Vec<u8>>>>>,
+) -> i32 {
+    use crate::metrics::Dv81Outcome as O;
+    // Defense in depth: `run_job`'s `render_fn` already strips the marker before calling here, so
+    // this is normally a no-op. Stripping again (idempotent) means `run_dv81` never depends on its
+    // caller having done it -- the fixture tests in `dv81_it.rs` call this directly with the
+    // marker still present, and neither ffmpeg#1/#2's argv nor the fallback below should ever
+    // carry it.
+    let stripped = strip_dv81_signal(args);
+    let args = &stripped;
+    // Every fallback below runs this, never bare `args`: none of them produced a real 8.1 record,
+    // so the client (which only ever asked for "8.1 or HDR10") must get DV removed rather than
+    // whatever DV the source actually carries -- see `add_dv_removal_bsf`'s doc comment.
+    let fallback_args = add_dv_removal_bsf(args);
+    let fallback = |outcome: O, why: String| {
+        crate::log(format_args!(
+            "dv81: {}: {why}; running the plain remux with DV removed",
+            outcome.as_str()
+        ));
+        state.metrics.inc_dv81(outcome);
+    };
+    let (plan, desc) = match dv81_prepare(cfg, args).await {
+        Ok(p) => p,
+        Err((o, why)) => {
+            fallback(o, why);
+            return run_ffmpeg(cfg, &fallback_args, cwd, tx, ctl, kill_rx, stdin_rx, None).await;
+        }
+    };
+    let feed = match dv81_scan(cfg, &plan.demux, cwd, desc, &mut kill_rx).await {
+        Dv81Scan::Ready(f) => f,
+        Dv81Scan::Fallback(o, why) => {
+            fallback(o, why);
+            return run_ffmpeg(cfg, &fallback_args, cwd, tx, ctl, kill_rx, stdin_rx, None).await;
+        }
+        Dv81Scan::Killed => {
+            // Fenced/drained/stalled while deciding: nothing ran for Jellyfin, nothing to fall
+            // back to (the kill is job-wide). Still one outcome per signaled job.
+            crate::log(format_args!("dv81: job killed during the RPU scan"));
+            state.metrics.inc_dv81(O::FallbackError);
+            return -libc::SIGKILL;
+        }
+    };
+    crate::log(format_args!(
+        "dv81: in-band RPU found; converting (level {})",
+        desc.level
+    ));
+    let code = run_ffmpeg(
+        cfg,
+        &plan.mux,
+        cwd,
+        tx,
+        ctl,
+        kill_rx.clone(),
+        stdin_rx.clone(),
+        Some(feed),
+    )
+    .await;
+    if code != 0
+        && !ctl.fenced.load(Ordering::SeqCst)
+        && ctl.ended().is_none()
+        && !*kill_rx.borrow()
+        && !first_segment(args).is_some_and(|p| std::path::Path::new(&p).exists())
+    {
+        fallback(
+            O::FallbackError,
+            format!("converting pipeline exited {code} before the first segment"),
+        );
+        return run_ffmpeg(cfg, &fallback_args, cwd, tx, ctl, kill_rx, stdin_rx, None).await;
+    }
+    state.metrics.inc_dv81(O::Converted);
+    code
+}
+
 /// Run one ffmpeg to completion (or until fenced). Returns its exit code (-signal if killed).
+/// With `feed` (P5), the rewritten DV8.1 TS is piped to the child's fd `DV81_FD`; a conversion
+/// error kills the child.
+#[allow(clippy::too_many_arguments)]
 async fn run_ffmpeg(
     cfg: &Config,
     args: &[String],
@@ -420,6 +1115,7 @@ async fn run_ffmpeg(
     ctl: &Arc<Ctl>,
     mut kill_rx: watch::Receiver<bool>,
     stdin_rx: Arc<Mutex<mpsc::Receiver<Option<Vec<u8>>>>>,
+    feed: Option<Box<Dv81Feed>>,
 ) -> i32 {
     crate::log(format_args!("start: {} {}", cfg.ffmpeg, args.join(" ")));
     let mut cmd = Command::new(&cfg.ffmpeg);
@@ -431,12 +1127,49 @@ async fn run_ffmpeg(
     if !cwd.is_empty() && std::path::Path::new(cwd).is_dir() {
         cmd.current_dir(cwd);
     }
+    let mut pipe_tx = None;
+    let mut pipe_rx_fd = None;
+    if feed.is_some() {
+        match tokio::net::unix::pipe::pipe().and_then(|(tx, rx)| Ok((tx, rx.into_blocking_fd()?))) {
+            Ok((ptx, prx)) => {
+                use std::os::fd::AsRawFd;
+                let raw = prx.as_raw_fd();
+                // SAFETY: runs in the forked child before exec; dup2/fcntl are async-signal-safe
+                // and touch only this child's descriptor table.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        if raw == DV81_FD {
+                            // Already fd 3: just let it survive exec.
+                            if libc::fcntl(raw, libc::F_SETFD, 0) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        } else if libc::dup2(raw, DV81_FD) < 0 {
+                            // dup2 clears FD_CLOEXEC on the new descriptor.
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                pipe_tx = Some(ptx);
+                pipe_rx_fd = Some(prx);
+            }
+            Err(e) => {
+                crate::log(format_args!("dv81 pipe failed: {e}"));
+                return 127;
+            }
+        }
+    }
     let mut child: Child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             crate::log(format_args!("spawn failed: {e}"));
             return 127;
         }
+    };
+    drop(pipe_rx_fd); // the child has its copy; ours would only keep the pipe open
+    let mut feeder = match (feed, pipe_tx) {
+        (Some(f), Some(ptx)) => Some(tokio::spawn(dv81_feed(f, ptx))),
+        _ => None,
     };
     if *kill_rx.borrow() {
         let _ = child.start_kill();
@@ -473,8 +1206,30 @@ async fn run_ffmpeg(
                     break child.wait().await;
                 }
             }
+            fed = async { feeder.as_mut().expect("guarded").await }, if feeder.is_some() => {
+                feeder = None;
+                match fed {
+                    Ok(Ok(st)) => crate::log(format_args!(
+                        "dv81: demux finished: {} frames, {} RPUs rewritten, {} EL NALs dropped",
+                        st.video_pes, st.rpus, st.dropped_el
+                    )),
+                    Ok(Err(e)) => {
+                        crate::log(format_args!("dv81: conversion failed mid-stream: {e}; killing ffmpeg"));
+                        let _ = child.start_kill();
+                        break child.wait().await;
+                    }
+                    Err(e) => {
+                        crate::log(format_args!("dv81: feeder task died: {e}; killing ffmpeg"));
+                        let _ = child.start_kill();
+                        break child.wait().await;
+                    }
+                }
+            }
         }
     };
+    if let Some(f) = feeder {
+        f.abort(); // drops ffmpeg#1 (kill_on_drop)
+    }
     if let Some(w) = writer {
         w.abort();
     }
@@ -489,5 +1244,98 @@ fn exit_code(status: std::io::Result<std::process::ExitStatus>) -> i32 {
     match status {
         Ok(s) => s.code().unwrap_or_else(|| -s.signal().unwrap_or(1)),
         Err(_) => 1,
+    }
+}
+
+#[cfg(test)]
+#[path = "dv81_it.rs"]
+mod dv81_it;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_refusal_only_applies_to_batch_jobs() {
+        let mut cfg = Config::minimal();
+        cfg.accept_batch = false;
+        assert_eq!(
+            batch_refusal_reason(&cfg, false),
+            None,
+            "a playback job is never refused for BATCH reasons"
+        );
+    }
+
+    #[test]
+    fn batch_refused_when_the_worker_opted_out() {
+        let mut cfg = Config::minimal();
+        cfg.accept_batch = false;
+        cfg.policy.trickplay_output_root = Some("/scratch/tp".into());
+        assert_eq!(batch_refusal_reason(&cfg, true), Some("batch-disabled"));
+    }
+
+    #[test]
+    fn batch_refused_when_no_trickplay_output_root_is_configured() {
+        let mut cfg = Config::minimal();
+        cfg.policy.trickplay_output_root = None;
+        assert_eq!(batch_refusal_reason(&cfg, true), Some("batch-disabled"));
+    }
+
+    #[test]
+    fn batch_allowed_when_accepted_and_rooted() {
+        let mut cfg = Config::minimal();
+        cfg.policy.trickplay_output_root = Some("/scratch/tp".into());
+        assert_eq!(batch_refusal_reason(&cfg, true), None);
+    }
+
+    #[test]
+    fn final_outcome_a_clean_exit_wins_over_a_late_preempted_ended() {
+        // Regression: preempt_watch (or stall_watch/drain_watch) can record an `Ended` reason in
+        // the narrow window between ffmpeg actually exiting 0 and `ctl.done` being stored (the
+        // pump-drain await inside run_ffmpeg). A code-0, not-fenced exit must always win.
+        assert_eq!(
+            final_outcome(0, false, Some(Ended::Preempted)),
+            (crate::metrics::Outcome::ExitOk, false)
+        );
+        assert_eq!(
+            final_outcome(0, false, Some(Ended::Stalled)),
+            (crate::metrics::Outcome::ExitOk, false)
+        );
+        assert_eq!(
+            final_outcome(0, false, Some(Ended::Drained)),
+            (crate::metrics::Outcome::ExitOk, false)
+        );
+        assert_eq!(
+            final_outcome(0, false, None),
+            (crate::metrics::Outcome::ExitOk, false)
+        );
+    }
+
+    #[test]
+    fn final_outcome_reports_a_genuine_preemption() {
+        assert_eq!(
+            final_outcome(-9, false, Some(Ended::Preempted)),
+            (crate::metrics::Outcome::Preempted, true)
+        );
+    }
+
+    #[test]
+    fn final_outcome_fenced_wins_regardless_of_code_or_ended() {
+        assert_eq!(
+            final_outcome(0, true, Some(Ended::Preempted)),
+            (crate::metrics::Outcome::Fenced, false)
+        );
+        assert_eq!(
+            final_outcome(-9, true, None),
+            (crate::metrics::Outcome::Fenced, false)
+        );
+    }
+
+    #[test]
+    fn final_outcome_nonzero_no_ended_is_exit_error() {
+        assert_eq!(
+            final_outcome(1, false, None),
+            (crate::metrics::Outcome::ExitError, false)
+        );
     }
 }

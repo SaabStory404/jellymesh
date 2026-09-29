@@ -41,5 +41,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "trickplay"
+path = "fuzz_targets/trickplay.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

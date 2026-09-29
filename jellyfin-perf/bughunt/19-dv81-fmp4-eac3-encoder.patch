@@ -1,0 +1,294 @@
+diff --git a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+index 9c725614b..a06b78776 100644
+--- a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
++++ b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+@@ -20,6 +20,7 @@ using Jellyfin.Extensions;
+ using MediaBrowser.Common.Configuration;
+ using MediaBrowser.Controller.Extensions;
+ using MediaBrowser.Controller.IO;
++using MediaBrowser.Controller.Streaming;
+ using MediaBrowser.Model.Configuration;
+ using MediaBrowser.Model.Dlna;
+ using MediaBrowser.Model.Dto;
+@@ -1623,6 +1624,42 @@ namespace MediaBrowser.Controller.MediaEncoding
+             return IsDoviP7ToP81Converted(state) ? " -tag:v:0 hvc1 -strict -2" : string.Empty;
+         }
+ 
++        /// <summary>
++        /// JELLYMESH_DOVI_P7_TO_81 (bughunt 19): whether this job should encode its audio to EAC3.
++        /// True for an HLS job with fMP4 segments that converts Dolby Vision profile 7 to 8.1
++        /// (<see cref="IsDoviP7ToP81Converted"/>), whose audio stream is TrueHD/MLP with at least
++        /// 6 channels, when the client lists <c>eac3</c> and ffmpeg has the <c>eac3</c> encoder.
++        ///
++        /// bughunt 18 dropped truehd/mlp from this job's candidate list (media3 cannot demux TrueHD
++        /// from fMP4) and moved eac3 to the front of it, but the output codec is picked here, as the
++        /// first candidate <c>CanEncodeToAudioCodec</c> accepts -- and that was
++        /// always false for eac3, because upstream's encoder whitelist
++        /// (EncoderValidator._requiredEncoders) never listed it. So eac3 was skipped whenever any
++        /// other candidate was offered (MEASURED in tc-lab: the Android TV list got AAC 5.1,
++        /// <c>eac3,ac3</c> got AC3, <c>eac3</c> alone got EAC3 only via the fall-back to the first
++        /// entry). The whitelist now detects eac3, and this is the only place that asks for it
++        /// (CanEncodeToAudioCodec still answers false for eac3, so every other job is unchanged).
++        /// The copy decision is untouched: it tests the candidate list, not this pick, so a
++        /// copyable AC3/EAC3 source is still copied. Sources below 6 channels keep upstream's
++        /// rule (ShiftAudioCodecsIfNeeded: a 2-channel ac3/eac3 transcode is avoided).
++        /// </summary>
++        /// <param name="state">The encoding job.</param>
++        /// <returns>Whether the audio transcode target is EAC3.</returns>
++        public bool PrefersEac3ForDoviP7ToP81Fmp4(EncodingJobInfo state)
++        {
++            var audioStream = state?.AudioStream;
++            return DoviP7ToP81Enabled
++                && audioStream is not null
++                && state.BaseRequest is StreamingRequestDto { SegmentContainer: var segmentContainer }
++                && string.Equals(segmentContainer, "mp4", StringComparison.OrdinalIgnoreCase)
++                && (string.Equals(audioStream.Codec, "truehd", StringComparison.OrdinalIgnoreCase)
++                    || string.Equals(audioStream.Codec, "mlp", StringComparison.OrdinalIgnoreCase))
++                && (audioStream.Channels ?? 6) >= 6
++                && state.SupportedAudioCodecs.Contains("eac3", StringComparison.OrdinalIgnoreCase)
++                && _mediaEncoder.SupportsEncoder("eac3")
++                && IsDoviP7ToP81Converted(state);
++        }
++
+         public string GetBitStreamArgs(EncodingJobInfo state, MediaStreamType streamType)
+         {
+             if (state is null)
+@@ -7708,8 +7745,10 @@ namespace MediaBrowser.Controller.MediaEncoding
+ 
+                 state.SupportedAudioCodecs = supportedAudioCodecsList.ToArray();
+ 
+-                request.AudioCodec = state.SupportedAudioCodecs.FirstOrDefault(_mediaEncoder.CanEncodeToAudioCodec)
+-                    ?? state.SupportedAudioCodecs.FirstOrDefault();
++                request.AudioCodec = PrefersEac3ForDoviP7ToP81Fmp4(state)
++                    ? "eac3"
++                    : state.SupportedAudioCodecs.FirstOrDefault(_mediaEncoder.CanEncodeToAudioCodec)
++                        ?? state.SupportedAudioCodecs.FirstOrDefault();
+             }
+ 
+             var supportedVideoCodecs = state.SupportedVideoCodecs;
+diff --git a/MediaBrowser.MediaEncoding/Encoder/EncoderValidator.cs b/MediaBrowser.MediaEncoding/Encoder/EncoderValidator.cs
+index 99c08eb9a..b7e8a1cc3 100644
+--- a/MediaBrowser.MediaEncoding/Encoder/EncoderValidator.cs
++++ b/MediaBrowser.MediaEncoding/Encoder/EncoderValidator.cs
+@@ -70,6 +70,9 @@ namespace MediaBrowser.MediaEncoding.Encoder
+             "aac_at",
+             "libfdk_aac",
+             "ac3",
++            // JELLYMESH bughunt 19: detected so a DV7->8.1 fMP4 job can encode EAC3; see
++            // MediaEncoder.CanEncodeToAudioCodec for why no other job's choice changes.
++            "eac3",
+             "alac",
+             "dca",
+             "libmp3lame",
+diff --git a/MediaBrowser.MediaEncoding/Encoder/MediaEncoder.cs b/MediaBrowser.MediaEncoding/Encoder/MediaEncoder.cs
+index fa43d756a..cd8a2a0e2 100644
+--- a/MediaBrowser.MediaEncoding/Encoder/MediaEncoder.cs
++++ b/MediaBrowser.MediaEncoding/Encoder/MediaEncoder.cs
+@@ -404,6 +404,15 @@ namespace MediaBrowser.MediaEncoding.Encoder
+             {
+                 codec = "libmp3lame";
+             }
++            else if (string.Equals(codec, "eac3", StringComparison.OrdinalIgnoreCase))
++            {
++                // JELLYMESH bughunt 19: eac3 is now in EncoderValidator's whitelist, but upstream never
++                // detected it, so this answered false for eac3 for every caller (StreamBuilder,
++                // StreamingHelpers, EncodingHelper's audio codec pick). Keep that answer; only
++                // EncodingHelper.PrefersEac3ForDoviP7ToP81Fmp4 (JELLYMESH_DOVI_P7_TO_81) asks
++                // SupportsEncoder("eac3") directly.
++                return false;
++            }
+ 
+             return SupportsEncoder(codec);
+         }
+diff --git a/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs b/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs
+index 69b0eb925..03d0ba6f3 100644
+--- a/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs
++++ b/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs
+@@ -7,6 +7,7 @@ using MediaBrowser.Controller.Streaming;
+ using MediaBrowser.Model.Configuration;
+ using MediaBrowser.Model.Dto;
+ using MediaBrowser.Model.Entities;
++using MediaBrowser.Model.Session;
+ using Moq;
+ using Xunit;
+ 
+@@ -16,6 +17,13 @@ namespace Jellyfin.Controller.Tests.MediaEncoding;
+ 
+ public class EncodingHelperDoviTests
+ {
++    /// <summary>
++    /// The official Android TV app's (0.19.10, deviceProfile.kt) audio list
++    /// "aac,ac3,alac,dts,eac3,flac,mp3,opus,truehd" in the client's own order (aac before eac3),
++    /// minus truehd, which bughunt 18's StreamBuilder drops for a DV7->8.1 fMP4 job.
++    /// </summary>
++    private const string AndroidTvAudioCodecs = "aac,ac3,alac,dts,eac3,flac,mp3,opus";
++
+     [Theory]
+     [InlineData(null, false)]
+     [InlineData("bt709", false)]
+@@ -237,6 +245,165 @@ public class EncodingHelperDoviTests
+         Assert.True(helper.IsDoviRemoved(state));
+     }
+ 
++    // JELLYMESH_DOVI_P7_TO_81, bughunt 19: TrueHD -> EAC3 for a DV7->8.1 fMP4 job ---------------
++
++    [Theory]
++    [InlineData(AndroidTvAudioCodecs)] // the client's own order: aac before eac3
++    [InlineData("eac3,aac,ac3,alac,dts,flac,mp3,opus")] // the URL bughunt 18's StreamBuilder sends (eac3 first)
++    [InlineData("eac3,ac3")]
++    [InlineData("ac3,eac3")]
++    public void DoviP7ToP81Fmp4_TrueHdSource_ClientOffersEac3_EncodesEac3(string audioCodecs)
++    {
++        // MEASURED in tc-lab before this fix (12.1-jm8.3-lab-gh14): the Android TV list got
++        // libfdk_aac, "eac3,ac3" got ac3 -- CanEncodeToAudioCodec("eac3") was always false.
++        using var env = new EnvVarScope("JELLYMESH_DOVI_P7_TO_81", "1");
++        var (helper, state) = AttachAudio(audioCodecs, "truehd", 8);
++
++        Assert.True(helper.PrefersEac3ForDoviP7ToP81Fmp4(state));
++        Assert.Equal("eac3", state.BaseRequest.AudioCodec);
++        Assert.Equal("eac3", state.OutputAudioCodec);
++        Assert.Equal("eac3", helper.GetAudioEncoder(state));
++
++        // ffmpeg's eac3 encoder caps at 5.1; 640 kb/s for a >= 6-channel source.
++        Assert.Equal(6, state.OutputAudioChannels);
++        Assert.Equal(640000, state.OutputAudioBitrate);
++        Assert.True(state.TranscodeReasons.HasFlag(TranscodeReason.AudioCodecNotSupported));
++    }
++
++    [Theory]
++    [InlineData("truehd")]
++    [InlineData("mlp")]
++    public void DoviP7ToP81Fmp4_LosslessDolbySource_ClientWithoutEac3_KeepsAacFallback(string sourceCodec)
++    {
++        using var env = new EnvVarScope("JELLYMESH_DOVI_P7_TO_81", "1");
++        var (helper, state) = AttachAudio("aac,ac3,alac,dts,flac,mp3,opus", sourceCodec, 8);
++
++        Assert.False(helper.PrefersEac3ForDoviP7ToP81Fmp4(state));
++        Assert.Equal("aac", state.OutputAudioCodec);
++    }
++
++    [Theory]
++    [InlineData("ac3", 6)]
++    [InlineData("eac3", 6)]
++    public void DoviP7ToP81Fmp4_Ac3OrEac3Source_StillCopied(string sourceCodec, int channels)
++    {
++        using var env = new EnvVarScope("JELLYMESH_DOVI_P7_TO_81", "1");
++        var (helper, state) = AttachAudio(AndroidTvAudioCodecs, sourceCodec, channels);
++
++        Assert.False(helper.PrefersEac3ForDoviP7ToP81Fmp4(state));
++        Assert.Equal("copy", state.OutputAudioCodec);
++        Assert.False(state.TranscodeReasons.HasFlag(TranscodeReason.AudioCodecNotSupported));
++    }
++
++    [Fact]
++    public void DoviP7ToP81Fmp4_FlagOff_Unchanged()
++    {
++        using var env = new EnvVarScope("JELLYMESH_DOVI_P7_TO_81", null);
++        var (helper, state) = AttachAudio(AndroidTvAudioCodecs, "truehd", 8);
++
++        Assert.False(helper.PrefersEac3ForDoviP7ToP81Fmp4(state));
++        Assert.Equal("aac", state.OutputAudioCodec);
++    }
++
++    [Theory]
++    [InlineData("ts", 8, true)] // TS segments (the client's most-compatible retry): not this job
++    [InlineData("mp4", 2, true)] // 2-channel source: upstream avoids a 2-channel ac3/eac3 transcode
++    [InlineData("mp4", 8, false)] // ffmpeg without the eac3 encoder
++    public void DoviP7ToP81_OutsideScope_KeepsUpstreamPick(string segmentContainer, int channels, bool hasEac3Encoder)
++    {
++        using var env = new EnvVarScope("JELLYMESH_DOVI_P7_TO_81", "1");
++        var (helper, state) = AttachAudio(AndroidTvAudioCodecs, "truehd", channels, segmentContainer, hasEac3Encoder);
++
++        Assert.False(helper.PrefersEac3ForDoviP7ToP81Fmp4(state));
++        Assert.Equal("aac", state.OutputAudioCodec);
++    }
++
++    [Fact]
++    public void DoviP7ToP81Fmp4_NotConverted_KeepsUpstreamPick()
++    {
++        // Client declares DOVIWithEL: the source is copied as-is, no 8.1 conversion.
++        using var env = new EnvVarScope("JELLYMESH_DOVI_P7_TO_81", "1");
++        var (helper, state) = AttachAudio(AndroidTvAudioCodecs, "truehd", 8, rangeTypes: "SDR,HDR10,DOVI,DOVIWithHDR10,DOVIWithEL");
++
++        Assert.False(helper.IsDoviP7ToP81Converted(state));
++        Assert.Equal("aac", state.OutputAudioCodec);
++    }
++
++    /// <summary>
++    /// Runs the audio part of StreamingHelpers.GetStreamingState for an HLS request against a DV
++    /// profile-7 source (video index 0) with one audio stream (index 1): the URL's AudioCodec list
++    /// becomes SupportedAudioCodecs, AttachMediaSourceInfo picks request.AudioCodec, then the
++    /// output codec/channels/bitrate are derived from it and TryStreamCopy decides on a copy.
++    /// The encoder mock answers like MediaEncoder: CanEncodeToAudioCodec is false for eac3 (and
++    /// truehd/mlp are not encodable targets here), SupportsEncoder("eac3") reports detection.
++    /// </summary>
++    private static (EncodingHelper Helper, EncodingJobInfo State) AttachAudio(
++        string audioCodecs,
++        string sourceAudioCodec,
++        int channels,
++        string segmentContainer = "mp4",
++        bool hasEac3Encoder = true,
++        string rangeTypes = "SDR,HDR10,HDR10Plus,HLG,DOVI,DOVIWithHDR10,DOVIWithHLG,DOVIWithSDR,DOVIWithHDR10Plus")
++    {
++        var encoder = new Mock<IMediaEncoder>();
++        encoder.Setup(x => x.SupportsBitStreamFilterWithOption(It.IsAny<BitStreamFilterOptionType>())).Returns(true);
++        encoder.SetupGet(x => x.EncoderVersion).Returns(new Version(8, 1));
++        encoder.Setup(x => x.SupportsEncoder("eac3")).Returns(hasEac3Encoder);
++        encoder.Setup(x => x.SupportsEncoder("libfdk_aac")).Returns(true);
++        encoder.Setup(x => x.CanEncodeToAudioCodec(It.IsAny<string>()))
++            .Returns<string>(c => c is "aac" or "ac3" or "alac" or "dts" or "flac" or "mp3" or "opus");
++        var helper = new EncodingHelper(
++            Mock.Of<IApplicationPaths>(),
++            encoder.Object,
++            Mock.Of<ISubtitleEncoder>(),
++            Mock.Of<IConfiguration>(),
++            Mock.Of<IConfigurationManager>(),
++            Mock.Of<IPathManager>());
++
++        var video = CreateValidDoviWithElState(hdr10Plus: false).VideoStream;
++        video.Index = 0;
++        var audio = new MediaStream
++        {
++            Type = MediaStreamType.Audio,
++            Index = 1,
++            Codec = sourceAudioCodec,
++            Channels = channels,
++            SampleRate = 48000,
++            BitRate = 640000
++        };
++        var request = new VideoRequestDto
++        {
++            VideoStreamIndex = 0,
++            AudioStreamIndex = 1,
++            SegmentContainer = segmentContainer,
++            VideoRangeType = rangeTypes,
++            AudioCodec = audioCodecs,
++            VideoCodec = "hevc",
++            AllowVideoStreamCopy = true,
++            AllowAudioStreamCopy = true,
++            EnableAutoStreamCopy = true
++        };
++        var state = new EncodingJobInfo(TranscodingJobType.Hls)
++        {
++            BaseRequest = request,
++            IsVideoRequest = true,
++            SupportedAudioCodecs = audioCodecs.Split(',')
++        };
++
++        helper.AttachMediaSourceInfo(
++            state,
++            new EncodingOptions(),
++            new MediaSourceInfo { Container = "mkv", Path = "/m/x.mkv", RunTimeTicks = 1, MediaStreams = [video, audio] },
++            "master.m3u8");
++
++        state.OutputAudioCodec = request.AudioCodec;
++        state.OutputAudioChannels = helper.GetNumAudioChannelsParam(state, state.AudioStream, state.OutputAudioCodec);
++        state.OutputAudioBitrate = helper.GetAudioBitrateParam(request.AudioBitRate, request.AudioCodec, state.AudioStream, state.OutputAudioChannels);
++        state.OutputVideoCodec = "hevc";
++        helper.TryStreamCopy(state, new EncodingOptions());
++        return (helper, state);
++    }
++
+     /// <summary>
+     /// Builds a state whose VideoStream is a valid (non-Invalid) DOVIWithEL profile-7 source --
+     /// same recipe as <see cref="GetBitStreamArgs_ValidDovi_PreservesMetadata"/> (bt2020nc/bt2020/

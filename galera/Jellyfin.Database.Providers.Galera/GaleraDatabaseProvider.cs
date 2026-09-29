@@ -14,7 +14,7 @@ namespace Jellyfin.Database.Providers.Galera;
 /// interceptors (see docs/jellymesh-db-options.md for why).
 /// </summary>
 [JellyfinDatabaseProviderKey("Jellyfin-Galera")]
-public sealed class GaleraDatabaseProvider : IJellyfinDatabaseProvider
+public sealed partial class GaleraDatabaseProvider : IJellyfinDatabaseProvider
 {
     private readonly ILogger<GaleraDatabaseProvider> _logger;
 
@@ -55,6 +55,8 @@ public sealed class GaleraDatabaseProvider : IJellyfinDatabaseProvider
                 // Pomelo refuses to translate them. The model's own list columns keep their explicit
                 // JSON converters (GaleraModelConvention), so this changes query translation only.
                 .EnablePrimitiveCollectionsSupport())
+            // /health: CanConnect runs SELECT 1 on the pooled connection, not a new unpooled one per probe.
+            .ReplaceService<Microsoft.EntityFrameworkCore.Storage.IRelationalDatabaseCreator, GaleraDatabaseCreator>()
             .ConfigureWarnings(w => w.Ignore(RelationalEventId.NonTransactionalMigrationOperationWarning)
                 .Ignore(RelationalEventId.MultipleCollectionIncludeWarning));
     }
@@ -127,18 +129,90 @@ public sealed class GaleraDatabaseProvider : IJellyfinDatabaseProvider
     public Task DeleteBackup(string key) => Task.CompletedTask;
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// FOREIGN_KEY_CHECKS is session state. With <c>ConnectionReset=false</c> a pooled connection keeps it
+    /// for its next user, so the checks are switched back on in a finally on the same (explicitly opened)
+    /// connection, and if even that fails the pool is cleared so this session is never handed out again.
+    /// </remarks>
     public async Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames)
     {
+        ArgumentNullException.ThrowIfNull(dbContext);
         ArgumentNullException.ThrowIfNull(tableNames);
-        var sql = "SET FOREIGN_KEY_CHECKS = 0;\n"
-            + string.Join('\n', tableNames.Select(t => $"DELETE FROM `{t}`;"))
-            + "\nSET FOREIGN_KEY_CHECKS = 1;";
-        await dbContext.Database.ExecuteSqlRawAsync(sql).ConfigureAwait(false);
+        var database = dbContext.Database;
+        await database.OpenConnectionAsync().ConfigureAwait(false);
+        try
+        {
+            await PurgeAsync(
+                sql => database.ExecuteSqlRawAsync(sql),
+                tableNames,
+                () => MySqlConnector.MySqlConnection.ClearPool((MySqlConnector.MySqlConnection)database.GetDbConnection())).ConfigureAwait(false);
+        }
+        finally
+        {
+            await database.CloseConnectionAsync().ConfigureAwait(false);
+        }
     }
 
-    private static string RedactPassword(string connectionString) =>
-        string.Join(';', connectionString.Split(';').Select(p =>
-            p.TrimStart().StartsWith("password", StringComparison.OrdinalIgnoreCase) || p.TrimStart().StartsWith("pwd", StringComparison.OrdinalIgnoreCase)
-                ? p[..(p.IndexOf('=') + 1)] + "*****"
-                : p));
+    /// <summary>
+    /// Deletes every row of <paramref name="tableNames"/> with foreign-key checks off, and always turns
+    /// them back on afterwards. All statements must run on one connection.
+    /// </summary>
+    /// <param name="execute">Runs one SQL statement on the connection.</param>
+    /// <param name="tableNames">Tables to empty.</param>
+    /// <param name="discardConnection">Called when the checks could not be restored: the connection must not be reused.</param>
+    /// <returns>A task.</returns>
+    internal static async Task PurgeAsync(Func<string, Task> execute, IEnumerable<string> tableNames, Action discardConnection)
+    {
+        await execute("SET FOREIGN_KEY_CHECKS = 0").ConfigureAwait(false);
+        try
+        {
+            var deletes = string.Join('\n', tableNames.Select(t => $"DELETE FROM `{t}`;"));
+            if (deletes.Length > 0)
+            {
+                await execute(deletes).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            try
+            {
+                await execute("SET FOREIGN_KEY_CHECKS = 1").ConfigureAwait(false);
+            }
+            catch
+            {
+                discardConnection();
+                throw;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Masks the password in a MySQL connection string for logging. Parsed with the connection-string
+    /// builder so a quoted password containing <c>;</c> (<c>Password="a;b"</c>) is masked whole; the
+    /// regex fallback (malformed strings the builder rejects) also treats quoted values as one token.
+    /// </summary>
+    /// <param name="connectionString">Connection string, possibly with a password.</param>
+    /// <returns>The connection string with any password replaced by <c>*****</c>.</returns>
+    internal static string RedactPassword(string connectionString)
+    {
+        try
+        {
+            var builder = new MySqlConnector.MySqlConnectionStringBuilder(connectionString);
+            if (!string.IsNullOrEmpty(builder.Password))
+            {
+                builder.Password = "*****";
+            }
+
+            return builder.ConnectionString;
+        }
+        catch (Exception ex) when (ex is ArgumentException or FormatException or InvalidOperationException)
+        {
+            // Logging must never be what fails startup; a bad value (Port=abc) surfaces at connect.
+            return PasswordPattern().Replace(connectionString, "$1*****");
+        }
+    }
+
+    // key = "double-quoted with "" escapes" | 'single-quoted with '' escapes' | bare to next ';'.
+    [System.Text.RegularExpressions.GeneratedRegex("""((?:^|;)\s*(?:password|pwd)\s*=\s*)(?:"(?:[^"]|"")*"?|'(?:[^']|'')*'?|[^;]*)""", System.Text.RegularExpressions.RegexOptions.IgnoreCase)]
+    private static partial System.Text.RegularExpressions.Regex PasswordPattern();
 }

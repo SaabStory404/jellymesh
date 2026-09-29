@@ -1,0 +1,424 @@
+diff --git a/Jellyfin.Api/Controllers/DynamicHlsController.cs b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+index 5a0a3644f..8a7716c98 100644
+--- a/Jellyfin.Api/Controllers/DynamicHlsController.cs
++++ b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+@@ -1448,6 +1448,15 @@ public class DynamicHlsController : BaseJellyfinApiController
+         var cancellationTokenSource = new CancellationTokenSource();
+         var cancellationToken = cancellationTokenSource.Token;
+ 
++        // The playlist lock and the segment wait loop below can otherwise poll for the full
++        // remaining transcode duration even after the client that made this request is gone,
++        // holding the per-playlist lock and making the client's own retry queue behind it.
++        // Link a request-scoped token so those two waits exit as soon as the request is aborted,
++        // without touching cancellationTokenSource itself (that CTS is handed to StartFfMpeg
++        // below and becomes the transcoding job's own CancellationTokenSource).
++        using var linkedCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, HttpContext.RequestAborted);
++        var linkedCancellationToken = linkedCancellationTokenSource.Token;
++
+         var state = await StreamingHelpers.GetStreamingState(
+                 streamingRequest,
+                 HttpContext,
+@@ -1470,7 +1479,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+ 
+         // Keep segment selection and transcoding replacement under the same playlist lock.
+         // An out-of-order request must not replace a job while another request is using its output.
+-        using (await _transcodeManager.LockAsync(playlistPath, cancellationToken).ConfigureAwait(false))
++        using (await _transcodeManager.LockAsync(playlistPath, linkedCancellationToken).ConfigureAwait(false))
+         {
+             TranscodingJob? job;
+             var startTranscoding = false;
+@@ -1478,7 +1487,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+             {
+                 job = _transcodeManager.OnTranscodeBeginRequest(playlistPath, TranscodingJobType);
+                 _logger.LogDebug("returning {0} [it exists]", segmentPath);
+-                return await GetSegmentResult(state, playlistPath, segmentPath, segmentExtension, segmentId, job, cancellationToken).ConfigureAwait(false);
++                return await GetSegmentResult(state, playlistPath, segmentPath, segmentExtension, segmentId, job, linkedCancellationToken).ConfigureAwait(false);
+             }
+ 
+             var currentTranscodingIndex = GetCurrentTranscodingIndex(playlistPath, segmentExtension);
+@@ -1512,7 +1521,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+                 try
+                 {
+                     var currentJob = _transcodeManager.GetTranscodingJob(playlistPath, TranscodingJobType);
+-                    await WaitForActiveTranscodingRequests(currentJob, cancellationToken).ConfigureAwait(false);
++                    await WaitForActiveTranscodingRequests(currentJob, linkedCancellationToken).ConfigureAwait(false);
+ 
+                     // No job is tracked on this node for this playlist. In a deployment where
+                     // several nodes share one transcode directory (see JellyMesh's shared-mode
+@@ -1536,10 +1545,10 @@ public class DynamicHlsController : BaseJellyfinApiController
+                         {
+                             var nextSegmentPath = GetSegmentPath(state, playlistPath, segmentId + 1);
+                             var waitForOtherWriterTimeout = TimeSpan.FromSeconds(Math.Max(state.SegmentLength * 3, 15));
+-                            if (await WaitForSegmentFromOtherWriter(segmentPath, nextSegmentPath, waitForOtherWriterTimeout, cancellationToken).ConfigureAwait(false))
++                            if (await WaitForSegmentFromOtherWriter(segmentPath, nextSegmentPath, waitForOtherWriterTimeout, linkedCancellationToken).ConfigureAwait(false))
+                             {
+                                 _logger.LogDebug("returning {0} [produced by an active transcode elsewhere on the shared output path]", segmentPath);
+-                                return await GetSegmentResult(state, playlistPath, segmentPath, segmentExtension, segmentId, null, cancellationToken).ConfigureAwait(false);
++                                return await GetSegmentResult(state, playlistPath, segmentPath, segmentExtension, segmentId, null, linkedCancellationToken).ConfigureAwait(false);
+                             }
+ 
+                             _logger.LogDebug("No active writer found for {0} after waiting; starting a new transcode", playlistPath);
+@@ -1584,7 +1593,7 @@ public class DynamicHlsController : BaseJellyfinApiController
+ 
+             _logger.LogDebug("returning {0} [general case]", segmentPath);
+             job ??= _transcodeManager.OnTranscodeBeginRequest(playlistPath, TranscodingJobType);
+-            return await GetSegmentResult(state, playlistPath, segmentPath, segmentExtension, segmentId, job, cancellationToken).ConfigureAwait(false);
++            return await GetSegmentResult(state, playlistPath, segmentPath, segmentExtension, segmentId, job, linkedCancellationToken).ConfigureAwait(false);
+         }
+     }
+ 
+@@ -2017,7 +2026,10 @@ public class DynamicHlsController : BaseJellyfinApiController
+         return Path.Combine(folder, filename + index.ToString(CultureInfo.InvariantCulture) + EncodingHelper.GetSegmentFileExtension(state.Request.SegmentContainer));
+     }
+ 
+-    private async Task<ActionResult> GetSegmentResult(
++    // internal (not private) so the request-abort wait-loop-exit and job-slot-release behavior
++    // added below can be driven directly by DynamicHlsControllerTests via InternalsVisibleTo,
++    // without duplicating GetDynamicSegment's own dependency wiring in the test.
++    internal async Task<ActionResult> GetSegmentResult(
+         StreamState state,
+         string playlistPath,
+         string segmentPath,
+@@ -2049,40 +2061,57 @@ public class DynamicHlsController : BaseJellyfinApiController
+         var nextSegmentPath = GetSegmentPath(state, playlistPath, segmentIndex + 1);
+         if (transcodingJob is not null)
+         {
+-            while (!cancellationToken.IsCancellationRequested && !transcodingJob.HasExited)
++            try
+             {
+-                // To be considered ready, the segment file has to exist AND
+-                // either the transcoding job should be done or next segment should also exist
+-                if (segmentExists)
++                while (!cancellationToken.IsCancellationRequested && !transcodingJob.HasExited)
+                 {
+-                    if (transcodingJob.HasExited || System.IO.File.Exists(nextSegmentPath))
++                    // To be considered ready, the segment file has to exist AND
++                    // either the transcoding job should be done or next segment should also exist
++                    if (segmentExists)
+                     {
+-                        _logger.LogDebug("Serving up {SegmentPath} as it deemed ready", segmentPath);
+-                        return GetSegmentResult(state, segmentPath, transcodingJob);
++                        if (transcodingJob.HasExited || System.IO.File.Exists(nextSegmentPath))
++                        {
++                            _logger.LogDebug("Serving up {SegmentPath} as it deemed ready", segmentPath);
++                            return GetSegmentResult(state, segmentPath, transcodingJob);
++                        }
+                     }
+-                }
+-                else
+-                {
+-                    segmentExists = System.IO.File.Exists(segmentPath);
+-                    if (segmentExists)
++                    else
+                     {
+-                        continue; // avoid unnecessary waiting if segment just became available
++                        segmentExists = System.IO.File.Exists(segmentPath);
++                        if (segmentExists)
++                        {
++                            continue; // avoid unnecessary waiting if segment just became available
++                        }
+                     }
++
++                    await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+                 }
+ 
+-                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+-            }
++                if (!System.IO.File.Exists(segmentPath))
++                {
++                    _logger.LogWarning("cannot serve {0} as transcoding quit before we got there", segmentPath);
++                }
++                else
++                {
++                    _logger.LogDebug("serving {0} as it's on disk and transcoding stopped", segmentPath);
++                }
+ 
+-            if (!System.IO.File.Exists(segmentPath))
+-            {
+-                _logger.LogWarning("cannot serve {0} as transcoding quit before we got there", segmentPath);
++                cancellationToken.ThrowIfCancellationRequested();
+             }
+-            else
++            catch (OperationCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
+             {
+-                _logger.LogDebug("serving {0} as it's on disk and transcoding stopped", segmentPath);
++                // The normal completion path below registers Response.OnCompleted, which is what
++                // calls OnTranscodeEndRequest to release this request's slot on the job. Cancelling
++                // out of the wait loop via the newly-linked RequestAborted skips that registration
++                // entirely, so without this the job's ActiveRequestCount would never be decremented
++                // and a later request for the same playlist could hang in
++                // WaitForActiveTranscodingRequests waiting for a count that will never drop back to
++                // zero. Scoped to only the request-abort case (the `when` filter) so the pre-existing
++                // kill-timer cancellation path -- which already unregisters the job -- is untouched
++                // and stays byte-identical to bh-base.
++                _transcodeManager.OnTranscodeEndRequest(transcodingJob);
++                throw;
+             }
+-
+-            cancellationToken.ThrowIfCancellationRequested();
+         }
+         else
+         {
+diff --git a/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerSegmentWaitTests.cs b/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerSegmentWaitTests.cs
+new file mode 100644
+index 000000000..a85c5a854
+--- /dev/null
++++ b/tests/Jellyfin.Api.Tests/Controllers/DynamicHlsControllerSegmentWaitTests.cs
+@@ -0,0 +1,257 @@
++using System;
++using System.Diagnostics;
++using System.IO;
++using System.Threading;
++using System.Threading.Tasks;
++using Jellyfin.Api.Controllers;
++using Jellyfin.Api.Helpers;
++using Jellyfin.MediaEncoding.Hls.Playlist;
++using MediaBrowser.Controller.Configuration;
++using MediaBrowser.Controller.Library;
++using MediaBrowser.Controller.MediaEncoding;
++using MediaBrowser.Controller.Streaming;
++using MediaBrowser.Model.Configuration;
++using MediaBrowser.Model.IO;
++using Microsoft.AspNetCore.Http;
++using Microsoft.AspNetCore.Mvc;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.Api.Tests.Controllers
++{
++    public class DynamicHlsControllerSegmentWaitTests
++    {
++        // Builds a real DynamicHlsController (not a test double) so GetSegmentResult below drives
++        // the actual production wait loop and abort-handling logic, not a reimplementation of it.
++        // Every dependency besides ITranscodeManager is unused by GetSegmentResult's code path and
++        // is stubbed out minimally.
++        private static DynamicHlsController CreateController(Mock<ITranscodeManager> transcodeManager, CancellationToken requestAborted)
++        {
++            var serverConfigurationManager = new Mock<IServerConfigurationManager>();
++            serverConfigurationManager.Setup(s => s.GetConfiguration("encoding"))
++                .Returns(new EncodingOptions());
++
++            var controller = new DynamicHlsController(
++                Mock.Of<ILibraryManager>(),
++                Mock.Of<IUserManager>(),
++                Mock.Of<IMediaSourceManager>(),
++                serverConfigurationManager.Object,
++                Mock.Of<IMediaEncoder>(),
++                Mock.Of<IFileSystem>(),
++                transcodeManager.Object,
++                NullLogger<DynamicHlsController>.Instance,
++                null!,
++                null!,
++                Mock.Of<IDynamicHlsPlaylistGenerator>());
++
++            controller.ControllerContext = new ControllerContext
++            {
++                HttpContext = new DefaultHttpContext { RequestAborted = requestAborted }
++            };
++
++            return controller;
++        }
++
++        [Theory]
++        [MemberData(nameof(GetSegmentLengths_Success_TestData))]
++        public void GetSegmentLengths_Success(long runtimeTicks, int segmentlength, double[] expected)
++        {
++            var res = DynamicHlsController.GetSegmentLengthsInternal(runtimeTicks, segmentlength);
++            Assert.Equal(expected.Length, res.Length);
++            for (int i = 0; i < expected.Length; i++)
++            {
++                Assert.Equal(expected[i], res[i]);
++            }
++        }
++
++        public static TheoryData<long, int, double[]> GetSegmentLengths_Success_TestData()
++        {
++            var data = new TheoryData<long, int, double[]>();
++            data.Add(0, 6, Array.Empty<double>());
++            data.Add(
++                TimeSpan.FromSeconds(3).Ticks,
++                6,
++                new double[] { 3 });
++            data.Add(
++                TimeSpan.FromSeconds(6).Ticks,
++                6,
++                new double[] { 6 });
++            data.Add(
++                TimeSpan.FromSeconds(3.3333333).Ticks,
++                6,
++                new double[] { 3.3333333 });
++            data.Add(
++                TimeSpan.FromSeconds(9.3333333).Ticks,
++                6,
++                new double[] { 6, 3.3333333 });
++
++            return data;
++        }
++
++        [Fact]
++        public async Task WaitForActiveTranscodingRequests_WaitsUntilRequestCompletes()
++        {
++            var job = new TranscodingJob(NullLogger<TranscodingJob>.Instance)
++            {
++                ActiveRequestCount = 1
++            };
++
++            var waitTask = DynamicHlsController.WaitForActiveTranscodingRequests(job, CancellationToken.None);
++            Assert.False(waitTask.IsCompleted);
++
++            job.DecrementActiveRequestCount();
++
++            await waitTask;
++        }
++
++        [Fact]
++        public async Task WaitForActiveTranscodingRequests_WaitsForEveryRequest()
++        {
++            var job = new TranscodingJob(NullLogger<TranscodingJob>.Instance)
++            {
++                ActiveRequestCount = 2
++            };
++
++            var waitTask = DynamicHlsController.WaitForActiveTranscodingRequests(job, CancellationToken.None);
++            job.DecrementActiveRequestCount();
++
++            await Task.Delay(150, TestContext.Current.CancellationToken);
++            Assert.False(waitTask.IsCompleted);
++
++            job.DecrementActiveRequestCount();
++
++            await waitTask;
++        }
++
++        [Fact]
++        public async Task WaitForActiveTranscodingRequests_ReturnsWithoutAnActiveRequest()
++        {
++            var job = new TranscodingJob(NullLogger<TranscodingJob>.Instance);
++
++            await DynamicHlsController.WaitForActiveTranscodingRequests(job, CancellationToken.None);
++            await DynamicHlsController.WaitForActiveTranscodingRequests(null, CancellationToken.None);
++        }
++
++        [Fact]
++        public async Task WaitForActiveTranscodingRequests_ObservesCancellation()
++        {
++            var job = new TranscodingJob(NullLogger<TranscodingJob>.Instance)
++            {
++                ActiveRequestCount = 1
++            };
++            using var cancellationTokenSource = new CancellationTokenSource();
++
++            var waitTask = DynamicHlsController.WaitForActiveTranscodingRequests(job, cancellationTokenSource.Token);
++            await cancellationTokenSource.CancelAsync();
++
++            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waitTask);
++        }
++
++        [Fact]
++        public async Task WaitForActiveTranscodingRequests_ExitsOnRequestAbortWithoutCancellingJobToken()
++        {
++            // Demonstrates the generic .NET CreateLinkedTokenSource composition GetDynamicSegment
++            // relies on (a job-lifetime token, standing in for the CTS handed to StartFfMpeg /
++            // job.CancellationTokenSource, linked with a separate token standing in for
++            // HttpContext.RequestAborted) using the pre-existing, unmodified
++            // WaitForActiveTranscodingRequests helper. This is NOT a regression guard for
++            // GetDynamicSegment's own CreateLinkedTokenSource wiring: it passes unchanged even with
++            // the controller reverted to bh-base, since it never calls into GetDynamicSegment and
++            // WaitForActiveTranscodingRequests itself already honored whatever token it was given.
++            // That wiring is verified by code reading only (see report).
++            var job = new TranscodingJob(NullLogger<TranscodingJob>.Instance)
++            {
++                ActiveRequestCount = 1
++            };
++            using var jobCancellationTokenSource = new CancellationTokenSource();
++            using var requestAbortedTokenSource = new CancellationTokenSource();
++            using var linkedCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
++                jobCancellationTokenSource.Token,
++                requestAbortedTokenSource.Token);
++
++            var waitTask = DynamicHlsController.WaitForActiveTranscodingRequests(job, linkedCancellationTokenSource.Token);
++            var stopwatch = Stopwatch.StartNew();
++
++            await requestAbortedTokenSource.CancelAsync();
++
++            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waitTask);
++            Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(1));
++
++            // The request aborting must not cancel the job-lifetime token: other code (the kill
++            // timer, KillTranscodingJobs) depends on that token representing the ffmpeg process's
++            // own lifetime rather than any one caller's connection.
++            Assert.False(jobCancellationTokenSource.IsCancellationRequested);
++        }
++
++        [Fact]
++        public async Task GetSegmentResult_RequestAborted_ExitsWaitLoopAndReleasesJobSlot()
++        {
++            // Regression test for GetSegmentResult's catch (OperationCanceledException) when
++            // (HttpContext.RequestAborted.IsCancellationRequested) branch (the ActiveRequestCount
++            // leak fix), which had zero coverage. Drives the actual (internal, not reimplemented)
++            // GetSegmentResult through a real DynamicHlsController whose HttpContext.RequestAborted
++            // is set to the token passed in, so the `when` filter observes an abort exactly as it
++            // would via GetDynamicSegment's linked token. The wait loop itself exits via whatever
++            // cancellationToken it is given regardless of this fix (that part is unconditional
++            // .NET CreateLinkedTokenSource/Task.Delay behavior, not new), so this test's actual
++            // regression coverage is the Verify below: reverting just the catch/decrement block
++            // (confirmed empirically against a scratch copy) leaves the wait loop exiting exactly
++            // the same way but OnTranscodeEndRequest never called, and Times.Once fails.
++            //
++            // This test does NOT cover GetDynamicSegment's own CreateLinkedTokenSource wiring (the
++            // LockAsync wait / WaitForActiveTranscodingRequests half of the finding) -- calling
++            // GetDynamicSegment itself requires StreamingHelpers.GetStreamingState's full
++            // mediaSource/user/library/encoding dependency graph, which was judged too costly to
++            // stand up for this scope. That half is verified by code reading only (see report).
++            var transcodeManager = new Mock<ITranscodeManager>();
++            using var requestAbortedSource = new CancellationTokenSource();
++            var controller = CreateController(transcodeManager, requestAbortedSource.Token);
++
++            // Not disposed: StreamState.Dispose reads the (unset, EncodingJobInfo-base) MediaSource
++            // property, which is unrelated to this test and would need a further unused stub.
++            var state = new StreamState(Mock.Of<IMediaSourceManager>(), TranscodingJobType.Hls, transcodeManager.Object)
++            {
++                Request = new StreamingRequestDto { SegmentContainer = "ts" }
++            };
++            var job = new TranscodingJob(NullLogger<TranscodingJob>.Instance) { HasExited = false };
++            var missingSegmentPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".ts");
++
++            var resultTask = controller.GetSegmentResult(
++                state,
++                "playlist.m3u8",
++                missingSegmentPath,
++                "ts",
++                0,
++                job,
++                requestAbortedSource.Token);
++
++            var stopwatch = Stopwatch.StartNew();
++
++            await requestAbortedSource.CancelAsync();
++
++            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => resultTask);
++            Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(1));
++
++            // Without the fix's catch-and-decrement, an abort exits the wait loop without ever
++            // calling OnTranscodeEndRequest (that call normally only happens via the
++            // Response.OnCompleted callback registered by the non-throwing completion path below,
++            // which a thrown exception skips) -- leaking the slot this request holds and hanging a
++            // later request to the same playlist in WaitForActiveTranscodingRequests.
++            transcodeManager.Verify(t => t.OnTranscodeEndRequest(job), Times.Once);
++        }
++
++        [Fact]
++        public async Task ActiveRequestCount_UpdatesAtomically()
++        {
++            const int RequestCount = 1000;
++            var job = new TranscodingJob(NullLogger<TranscodingJob>.Instance);
++
++            await Task.WhenAll(
++                Task.Run(() => Parallel.For(0, RequestCount, _ => job.IncrementActiveRequestCount())),
++                Task.Run(() => Parallel.For(0, RequestCount, _ => job.DecrementActiveRequestCount())));
++
++            Assert.Equal(0, job.ActiveRequestCount);
++        }
++    }
++}

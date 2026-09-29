@@ -1,0 +1,20 @@
+# jellymesh-jellyfin 12.1-jm5: jm4 + the Rust transcode-pool shim as Jellyfin's ffmpeg.
+#
+# CONTRACT.md method 1 (bake): hotio hard-codes ffmpeg at /usr/lib/jellyfin-ffmpeg/ffmpeg and
+# passes it to Jellyfin as --ffmpeg=, so EncoderAppPath cannot redirect it. The real binary moves
+# to ffmpeg.real (the shim's TC_FFMPEG_REAL default); every non-HLS call and every fallback execs it.
+#
+# Inert unless configured: with TC_WORKERS_DNS / TC_WORKERS unset the shim finds no workers and
+# execs ffmpeg.real locally, so this image is a drop-in for pods that are not on the pool.
+#
+# Build context = transcode/target/x86_64-unknown-linux-musl/release (static musl binaries from
+# transcode/deploy/build-musl.sh, built from a committed SHA):
+#   podman build -f image/Containerfile.jm5 -t ghcr.io/saabstory404/jellymesh-jellyfin:12.1-jm5 \
+#     transcode/target/x86_64-unknown-linux-musl/release
+FROM ghcr.io/saabstory404/jellymesh-jellyfin:12.1-jm4@sha256:54061b47aeb7421ab282c5ddad47468c47c1e302455030be27c3d69288c2878c
+RUN mv /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/lib/jellyfin-ffmpeg/ffmpeg.real \
+ && rm -f /opt/jellymesh/transcode/*.py
+COPY tcpool-shim /usr/lib/jellyfin-ffmpeg/ffmpeg
+COPY tcpool-sync /usr/local/bin/tcpool-sync
+LABEL org.opencontainers.image.source="https://github.com/SaabStory404/jellymesh" \
+      org.opencontainers.image.description="Jellyfin 12.1 + JellyMesh (shared-database HA) + transcode-pool shim"

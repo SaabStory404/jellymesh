@@ -152,6 +152,118 @@ which is P4's measurement, not P0's.
 
 <!--QUALITY-->
 
+## P5 applied: calibrated rate control in `render()` (2026-09-27)
+
+`render()` now maps Jellyfin's `-crf N -maxrate cap -bufsize 2cap` per encoder
+(`crates/ir/src/lib.rs` `apply_rate_control`; agent `TC_RC=legacy` restores the P1 mapping):
+
+| encoder | rate control | preset |
+|---|---|---|
+| `h264_qsv` | `-b:v 0.95*cap -extbrc 1`, Jellyfin's `-maxrate`/`-bufsize` kept | `medium` |
+| `hevc_qsv` | same + `-look_ahead_depth 40 -b_strategy 1` | `medium` |
+| `h264_nvenc` | `-b:v 0.90*cap -rc vbr -tune hq -multipass fullres -b_ref_mode middle` | `p5` |
+| `hevc_nvenc` | `-b:v 0.90*cap -rc vbr -tune hq -multipass fullres` | `p5` |
+| CPU, stream copy, no `-maxrate`, AV1 | unchanged | |
+
+Two changes from the P0 recommendation above, both MEASURED in this run:
+- **NVENC targets 90% of the cap, not 95% (pool-r1, 2026-09-28).** MEASURED (P5.1 lab, sample-b,
+  P4): NVENC delivers 7-9% above its `-b:v` (8183 kbps for 7600, 6492 for 6080, 4587 for 4275),
+  so 95% of a binding 4M cap came out at 99.7-101.3% of it; 90% delivered 96.5-98.4%. The Arc
+  stays at 95% (94-97% delivered, never over). pool-r1 cap check (MEASURED 2026-09-28, both cards,
+  2160p-class sources -> 1080p h264/hevc, 20 s): 4M cap Arc 94.1-96.1%, P4 93.5-98.4%; 60M cap Arc
+  93.0-95.7%, P4 81.1-82.6%; never over. Raw rows: `2026-09-28-pool-r1.csv`.
+- **No `-cq` hybrid on NVENC.** `-rc vbr -cq 23/28 -b:v 0.95cap` behaves like the old `-cq`: it
+  stops at its quality target, delivering **49–60% of the cap at 15M (h264) and 25–55% at 8M/15M
+  (hevc)**. Rejected.
+- **No `-spatial-aq`/`-temporal-aq` on NVENC.** With AQ the P4 scored 0.7–1.8 VMAF lower at the
+  same bitrate on sample-b and missed ±1.5 against the Arc there (h264 3M **+2.66**, hevc 8M/15M
+  **+1.93/+1.92**). Without AQ every sample-b rung is within ±1.26.
+
+### Method
+
+Same excerpt, reference and metric as P0 (20 s from t=1200 s, 1920 wide, video only; reference =
+Jellyfin's CPU chain with lanczos, x264 `-crf 8 -preset medium`, `tonemapx` for sample-c; libvmaf
+`vmaf_v0.6.1` + PSNR-Y + float SSIM, `setpts=PTS-STARTPTS` on both, `shortest=1:repeatlast=0`).
+Differences: each encode's argv is the output of the real `render()` (a small CLI over `tcpool_ir`)
+applied to Jellyfin's software command from `corpus/lab-sw.tsv` with the rung's `-maxrate`/`-bufsize`,
+run with jellyfin-ffmpeg 8.1.2 directly on the lab workers (`tc-worker-qsv`, `tc-worker-nv`; references
+on `tc-worker-cpu`), no agent redeploy. Scoring ran on the workstation (ffmpeg with libvmaf, AVX2).
+Delivered bitrate = sum of video packet sizes / 20 s (the legacy Arc rows reproduce P0 exactly:
+1202.8 kbps sample-a h264). Raw rows: `2026-09-27-p5.csv`.
+
+**Sample-a gap.** Sample-a's lab mount went stale mid-run (the source was removed from the library),
+after the Arc rows, the P4 AQ/hybrid/92% rows and the reference were done but before the shipped
+no-AQ P4 set ran. So the **P4 sample-a rows for the shipped config are UNMEASURED**; the nearest
+measured proxy is the AQ variant (Arc − P4: h264 +1.26/+0.60/+0.33, hevc +1.07/+0.71/+0.52 at
+3/8/15M). On sample-b, dropping AQ raised the P4 by 0.8–1.8 VMAF, so the true sample-a gap is
+likely smaller, but that is inferred, not measured.
+
+### Cross-card consistency (target ±1.5 VMAF per rung)
+
+Arc = calibrated QSV, P4 = calibrated NVENC as shipped (no AQ). VMAF mean / PSNR-Y dB / SSIM.
+
+| codec | title | cap | Arc % of cap | Arc VMAF / PSNR / SSIM | P4 % of cap | P4 VMAF / PSNR / SSIM | Arc − P4 | ±1.5 |
+|---|---|---|---|---|---|---|---|---|
+| h264 | sample-b | 3M | 94.1 | 87.29 / 42.27 / 0.9853 | 100.1 | 86.47 / 42.10 / 0.9841 | +0.82 | pass |
+| h264 | sample-b | 8M | 94.4 | 89.80 / 43.02 / 0.9891 | 100.7 | 89.71 / 42.98 / 0.9891 | +0.09 | pass |
+| h264 | sample-b | 15M | 94.5 | 91.65 / 43.98 / 0.9923 | 101.2 | 91.68 / 43.95 / 0.9927 | −0.03 | pass |
+| hevc | sample-b | 3M | 94.1 | 88.55 / 42.61 / 0.9870 | 102.2 | 87.87 / 42.54 / 0.9870 | +0.68 | pass |
+| hevc | sample-b | 8M | 94.5 | 91.06 / 43.55 / 0.9913 | 100.4 | 90.05 / 43.40 / 0.9910 | +1.01 | pass |
+| hevc | sample-b | 15M | 94.7 | 92.72 / 44.61 / 0.9943 | 100.2 | 91.46 / 44.36 / 0.9937 | +1.26 | pass |
+| h264 | sample-a | 3/8/15M | 96.4 / 96.3 / 96.5 | 95.43 / 97.27 / 97.98 | — | unmeasured (see above) | — | open |
+| hevc | sample-a | 3/8/15M | 96.3 / 96.6 / 96.5 | 96.16 / 97.61 / 98.10 | — | unmeasured | — | open |
+| h264 | sample-c (HDR→SDR) | 3M | 95.8 | 90.94 / 33.72 / 0.9848 | 96.0 | 93.72 / 41.22 / 0.9924 | −2.78 | fail (tone map) |
+| h264 | sample-c | 8M | 96.0 | 92.87 / 33.79 / 0.9866 | 98.5 | 95.62 / 41.85 / 0.9942 | −2.75 | fail (tone map) |
+| h264 | sample-c | 15M | 96.0 | 93.77 / 33.82 / 0.9876 | 97.9 | 96.61 / 42.44 / 0.9954 | −2.83 | fail (tone map) |
+| hevc | sample-c | 3M | 95.1 | 91.97 / 33.55 / 0.9852 | 95.7 | 94.65 / 41.33 / 0.9931 | −2.68 | fail (tone map) |
+| hevc | sample-c | 8M | 95.9 | 93.48 / 33.65 / 0.9868 | 93.7 | 95.84 / 41.91 / 0.9946 | −2.36 | fail (tone map) |
+| hevc | sample-c | 15M | 95.9 | 94.20 / 33.73 / 0.9878 | 94.3 | 96.48 / 42.42 / 0.9954 | −2.28 | fail (tone map) |
+
+Sample-c's gap is not rate control: at the same delivered bitrate the Arc's PSNR-Y is ~8 dB below
+the P4's at every rung, which is the `tonemap_vaapi` vs `tonemap_cuda` difference P0 already
+isolated (tone-map floors 95.55 vs 97.81). It is the §4.4 tone-map item's opening number. Sample-c
+was scored over 473 paired frames, and two tail frames (469, 471) score 0.0 in every row (identical
+offset for every encode, ~0.4 off each mean).
+
+### Delivered bitrate (target: within 10% of the cap)
+
+| card | range over 3 titles x 2 codecs x 3 rungs | over the cap? |
+|---|---|---|
+| Arc, calibrated | **94.1–96.6%** | never |
+| P4, calibrated (no AQ; sample-a from the AQ run) | **93.7–102.4%** | yes, up to +2.4% (h264 3M) |
+| Arc, legacy (`-global_quality`, today) | 7.4–22.4% at 8M | — |
+| P4, legacy (`-cq`, today) | h264 96–100%, hevc 35–47% at 8M | — |
+
+The P4 overshoot is VBV/multipass behaviour at the low rung, not the target fraction: a 92% target
+delivered the identical 3073 kbps at sample-a h264 3M. Inside the ±10% gate, but a 2% overshoot of a
+client's cap is the wrong direction; revisit if a client is seen to stall on it.
+
+### Better than today's prod QSV at equal bitrate
+
+Arc calibrated at a cap equal to what the legacy mapping delivered (legacy is cap-blind, so its 8M
+row is its only operating point):
+
+| codec | title | legacy kbps / VMAF | calibrated kbps / VMAF | Δ VMAF |
+|---|---|---|---|---|
+| h264 | sample-a | 1203 / 91.35 | 1208 / 92.18 | **+0.83** |
+| hevc | sample-a | 885 / 91.31 | 886 / 92.26 | **+0.94** |
+| h264 | sample-b | 844 / 81.39 | 822 / 82.48 | **+1.09** |
+| hevc | sample-b | 593 / 82.08 | 578 / 83.56 | **+1.49** |
+| h264 | sample-c | 1793 / 88.13 | 1787 / 89.57 | **+1.45** |
+| hevc | sample-c | 1185 / 88.69 | 1171 / 89.95 | **+1.26** |
+
+At the same 8M cap the Arc goes from 81.4–91.4 to 89.8–97.6 VMAF; that larger gain is cap
+utilisation, the table above is the encoder-efficiency part.
+
+**Trade on the P4:** h264 at 8M gives up ~0.5 VMAF against today's `-cq 23` at equal bitrate
+(sample-b 89.71 vs 90.19), in exchange for tracking the cap at 15M and for HEVC, where `-cq 28`
+delivered 35–47% of an 8M cap. The CPU worker is unchanged (Jellyfin's own x264 `-crf 23 veryfast`
++ VBV): 1.6–2.2 Mbps at an 8M cap, VMAF 91.25 / 84.28 / 90.62 (a/b/c) — it is a fallback, not a
+playback tier (P0: 0.18–0.59x realtime at `slow`).
+
+Not re-measured here: throughput/concurrency at `medium`/`p5` (single-job cost is P0's, INHERITED),
+preset scaling, HEVC 10-bit.
+
 
 ## Startup latency
 

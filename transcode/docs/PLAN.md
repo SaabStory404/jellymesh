@@ -107,8 +107,7 @@ gRPC with mTLS, certificates from the existing step-ca (`60-step-ca.yaml`).
    - Among the top two candidates, pick with probability proportional to score (power-of-two choices). This avoids a stampede when both Jellyfin replicas choose at once.
 3. **Priority classes.**
    - `playback` (HLS for a viewer) always wins.
-   - `batch` (trickplay, keyframe extraction, and progressive/download transcodes, which have no restart primitive) goes to the pool only when there's headroom, at low priority, and may be preempted. Preemption hands the job back to Jellyfin as a retryable failure; batch jobs have no viewer.
-   - Today batch jobs run on the Jellyfin pod's CPU.
+   - `batch` (trickplay, keyframe extraction, and progressive/download transcodes, which have no restart primitive) goes to the pool only when there's headroom, at low priority, and may be preempted. A pool failure -- preempted, a lost worker, or a plain non-zero exit, not just a preemption -- hands the job back to Jellyfin as a retryable failure once a first frame exists; before that the shim reruns locally and Jellyfin never sees a failure. Landed for trickplay only (§10 P2); keyframe extraction and progressive/download transcodes are out of scope for this pass (see §10).
 4. **Degrade instead of stall (N+1 policy).** When a card is lost and the survivors are over capacity, re-admitted and new playback jobs get an "emergency" render: fastest preset, GPU chain only. That buys throughput at a small quality cost, so viewers don't stutter. A pool gauge and alert show when the pool is running degraded. When capacity returns, new jobs go back to normal quality automatically.
 
 ## 4. Quality
@@ -193,6 +192,10 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
 - [x] Shim overhead 0.33 ms vs 71 ms for Python (MEASURED)
 - [x] Protocol suite 14/14 on native binaries, locally and in CI (`tcpool` job)
 - [x] Per-output lease with follow-then-take-over (multi-replica Jellyfin)
+- [x] Shared transcode dir across Jellyfin replicas (docs/SHARED-TRANSCODE.md): jobs detach from a dead
+      replica's shim and keep writing, agent heartbeats the lease, takeover on a seek, session keepalive
+      for the kill timer (bughunt patch 16; numbered 14 before the jm7.1 rebase). jm-lab 2026-09-28: pod delete / kill -9 of the serving
+      replica with 3 sessions -> 0 failed, 0 slow, no new ffmpeg; suite case 21
 - [x] Native binaries serving tc-lab (2026-09-27): playback 0 failed requests; graceful pod delete of the
       serving Arc mid-4K-HDR → agent drained in 0.9 s, Jellyfin resumed at segment 22 on the new pod,
       0 failed requests, lowest buffer 1.3 s
@@ -206,9 +209,63 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
 - [x] Command allowlist (134 real commands pass, 11 attacks rejected) — case 13
 - [x] mTLS (pool CA, client certs required, drain on cert rotation, plaintext health port) — case 14
 - [x] Metrics: agent :9903, sync :9904; alert rules `transcode/deploy/alerts.yaml` (sub A, merged)
-- [~] Fuzzing + property tests + bypass hunt (sub B, branch `tcpool-fuzz`)
+- [x] Fuzzing + property tests + bypass hunt (branch `p2-fuzz`; no `tcpool-fuzz` branch existed on
+      origin to merge from -- checked and confirmed absent). 4 cargo-fuzz targets (`validate`,
+      `render`, `filters`, `trickplay`) over the IR parser/validator/renderer, each run 10 min
+      (4 parallel workers, `-timeout=10`) against the existing seed corpus: 13.1M/2.5M/3.0M/7.9M
+      total execs, 0 crashes/timeouts/OOMs, coverage converged (cov 454/1147/787/496 edges). Added
+      a small hand-crafted `trickplay` seed corpus (4 files, ~200 B) -- none existed before; the
+      libFuzzer-grown corpora (11 MB minimized via `cargo fuzz cmin`, 213 MB raw) were both over
+      the size bar and, in the minimized case, dropped all 529 original hand-curated seeds as
+      redundant, so neither was committed; the original committed corpus is unchanged. CI gets a
+      separate `fuzz-smoke` job in `transcode.yml` (nightly toolchain, cached `cargo-fuzz`, each
+      target 60 s against the committed corpus, fails the job on any crash). Property tests
+      (`crates/ir/tests/properties.rs`, 4 cases) and the allowlist/bypass suite already existed
+      and are green under `cargo test --locked`
 - [~] cert-manager certs, DaemonSets per GPU label, headless-Service DNS discovery, PDBs, JellyMesh contract (sub C)
-- [ ] Batch/priority class (decision 3): route trickplay/keyframe jobs to the pool at low priority. Needs workers to write Jellyfin's trickplay dir
+- [x] Batch/priority class (decision 3), trickplay only: routes at `Priority::Batch` behind `TC_BATCH=1` (unset by
+      default, so this ships dark). Keyframe extraction needs no pool routing -- Jellyfin never spawns `ffmpeg`
+      for it. Progressive/download transcodes are deferred, no restart primitive to build the preemption
+      contract on yet (out of scope, A8). `TC_TRICKPLAY_OUTPUT_ROOT` is Jellyfin's `TempDirectory`, not the
+      final sprite-sheet directory Jellyfin later reads from -- the two are wired together by a shared volume
+      mount, which is P3 work (deploy manifests), not this item. A1 (REVISED): a pool failure before a first
+      frame reruns locally (exit 0); a pool failure once a first frame exists exits the shim non-zero with no
+      local rerun (a from-scratch rerun can't catch the pool's high-water mark inside Jellyfin's ~20s poll
+      window) -- Jellyfin retries it as a normal failed trickplay task. Suite cases 15-19 (proto_test.sh)
+- [x] Seek affinity (PLAYBACK only): a fresh `rank()` on every ffmpeg restart (seek, audio/subtitle
+      track change, bitrate switch, failover) could hop a session between the Arc (QSV) and the P4
+      (NVENC) mid-playback and show a visible quality step, so the shim now pins a session to its
+      first worker and keeps it there through ordinary restarts. Key: the HLS output prefix
+      `lease::lease_path` already derives its lock file from -- Jellyfin computes it as
+      `MD5(MediaPath-UserAgent-DeviceId-PlaySessionId)` and every `DynamicHlsController` restart
+      handler carries the same `playSessionId` straight through
+      (`Jellyfin.Api/Helpers/StreamingHelpers.cs:377-386`, `DynamicHlsController.cs:229` et al. in
+      `~/.cache/jellymesh-vendor/jellyfin-src`), so it is stable **server-side** across any restart
+      that carries an existing `playSessionId`, and changes only on a genuinely new session.
+      Verified for a seek; whether a client-driven track/bitrate change reuses `PlaySessionId`
+      rather than re-invoking `/PlaybackInfo` (which mints a fresh one --
+      `MediaInfoHelper.cs:132`) was not independently checked -- no jellyfin-web client source is
+      vendored here (see `crates/shim/src/affinity.rs`'s doc comment). Store: `<md5>.worker`, a
+      sibling of the lease lock in the shared scratch dir (so every Jellyfin replica sees it),
+      written atomically (tmp + rename) with the winning `Worker.name` on every PLAYBACK
+      `Accepted`, never for BATCH. Use: `apply_affinity` moves the pinned worker to the front of
+      `rank()`'s output when it answered Hello this round and still shows free capacity; `Caps`
+      carries no draining flag, so a pinned-but-draining worker is only caught by its
+      `Busy{reason:"draining"}` at admission, which the existing per-candidate loop already falls
+      through on -- no new field needed. Failover: the pin is cleared before the 255-exit site (a
+      worker LOST mid-transcode, or another replica's lease holder gone after the first segment),
+      before a non-zero exit from the agent's own stall watchdog or drain (a wedged/hung card, or
+      a rolling update -- these reach the shim the same as any other post-first-segment failure,
+      not as a dropped connection), and opportunistically by `affinity::sweep_stale` for any file
+      past `TC_AFFINITY_TTL_SECS` that a session never revisits, so the restart ranks fresh
+      instead of returning to a card that just died or is draining, and a fully-orphaned pin does
+      not sit in shared scratch forever; a clean Busy/refusal, or the file's own session simply
+      ending cleanly, leaves it alone otherwise. `TC_AFFINITY_TTL_SECS` (default 6h) ages out an
+      orphaned file; `TC_AFFINITY=0` disables the feature (default on). Unit tests:
+      `crates/shim/src/affinity.rs` (round-trip, overwrite, clear, sweep, TTL, garbage/blank
+      content, env parsing) and `crates/shim/src/tests.rs` (`apply_affinity_*`); suite case 20
+      (proto_test.sh) exercises the full write-on-Accept / seek-stays-pinned /
+      kill-clears-and-fails-over / stall-clears-and-fails-over path against the native binaries.
 - [ ] Chaos CronJob + Kuma push monitor (weekly drills against a canary)
 - [ ] Drain drill: `kubectl drain` a GPU node during 3 sessions → 0 failed requests
 
@@ -222,15 +279,218 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
 - [x] Resolution-weighted capacity (Arc 14 / 4K 2.3, P4 6 / 4K 2), busy → next worker, free-capacity ranking
 - [~] Emergency degrade (fastest preset + emergency capacity when every worker is busy)
 - [ ] Online cost model (EWMA of unpaused speed), quality-aware placement score, power-of-two-choices
+- [ ] Sticky server failover (future release, Brian 2026-09-27): prod's Traefik failover route sends a
+      failed-over viewer back to the primary as soon as it is healthy, so one failover costs two ffmpeg
+      restarts. MEASURED 2026-09-27 18:02Z/18:05Z: a Safari remux (video copy, DTS->AAC) restarted at 49:12
+      on the fallback and again at 52:48 on the primary, and the viewer reported audio drifting out of sync.
+      Pin sessions with a sticky cookie so new sessions prefer the primary but a failed-over one stays put.
+      Prototype + drill in jm-lab first. Related: remux restarts can drift A/V (video resumes on a source
+      keyframe, audio at the exact second); add an A/V start-PTS check to the restart drills.
+- [ ] Trickplay resume from high-water mark: instead of retrying whole (§10 P2), resume a preempted-after-first-
+      -frame job with `-ss` + `-start_number` at the pool's last complete frame. Not done in P2 because of four
+      unresolved hazards (A1 REVISED): (1) keyframe-only mode (`-skip_frame nokey`, no `setpts`) doesn't land on
+      an `N * interval` boundary after a seek, so the resumed sequence can't be spliced onto the original
+      numbering; (2) the pool's last `.jpg` may be truncated by the kill, so resuming needs an EOI-byte check to
+      decide whether to resume at N or overwrite N-1; (3) `-threads 1` software seek+decode of a 4K source may
+      itself exceed Jellyfin's ~20s trickplay window, i.e. the resume could be slower than a full local retry;
+      (4) resuming changes the argv the pool renders, which breaks the "exec_real preserves argv exactly"
+      invariant every other fallback in this codebase relies on
 
 ### P5 Quality
+- [~] On-the-fly Dolby Vision 7 -> 8.1 (Brian 2026-09-27; re-scoped after lab measurement; agent path
+      wired 2026-09-27 on branch `dv81-wire`):
+      124 of 329 movies are DV profile 7 (dual-layer BD remuxes); TVs/streamers decode only
+      single-layer DV (8.1/5), so Jellyfin strips them to HDR10 or transcodes. Offline conversion with
+      dovi_tool is proven (two titles converted and verified 2026-09-27) but costs a second copy of
+      each file. Two halves: (a) Jellyfin's decision (core patch: P7 is servable as 8.1 to a client
+      that supports DOVIWithHDR10) — owned by the jellyfin bug-hunt session, brief item 5; (b) the
+      pool's execution (agent/IR) — this entry.
+
+      **Signal contract (`crates/ir/src/lib.rs` `wants_dv81`/`strip_dv81_signal`):** Jellyfin's
+      decision patch (jellymesh PR #3, bug-hunt patch 13) appends `-metadata:s:v:0
+      JELLYMESH_DOVI_P7_TO_81=1` once, on the output video stream (`DV81_SIGNAL_VALUE`; the pool's
+      original `TC_DV81=1` still works as `DV81_SIGNAL_VALUE_ALIAS`, for lab use and older argvs).
+      A real, harmless ffmpeg option, so any path that execs the argv unmodified (older agent, the
+      shim's `exec_real`) still runs, just with one inert metadata key. `validate()` is opaque to
+      it (`validate::tests::dv81_signal_is_already_opaque_to_the_allowlist` and its `_alias`
+      sibling). The agent strips it from whatever argv it runs, and matches the pair anywhere in
+      argv (not by position) — MEASURED against a Jellyfin-shaped argv carrying `-copyts`, a
+      non-zero `-map 0:<N>` for video and `-bsf:v hevc_mp4toannexb`
+      (`strip_dv81_signal_leaves_a_jellyfin_shaped_argv_otherwise_untouched`).
+
+      **`hevc_mp4toannexb` in Jellyfin's own argv (PR #3's shape) is harmless to ffmpeg#2.**
+      MEASURED 2026-09-27 on ffmpeg 8.1.3: copying an HEVC stream already read out of MPEG-TS (as
+      ffmpeg#2's fd-3 input always is) into an mp4/fmp4 output with `-bsf:v hevc_mp4toannexb`
+      applied produces a byte-identical file to the same copy without it — the filter no-ops on
+      input that is already Annex-B. `dv81_plan::without_dovi_strip` only strips `dovi_rpu*`/
+      `remove_dovi` filters from a `-bsf:v` chain, so this bsf already passes through unchanged;
+      `dv81_plan::tests::mux_keeps_hevc_mp4toannexb_bsf_untouched_and_repoints_a_nonzero_video_map`
+      and `job::dv81_it`'s fixtures (now built with this bsf + the marker in Jellyfin's shape) cover
+      it end to end.
+
+      **A fallback must remove DV, not just the marker (`tcpool_ir::add_dv_removal_bsf`).**
+      Jellyfin's decision patch only emits the marker for a client it already confirmed accepts "DV
+      8.1 or HDR10" — never raw profile 7. Every path that does not produce a real 8.1 record (the
+      agent's three non-convert outcomes below, and the shim's `exec_real` when the pool cannot be
+      reached at all) merges `hevc_metadata=remove_dovi=1` (`DV_REMOVAL_BSF`) into the argv's
+      `-bsf:v` chain (comma-joined into an existing chain, e.g. Jellyfin's own `hevc_mp4toannexb`,
+      never a second `-bsf:v` flag) so the client gets plain HDR10 instead of an untouched,
+      mislabeled DV7 (or whatever DV, if any, the source actually has — `fallback_not_p7` can't
+      assume). This is the one sanctioned exception to "exec_real preserves argv exactly".
+      CONFIRMED from source: `remove_dovi` is a jellyfin-ffmpeg-only Debian patch
+      (`debian/patches/0061-add-remove-dovi-hdr10plus-bsf.patch`, present at tag `v8.1.2-5`) on the
+      `h265_metadata` bsf ("hevc_metadata" in ffmpeg CLI naming) — the same bsf/option already
+      named "Jellyfin's HDR10 fallback" in `dv81_plan::without_dovi_strip`'s doc comment. It deletes
+      the trailing RPU/EL NAL units per access unit *and* removes the `AV_PKT_DATA_DOVI_CONF` coded
+      side data on init, so the output carries no DOVI record at all. Not in stock ffmpeg — MEASURED
+      2026-09-27, this workstation's stock Fedora ffmpeg 8.1.3 errors `Option 'remove_dovi' not
+      found` — so `job::dv81_it`'s two non-converting fallback tests probe for the option
+      (`have_dv_removal_bsf`) and skip with a note on this workstation, same convention as
+      `have_tools()`; the converting test never takes this path and always runs.
+
+      **Agent path (`crates/agent/src/job.rs` `run_dv81`, shipped on `dv81-wire`):** for a PLAYBACK job
+      carrying the marker:
+        1. Gate: video stream copy (`is_video_copy`) AND `probe::source_dovi` says DV profile 7
+           (ffprobe `stream_side_data`, fails closed) AND `dv81_plan::plan` accepts the argv shape
+           (exactly one `-i`, `-copyts` present — Jellyfin's remux shape; no `-itsoffset`/`-sseof`/
+           output `-ss`). Otherwise: DV-removed fallback, `fallback_not_p7` / `fallback_error`.
+        2. ffmpeg#1 (`dv81_plan`): Jellyfin's input options (same `-ss`/`-noaccurate_seek`/probe
+           limits) + `-map 0:v:0 -c:v copy -copyts -output_ts_offset 10 -muxdelay 0 -muxpreload 0
+           -f mpegts pipe:1`. TS, not raw `-f hevc`: it carries PTS/DTS, so B-frame order and the
+           source timestamps survive; a raw pipe makes ffmpeg#2 invent timestamps at a fixed rate.
+        3. The agent reads ffmpeg#1's TS (`dv81_ts::TsRewriter`): PES by PES, `dv81::convert_access_unit`
+           rewrites each RPU (NAL 62) with `ConversionMode::To81` and drops EL NALs (type 63
+           UNSPEC63 — the BD single-track EL encapsulation — and any `nuh_layer_id != 0`); the PMT
+           gets exactly one DOVI video stream descriptor (0xB0) saying profile 8 / BL compat 1 / no
+           EL, replacing any ffmpeg#1 wrote. **Decision on the first bytes:** if no RPU has been
+           seen within 32 MB (or 10 s — kept inside the 45 s first-progress grace, which also covers
+           the ffprobe and whatever ffmpeg runs next — or ffmpeg#1's whole output) the source's RPU is out-of-band
+           (`hvcE`, below): kill ffmpeg#1, DV-removed fallback (`add_dv_removal_bsf`), `fallback_no_rpu`.
+           Nothing has been written to Jellyfin's output at that point.
+        4. ffmpeg#2: input 0 = the rewritten TS on **fd 3** (`pipe:3`, dup2 in `pre_exec`) — not
+           stdin, which stays Jellyfin's `p`/`u`/`q` key channel, so throttling and quit work
+           unchanged; input 1 = the source with Jellyfin's input options (audio/subs); Jellyfin's
+           output options with the `-map`s re-pointed, DV-strip bsfs removed, `-strict unofficial`
+           (the mp4 muxer only writes `dvcC`/`dvvC` at that level) and Jellyfin's `-tag:v` (hvc1 if
+           none; hvc1 and dvh1 both MEASURED to carry the record).
+        5. Timestamps: `-start_at_zero` subtracts each input's *own* start time, which differs
+           between the TS (seek point) and the MKV (~0). So ffmpeg#2 always runs `-copyts` without
+           `-start_at_zero` and applies the plain remux's shift explicitly as `-itsoffset` on both
+           inputs (−10 s more on the TS). And `-discard:v:0 none` on input 1: MEASURED, with the
+           source's video unused ffmpeg's matroska seek lands elsewhere (`-ss 1.5`: audio started at
+           1.003 s instead of the plain remux's 0.811 s).
+        6. Failure after ffmpeg#2 started: a conversion error mid-stream kills ffmpeg#2 (nonzero
+           exit, never a clean-looking truncated playlist); a nonzero exit before the first segment
+           re-runs the DV-removed fallback (`fallback_error`), mirroring the GPU-filter fallback.
+      Metric: `tcpool_dv81_total{outcome=converted|fallback_no_rpu|fallback_not_p7|fallback_error}`,
+      one per signaled job (`fallback_not_p7` added beyond the original three labels so a Jellyfin
+      signal on a non-DV7 source is visible separately from an agent error).
+
+      **MEASURED 2026-09-27 on ffmpeg 8.1.3 (Fedora, this workstation) with a synthetic DV7 fixture**
+      (x265 10-bit + AAC, a synthetic profile-7 MEL RPU from the `dolby_vision` crate plus a fake
+      type-63 EL NAL in every AU, MKV with a profile-7 DOVI record; built in-test, no binary asset —
+      `job::dv81_it`):
+        - init segment: `DOVI configuration record: version: 1.0, profile: 8, level: 6, rpu flag: 1,
+          el flag: 0, bl flag: 1, compatibility id: 1`; no "Generating one" warning (no bsf involved);
+        - dovi_tool 2.3.4 (official x86_64 musl release, sha256 `1844258e…32b3f` = the GitHub asset
+          digest) `info --summary`: input `Frames: 96, Profile: 7 (MEL)` → output `Frames: 96,
+          Profile: 8`; 96/96 EL NALs dropped;
+        - A/V vs the plain remux of the same argv: no seek — video 0.021 / audio −0.021333 on both;
+          `-ss 1.5 -noaccurate_seek` — video 0.939011 vs 0.939063 (52 µs, the ms→90 kHz rounding),
+          audio 0.810 vs 0.810; same frame count (96 / 75);
+        - a DV7 source without in-band RPU → `fallback_no_rpu`, DV-removed output (no DOVI record,
+          MEASURED via `ffprobe`); a non-DV source → `fallback_not_p7`.
+      The same probe finding changed the gate: `-show_entries stream=index:side_data=dv_profile` (the
+      earlier `source_dovi_profile`) also selects packet/frame side data and read all 96 packets of a
+      4 s clip — on a 70 GB remux it would time out and fail closed on every job; `source_dovi` uses
+      `stream_side_data`.
+
+      **Two source muxings, one of them not handled yet — MEASURED 2026-09-27 by earlier sessions
+      (jellyfin-ffmpeg 8.1.2; not re-measured on `dv81-wire`):** (a) some DV7 MKVs (e.g. our offline-converted sources, a DV7 FEL
+      title and a second DV7 title) carry RPU in-band: `-c copy -bsf:v hevc_mp4toannexb -f hevc` output has
+      NAL 62s and dovi_tool extract-rpu/convert worked on it — the agent path above converts these.
+      (b) others carry EL+RPU in a Matroska Block Addition, mapping type `hvcE` (ffmpeg: `Invalid Block
+      Addition value 0x0 for unknown Block Addition Mapping type 68766345`); a stream copy of those has
+      zero NAL 62s (301 NALs traced over 3 s), and ffprobe still shows the static profile-7 record.
+      The agent detects (b) on the first bytes and runs the DV-removed fallback. Never trust a
+      `dovi_rpu`-bsf recipe on (b): on a stream with no config record it prints `No Dolby Vision
+      configuration record found? Generating one, but results may be invalid` and fabricates one.
+      **(b) not reproduced by the 2026-09-27 census (below):** the `hvcE` mapping warning is present
+      on 117 of 122 DV7 files, and all 122 still have NAL 62 in ffmpeg's `-c copy` output — the
+      warning alone does not mean out-of-band RPU. The earlier 301-NAL/zero-RPU trace is unexplained.
+
+      **Library census — MEASURED 2026-09-27 on prod (jellyfin-qsv, `ffmpeg version 8.1.2-Jellyfin`):**
+      336 video files under the movies library; 165 carry a DOVI record (header-only ffprobe,
+      `stream_side_data`, `-probesize 5M`): 122 profile 7, 43 profile 8 (includes the in-library
+      offline DV81 conversions). (The "124 of 329" above is an earlier session's count; method not recorded.)
+      Per DV7 title, a 3 s `-ss 0 -t 3 -map 0:v:0 -c copy -bsf:v hevc_mp4toannexb -f hevc` scanned
+      for NAL types: **in-band RPU 122, HVCE (warning + 0 NAL 62) 0, other 0**; 73-75 NAL 62 per
+      3 s on every title; EL carried as NAL 63 on every title. EL type (dovi_tool 2.3.4 `info -s`
+      on the same 3 s): **FEL 76, MEL 46**. hvcE BlockAddition mapping in the header: 117 of 122.
+      HVCE class: 0 of 122 in this library. hvcE BlockAddition reader required for the HVCE class —
+      tracked in SaabStory404/jellymesh#4.
+
+      **Real-title proof — MEASURED 2026-09-27 on prod jellyfin-qsv (jellyfin-ffmpeg 8.1.2), one
+      in-band DV7 FEL title (level 6, 23.976 fps), `examples/dv81_filter` (static musl, the agent's
+      `dv81`/`dv81_ts` code) between ffmpeg#1 and ffmpeg#2 with the argvs `dv81_plan::plan`
+      produces for a Jellyfin MKV HLS-fmp4 remux (`-ss 600 -noaccurate_seek -t 30`, `-copyts
+      -start_at_zero`, `-bsf:v hevc_mp4toannexb -tag:v:0 hvc1`, TrueHD -> libfdk_aac 2ch), ffmpeg#2
+      reading `pipe:3`, all `nice -n 19`:**
+        - init segment DOVI record: `dv_profile=8 dv_level=6 rpu 1 el 0 bl 1 compatibility id 1`;
+          plain remux of the same argv: profile 7, el 1, compat 6. No "Generating one" in ffmpeg#2's
+          stderr (0 hits).
+        - filter: 729 video frames, 729 RPUs rewritten, 2459 EL NALs dropped. dovi_tool 2.3.4
+          (official musl, tarball sha256 `1844258e…32b3f` = GitHub asset digest): source window
+          `Frames: 729, Profile: 7 (FEL)` -> output `Frames: 729, Profile: 8`; L1/L2/L5/L6 unchanged.
+          Output video NALs: 729 NAL 62, 0 NAL 63.
+        - Real bytes settle the two INHERITED points: EL is NAL type 63 and the RPU is `nuh_layer_id`
+          0 (source window: (62,0)=729, (63,0)=2459; no other layer ids).
+        - A/V start: first video packet pts 599.724 / dts 599.599, first audio 599.681 — identical
+          in the DV81 output and the plain remux (0 frames apart); 729 video / 1408 audio packets in
+          both; 6 segments each.
+        - Time for the 30.4 s window: plain remux real 1.217 s (user+sys 2.24 s); DV81 pipeline
+          real 1.772 s (user+sys 3.88 s) = ~17x realtime. The plain remux ran first, so the DV81 run's
+          two source reads were likely page-cache warm — cold NFS double-read cost still unmeasured.
+        - DV-removed fallback (`-bsf:v hevc_mp4toannexb,hevc_metadata=remove_dovi=1`, the chain
+          `add_dv_removal_bsf` builds from this argv) on the same title: no DOVI record in init,
+          `color_transfer=smpte2084`, bt2020, mastering-display + CLL frame side data intact; seg0 has
+          0 NAL 62 and EL payload 6.16 MB -> 3437 B, but 336 small NAL 63 remain (~10 B each), so
+          `remove_dovi` does not delete every EL NAL. Same frame/packet counts and A/V start.
+        - The `fallback_no_rpu` gate could not be exercised on a real title: the library has none.
+
+      **Open:**
+        - [x] Lab proof against a real in-band DV7 title (above, 2026-09-27).
+        - [x] Library census (above): 122 in-band, 0 `hvcE`-only.
+        - (b) reader: a Matroska Block-Addition-aware extractor (Rust, in the agent) that yields the
+          RPU per frame so the same rewrite applies.
+        - [x] Jellyfin decision patch adopting the marker (jellymesh PR #3, bug-hunt patch 13):
+              emits `-metadata:s:v:0 JELLYMESH_DOVI_P7_TO_81=1`, `-bsf:v hevc_mp4toannexb` and a
+              `-map 0:<N>` for video; the pool's marker/fallback/bsf handling above was updated to
+              match (2026-09-27).
+        - Cost: a converting job reads the source twice (ffmpeg#1 for video, ffmpeg#2 for audio,
+          same file, same seek) — ~2x NFS read per DV81 session on a link P6 already flags as
+          saturating on remux probes. Not measured yet.
+
+      Done when the Bravia shows the Dolby Vision badge on a DV7 title with Direct Stream (remux) and
+      no extra disk use.
 - [x] Baseline measured (P0, calibration/README.md): Arc delivers 16-22% of the cap, VMAF 87.1/87.5 @8M
       (h264/hevc); P4 94.8/93.2; Arc-vs-P4 gap 5.4-7.8 (a failover is visible). Calibrated settings
       measured Arc 93.5/97.6, P4 93.5/96.9, gap +0.04/+0.72
-- [ ] **Next session, step 1** (docs/tcpool-next-session.md): calibrated rate control + presets in render()
-- [ ] Rate-control mapping per encoder from the calibration (fix the bitrate undershoot)
-- [ ] Preset scaling by headroom; tone-map choice per card (vaapi/cuda/opencl/libplacebo by metrics)
-- [ ] HEVC 10-bit end-to-end through both GPU chains; VMAF consistency ±1.5 across cards
+- [x] **Next session, step 1** (docs/tcpool-next-session.md): calibrated rate control + presets in render()
+      (branch `p5-ratecontrol`, 2026-09-27; `apply_rate_control`, agent `TC_RC=calibrated|legacy`,
+      golden `corpus/goldens/render-calibrated.json`). Lab-measured in calibration/README.md "P5 applied".
+      Not yet deployed to tc-lab agents or prod.
+- [x] Rate-control mapping per encoder from the calibration (fix the bitrate undershoot): MEASURED
+      delivered Arc 94.1-96.6% of the cap (never over; was 7-22%), P4 93.7-102.4%; Arc +0.83..+1.49
+      VMAF over today's mapping at equal bitrate. NVENC `-cq` hybrid rejected (25-60% of the cap) and
+      NVENC AQ dropped (lower VMAF, missed ±1.5).
+- [ ] Preset scaling by headroom (concurrency at `medium`/`p5` not yet measured); tone-map choice per
+      card (vaapi/cuda/opencl/libplacebo by metrics) -- P5 run: sample-c Arc-P4 gap -2.3..-2.8 VMAF
+      with Arc PSNR ~8 dB lower at equal bitrate = `tonemap_vaapi`
+- [~] VMAF consistency ±1.5 across cards: SDR sample-b within ±1.26 at 3/8/15M on h264 and hevc;
+      sample-a P4 rows for the shipped config unmeasured (source left the library mid-run; AQ-variant
+      proxy +0.33..+1.26); HDR sample-c fails on the tone mapper (above)
+- [ ] HEVC 10-bit end-to-end through both GPU chains
 
 ### P6 Latency
 - [x] Probe clamp: Jellyfin's `-probesize 1G` cost 8-12 s over the tower's 1 GbE link; clamped to 50M/5M
@@ -245,8 +505,10 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
 **How it stays seamless.** Jellyfin is not modified. It runs with hardware acceleration
 **none**, so it always emits a portable software command line (`libx264`/`libx265`, `scale`,
 `tonemapx`). The shim sits at Jellyfin's configured ffmpeg path. Every HLS transcode goes to the
-pool, and every other invocation (probes, `-encoders`, trickplay, subtitle extraction) execs the
-real local ffmpeg. Each agent swaps in its own card's decoder, encoder and GPU filter chain
+pool. Every other invocation (probes, `-encoders`, subtitle extraction) execs the real local
+ffmpeg unconditionally; trickplay does too unless `TC_BATCH=1` and its output directory is under
+`TC_TRICKPLAY_OUTPUT_ROOT` (§10 P2, shipped dark), in which case it routes to the pool at
+`Priority::Batch` instead. Each agent swaps in its own card's decoder, encoder and GPU filter chain
 (`crates/ir/src/lib.rs`, `filters.rs`). Consequences:
 - Jellyfin needs no GPU, and its per-device probes (`IsVaapiDevice*`) never matter, because they
   only feed vaapi/qsv command building (EncodingHelper.cs:1051).

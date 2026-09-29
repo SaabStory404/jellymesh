@@ -1,0 +1,177 @@
+diff --git a/Jellyfin.Server.Implementations/Security/AuthorizationContext.cs b/Jellyfin.Server.Implementations/Security/AuthorizationContext.cs
+index 8657cb7db..93758167f 100644
+--- a/Jellyfin.Server.Implementations/Security/AuthorizationContext.cs
++++ b/Jellyfin.Server.Implementations/Security/AuthorizationContext.cs
+@@ -14,30 +14,39 @@ using MediaBrowser.Controller.Library;
+ using MediaBrowser.Controller.Net;
+ using Microsoft.AspNetCore.Http;
+ using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.Logging;
+ using Microsoft.Net.Http.Headers;
+ 
+ namespace Jellyfin.Server.Implementations.Security
+ {
+     public class AuthorizationContext : IAuthorizationContext
+     {
++        /// <summary>
++        /// The client name reported by the built-in Jellyfin Web client.
++        /// </summary>
++        private const string JellyfinWebClientName = "Jellyfin Web";
++
+         private readonly IDbContextFactory<JellyfinDbContext> _jellyfinDbProvider;
+         private readonly IUserManager _userManager;
+         private readonly IDeviceManager _deviceManager;
+         private readonly IServerApplicationHost _serverApplicationHost;
+         private readonly IServerConfigurationManager _configurationManager;
++        private readonly ILogger<AuthorizationContext> _logger;
+ 
+         public AuthorizationContext(
+             IDbContextFactory<JellyfinDbContext> jellyfinDb,
+             IUserManager userManager,
+             IDeviceManager deviceManager,
+             IServerApplicationHost serverApplicationHost,
+-            IServerConfigurationManager configurationManager)
++            IServerConfigurationManager configurationManager,
++            ILogger<AuthorizationContext> logger)
+         {
+             _jellyfinDbProvider = jellyfinDb;
+             _userManager = userManager;
+             _deviceManager = deviceManager;
+             _serverApplicationHost = serverApplicationHost;
+             _configurationManager = configurationManager;
++            _logger = logger;
+         }
+ 
+         public Task<AuthorizationInfo> GetAuthorizationInfo(HttpContext requestContext)
+@@ -181,6 +190,21 @@ namespace Jellyfin.Server.Implementations.Security
+                     {
+                         device.DateLastActivity = DateTime.UtcNow;
+                         updateToken = true;
++
++                        // Piggyback on this same throttle (at most once every ~3 minutes per device) to warn
++                        // when a Jellyfin Web client is reporting a version older than this server. This is the
++                        // signal for a stale cached web bundle (e.g. a browser tab or reverse-proxy/CDN cache
++                        // that never picked up a server upgrade) that would otherwise go undetected. No new
++                        // state is added; this reuses device.DateLastActivity purely as a rate limit.
++                        if (IsStaleWebClient(authInfo.Client, authInfo.Version, _serverApplicationHost.ApplicationVersion))
++                        {
++                            _logger.LogWarning(
++                                "Client {Client} (device {DeviceId}) reported version {ClientVersion}, which is older than this server's version {ServerVersion}. This usually means the browser is running a cached, outdated Jellyfin Web bundle; a hard refresh (or clearing the site's cache) may be required.",
++                                authInfo.Client,
++                                device.Id,
++                                authInfo.Version,
++                                _serverApplicationHost.ApplicationVersion);
++                        }
+                     }
+ 
+                     authInfo.User = _userManager.GetUserById(device.UserId);
+@@ -221,6 +245,46 @@ namespace Jellyfin.Server.Implementations.Security
+             }
+         }
+ 
++        /// <summary>
++        /// Determines whether a request's reported client identifies itself as the built-in Jellyfin Web
++        /// client while reporting a version strictly older than the given server version.
++        /// </summary>
++        /// <param name="client">The <c>Client</c> value reported by the request, if any.</param>
++        /// <param name="version">The <c>Version</c> value reported by the request, if any.</param>
++        /// <param name="serverVersion">
++        /// This server's own application version (<c>IServerApplicationHost.ApplicationVersion</c>), which is the
++        /// 4-part assembly version; only the Major/Minor/Build components are meaningful for this comparison (see
++        /// <c>IServerApplicationHost.ApplicationVersionString</c>, which is that same version formatted to 3
++        /// parts) - both sides are normalized to 3 parts below so an up-to-date client is never misreported as
++        /// stale merely because it omits a Revision the server's assembly version happens to carry.
++        /// </param>
++        /// <returns><c>true</c> if this looks like a stale Jellyfin Web client; otherwise, <c>false</c>.</returns>
++        internal static bool IsStaleWebClient(string? client, string? version, Version serverVersion)
++        {
++            if (!string.Equals(client, JellyfinWebClientName, StringComparison.OrdinalIgnoreCase))
++            {
++                return false;
++            }
++
++            if (!Version.TryParse(version, out var clientVersion))
++            {
++                return false;
++            }
++
++            return NormalizeToThreePart(clientVersion) < NormalizeToThreePart(serverVersion);
++        }
++
++        /// <summary>
++        /// Reduces a <see cref="Version"/> to its Major/Minor/Build components, treating an absent (-1) Build
++        /// or Revision as 0, so a 3-part client version and a 4-part assembly version compare correctly.
++        /// </summary>
++        /// <param name="version">The version to normalize.</param>
++        /// <returns>An equivalent version with exactly 3, non-negative components.</returns>
++        private static Version NormalizeToThreePart(Version version)
++        {
++            return new Version(version.Major, version.Minor, Math.Max(version.Build, 0));
++        }
++
+         /// <summary>
+         /// Gets the auth.
+         /// </summary>
+diff --git a/Jellyfin.Server/Startup.cs b/Jellyfin.Server/Startup.cs
+index 560a41994..d4dda74b0 100644
+--- a/Jellyfin.Server/Startup.cs
++++ b/Jellyfin.Server/Startup.cs
+@@ -222,6 +222,15 @@ namespace Jellyfin.Server
+                             {
+                                 context.Context.Response.Headers.CacheControl = new StringValues("no-cache");
+                             }
++                            else if (Path.GetFileName(context.File.Name).Equals("serviceworker.js", StringComparison.Ordinal))
++                            {
++                                // The service worker script is fetched directly by the browser's SW update
++                                // check, bypassing the build-hash query string that busts the cache for every
++                                // other asset referenced from index.html. Without an explicit header it is
++                                // subject to normal heuristic HTTP caching, so mark it no-cache like index.html
++                                // (a separate branch so index.html's own header is unaffected).
++                                context.Context.Response.Headers.CacheControl = new StringValues("no-cache");
++                            }
+                         }
+                     });
+ 
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Security/AuthorizationContextTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Security/AuthorizationContextTests.cs
+new file mode 100644
+index 000000000..5889d8bb9
+--- /dev/null
++++ b/tests/Jellyfin.Server.Implementations.Tests/Security/AuthorizationContextTests.cs
+@@ -0,0 +1,37 @@
++using System;
++using Jellyfin.Server.Implementations.Security;
++using Xunit;
++
++namespace Jellyfin.Server.Implementations.Tests.Security;
++
++public class AuthorizationContextTests
++{
++    // IServerApplicationHost.ApplicationVersion is the assembly version, which is always 4-part
++    // (e.g. "12.1.0.0"), not the 3-part "12.1.0" that Jellyfin Web itself reports. Modeling the
++    // fixture on the real 4-part shape is what catches a naive Version comparison treating an
++    // up-to-date 3-part client as older solely because it has no 4th (Revision) component.
++    private static readonly Version ServerVersion = new Version(12, 1, 0, 0);
++
++    [Theory]
++    [InlineData("Jellyfin Web", "12.0.0")]
++    [InlineData("jellyfin web", "11.9.3")]
++    [InlineData("Jellyfin Web", "12.0")]
++    public void IsStaleWebClient_OlderJellyfinWebVersion_ReturnsTrue(string client, string version)
++    {
++        Assert.True(AuthorizationContext.IsStaleWebClient(client, version, ServerVersion));
++    }
++
++    [Theory]
++    [InlineData("Jellyfin Web", "12.1.0")] // same version, 3-part vs. the 4-part assembly version
++    [InlineData("Jellyfin Web", "12.1")] // same version, Build/Revision omitted entirely
++    [InlineData("Jellyfin Web", "12.2.0")]
++    [InlineData("Kodi", "12.0.0")]
++    [InlineData("Moonfin", "1.0.0")]
++    [InlineData("Jellyfin Web", null)]
++    [InlineData("Jellyfin Web", "not-a-version")]
++    [InlineData(null, "12.0.0")]
++    public void IsStaleWebClient_NotAnOlderWebClient_ReturnsFalse(string? client, string? version)
++    {
++        Assert.False(AuthorizationContext.IsStaleWebClient(client, version, ServerVersion));
++    }
++}

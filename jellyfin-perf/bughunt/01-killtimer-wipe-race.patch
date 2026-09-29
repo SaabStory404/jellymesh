@@ -1,0 +1,224 @@
+diff --git a/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs b/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
+index a534fdd68..5e985c1a7 100644
+--- a/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
++++ b/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
+@@ -246,7 +246,10 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+         }
+     }
+ 
+-    private async Task DeletePartialStreamFiles(string path, TranscodingJobType jobType, int retryCount, int delayMs)
++    // Visibility is `internal` (not `private`) solely so Jellyfin.MediaEncoding.Tests can exercise
++    // the guard-then-delete sequence directly (see AssemblyInfo.cs InternalsVisibleTo). Behavior for
++    // all production callers is unchanged.
++    internal async Task DeletePartialStreamFiles(string path, TranscodingJobType jobType, int retryCount, int delayMs)
+     {
+         if (retryCount >= 10)
+         {
+@@ -259,13 +262,34 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+ 
+         try
+         {
+-            if (jobType == TranscodingJobType.Progressive)
++            // The delay above gives a client that raced the kill a window to land a retry and start
++            // a replacement job for this exact path (e.g. DynamicHlsController's restart-on-retry).
++            // Take the same per-path lock the controller holds while that replacement is starting up
++            // (StartFfMpeg only returns once the replacement's own job is registered and its first
++            // segment exists or the process has exited), then re-check the active job list under it
++            // immediately before deleting anything. This makes the "is this path still mine to wipe"
++            // check and the delete atomic with respect to a replacement job's startup, instead of racing
++            // it. None of KillTranscodingJob's callers (HlsSegmentController, PlaystateController, the
++            // async-void kill timer) hold this lock already, and DynamicHlsController only ever calls
++            // KillTranscodingJobs with delete=false, so this cannot deadlock against them.
++            using (await _transcodingLocks.LockAsync(path, CancellationToken.None).ConfigureAwait(false))
+             {
+-                DeleteProgressivePartialStreamFiles(path);
+-            }
+-            else
+-            {
+-                DeleteHlsPartialStreamFiles(path);
++                if (IsPathInUseByActiveJob(path, jobType))
++                {
++                    _logger.LogDebug(
++                        "Skipping deletion of partial stream file(s) {Path}; a new transcoding job now owns this path",
++                        path);
++                    return;
++                }
++
++                if (jobType == TranscodingJobType.Progressive)
++                {
++                    DeleteProgressivePartialStreamFiles(path);
++                }
++                else
++                {
++                    DeleteHlsPartialStreamFiles(path);
++                }
+             }
+         }
+         catch (IOException ex)
+@@ -280,6 +304,34 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+         }
+     }
+ 
++    /// <summary>
++    /// Returns whether a transcoding job with the given path and type is currently registered, i.e.
++    /// whether some job other than the one being torn down now owns this output path.
++    /// </summary>
++    /// <param name="path">The output path to check.</param>
++    /// <param name="type">The transcoding job type to check.</param>
++    /// <returns><c>true</c> if a matching job is registered; otherwise <c>false</c>.</returns>
++    internal bool IsPathInUseByActiveJob(string path, TranscodingJobType type)
++    {
++        lock (_activeTranscodingJobs)
++        {
++            return _activeTranscodingJobs.Any(j => j.Type == type && string.Equals(j.Path, path, StringComparison.OrdinalIgnoreCase));
++        }
++    }
++
++    /// <summary>
++    /// Test seam: registers a job directly into the active job list, bypassing process startup.
++    /// Production code always adds jobs through <see cref="OnTranscodeBeginning"/> (via <see cref="StartFfMpeg"/>).
++    /// </summary>
++    /// <param name="job">The job to register.</param>
++    internal void AddActiveTranscodingJobForTests(TranscodingJob job)
++    {
++        lock (_activeTranscodingJobs)
++        {
++            _activeTranscodingJobs.Add(job);
++        }
++    }
++
+     private void DeleteProgressivePartialStreamFiles(string outputFilePath)
+     {
+         if (File.Exists(outputFilePath))
+diff --git a/tests/Jellyfin.MediaEncoding.Tests/Transcoding/TranscodeManagerTests.cs b/tests/Jellyfin.MediaEncoding.Tests/Transcoding/TranscodeManagerTests.cs
+new file mode 100644
+index 000000000..a13418dee
+--- /dev/null
++++ b/tests/Jellyfin.MediaEncoding.Tests/Transcoding/TranscodeManagerTests.cs
+@@ -0,0 +1,126 @@
++using System.Collections.Generic;
++using System.Threading.Tasks;
++using MediaBrowser.Common.Configuration;
++using MediaBrowser.Controller.Configuration;
++using MediaBrowser.Controller.IO;
++using MediaBrowser.Controller.Library;
++using MediaBrowser.Controller.MediaEncoding;
++using MediaBrowser.Controller.Session;
++using MediaBrowser.MediaEncoding.Transcoding;
++using MediaBrowser.Model.Configuration;
++using MediaBrowser.Model.IO;
++using Microsoft.Extensions.Configuration;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.MediaEncoding.Tests.Transcoding;
++
++/// <summary>
++/// Regression tests for the kill-timer's deferred stream-file delete racing a replacement
++/// transcoding job started for the same output path (killtimer-wipe-race).
++/// </summary>
++public class TranscodeManagerTests
++{
++    private const string PlaylistPath = "/transcodes/deadbeefdeadbeefdeadbeefdeadbeef.m3u8";
++
++    private static (TranscodeManager Manager, Mock<IFileSystem> FileSystem) CreateManager()
++    {
++        var fileSystem = new Mock<IFileSystem>();
++
++        // No files on disk for DeleteEncodedMediaCache's startup scan to trip over.
++        fileSystem.Setup(f => f.GetFilePaths(It.IsAny<string>(), true)).Returns(System.Array.Empty<string>());
++
++        var appPaths = Mock.Of<IApplicationPaths>();
++        var serverConfigurationManager = new Mock<IServerConfigurationManager>();
++
++        // TranscodeManager's constructor calls DeleteEncodedMediaCache -> GetTranscodePath(), an
++        // extension method over these two real interface members.
++        serverConfigurationManager.Setup(s => s.GetConfiguration("encoding")).Returns(new EncodingOptions());
++        serverConfigurationManager.Setup(s => s.CommonApplicationPaths).Returns(Mock.Of<IApplicationPaths>(a => a.CachePath == "/cache"));
++
++        var mediaEncoder = new Mock<IMediaEncoder>();
++        var subtitleEncoder = new Mock<ISubtitleEncoder>();
++        var config = new Mock<IConfiguration>();
++        var configurationManager = new Mock<MediaBrowser.Common.Configuration.IConfigurationManager>();
++        var pathManager = new Mock<IPathManager>();
++        var encodingHelper = new EncodingHelper(
++            appPaths,
++            mediaEncoder.Object,
++            subtitleEncoder.Object,
++            config.Object,
++            configurationManager.Object,
++            pathManager.Object);
++
++        var manager = new TranscodeManager(
++            NullLoggerFactory.Instance,
++            fileSystem.Object,
++            appPaths,
++            serverConfigurationManager.Object,
++            Mock.Of<IUserManager>(),
++            new Mock<ISessionManager>().Object,
++            encodingHelper,
++            mediaEncoder.Object,
++            Mock.Of<IMediaSourceManager>(),
++            Mock.Of<IAttachmentExtractor>());
++
++        return (manager, fileSystem);
++    }
++
++    private static TranscodingJob CreateJob(string path, TranscodingJobType type)
++        => new(NullLogger<TranscodingJob>.Instance)
++        {
++            Path = path,
++            Type = type
++        };
++
++    [Fact]
++    public async Task DeletePartialStreamFiles_SkipsDelete_WhenReplacementJobRegisteredForSamePath()
++    {
++        var (manager, fileSystem) = CreateManager();
++
++        // Simulate DynamicHlsController's restart-on-retry: a replacement job for the exact
++        // same playlist path is registered again before the kill timer's deferred delete runs.
++        manager.AddActiveTranscodingJobForTests(CreateJob(PlaylistPath, TranscodingJobType.Hls));
++
++        fileSystem
++            .Setup(f => f.GetFilePaths(It.IsAny<string>(), false))
++            .Returns(new[] { PlaylistPath });
++
++        await manager.DeletePartialStreamFiles(PlaylistPath, TranscodingJobType.Hls, 0, 0);
++
++        fileSystem.Verify(f => f.DeleteFile(It.IsAny<string>()), Times.Never);
++    }
++
++    [Fact]
++    public async Task DeletePartialStreamFiles_Deletes_WhenNoReplacementJobRegistered()
++    {
++        var (manager, fileSystem) = CreateManager();
++
++        var otherFile = "/transcodes/deadbeefdeadbeefdeadbeefdeadbeef1.ts";
++        fileSystem
++            .Setup(f => f.GetFilePaths(It.IsAny<string>(), false))
++            .Returns(new[] { PlaylistPath, otherFile });
++
++        await manager.DeletePartialStreamFiles(PlaylistPath, TranscodingJobType.Hls, 0, 0);
++
++        fileSystem.Verify(f => f.DeleteFile(PlaylistPath), Times.Once);
++        fileSystem.Verify(f => f.DeleteFile(otherFile), Times.Once);
++    }
++
++    [Fact]
++    public void IsPathInUseByActiveJob_MatchesOnPathAndType()
++    {
++        var (manager, _) = CreateManager();
++
++        manager.AddActiveTranscodingJobForTests(CreateJob(PlaylistPath, TranscodingJobType.Hls));
++
++        Assert.True(manager.IsPathInUseByActiveJob(PlaylistPath, TranscodingJobType.Hls));
++
++        // A different type at the same path (e.g. a stale Progressive job) does not count as the
++        // same job, matching KillTranscodingJob's own GetTranscodingJob(path, type) lookup key.
++        Assert.False(manager.IsPathInUseByActiveJob(PlaylistPath, TranscodingJobType.Progressive));
++
++        Assert.False(manager.IsPathInUseByActiveJob("/transcodes/other.m3u8", TranscodingJobType.Hls));
++    }
++}

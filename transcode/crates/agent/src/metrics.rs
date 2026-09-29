@@ -25,10 +25,26 @@ pub enum Outcome {
     Stalled,
     Drained,
     GpuFilterFallback,
+    /// A BATCH job's `reserve_batch` refused because admitting it would have eaten into
+    /// `TC_BATCH_HEADROOM` (distinct from `Busy`'s `"capacity"`/`"draining"`/`"batch-disabled"`
+    /// reasons, which are not headroom-specific).
+    BusyHeadroom,
+    /// A BATCH job ended because a PLAYBACK admission preempted it (before or after it produced
+    /// any output).
+    Preempted,
+    /// A BATCH job was admitted (counted in addition to, not instead of, `Accepted`).
+    BatchAccepted,
+    /// Shared transcode dir: a PLAYBACK job's shim went away and the job kept running (counted
+    /// in addition to the job's final outcome).
+    Detached,
+    /// A job ended because another replica's shim took its output over (a seek there).
+    TakenOver,
+    /// A detached job ended because its session keepalive went stale (the viewer is gone).
+    OrphanExpired,
 }
 
 impl Outcome {
-    pub const ALL: [Outcome; 9] = [
+    pub const ALL: [Outcome; 15] = [
         Outcome::Accepted,
         Outcome::Busy,
         Outcome::RefusedPolicy,
@@ -38,6 +54,12 @@ impl Outcome {
         Outcome::Stalled,
         Outcome::Drained,
         Outcome::GpuFilterFallback,
+        Outcome::BusyHeadroom,
+        Outcome::Preempted,
+        Outcome::BatchAccepted,
+        Outcome::Detached,
+        Outcome::TakenOver,
+        Outcome::OrphanExpired,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -51,6 +73,12 @@ impl Outcome {
             Outcome::Stalled => "stalled",
             Outcome::Drained => "drained",
             Outcome::GpuFilterFallback => "gpu_filter_fallback",
+            Outcome::BusyHeadroom => "busy_headroom",
+            Outcome::Preempted => "preempted",
+            Outcome::BatchAccepted => "batch_accepted",
+            Outcome::Detached => "detached",
+            Outcome::TakenOver => "taken_over",
+            Outcome::OrphanExpired => "orphan_expired",
         }
     }
 }
@@ -121,19 +149,93 @@ impl Histogram {
 /// job.rs; only the value that changed is written here.
 pub struct Metrics {
     jobs_total: [AtomicU64; Outcome::ALL.len()],
+    dv81_total: [AtomicU64; Dv81Outcome::ALL.len()],
     job_seconds: Histogram,
     /// job id -> last observed `speed=` factor, while the job is running and not paused.
     job_speed: Mutex<HashMap<u64, f64>>,
     next_job_id: AtomicU64,
+    /// Detached jobs the agent currently holds paused (shared transcode dir throttle).
+    orphans_paused: AtomicU64,
+}
+
+/// Counts one detached job in `tcpool_orphans_paused` while `set(true)`; Drop releases it, so an
+/// aborted watcher task never leaves the gauge high.
+pub struct OrphanPausedGuard {
+    state: std::sync::Arc<crate::State>,
+    counted: bool,
+}
+
+impl OrphanPausedGuard {
+    pub fn new(state: std::sync::Arc<crate::State>) -> Self {
+        OrphanPausedGuard {
+            state,
+            counted: false,
+        }
+    }
+
+    pub fn set(&mut self, paused: bool) {
+        if paused != self.counted {
+            let g = &self.state.metrics.orphans_paused;
+            if paused {
+                g.fetch_add(1, Ordering::Relaxed);
+            } else {
+                g.fetch_sub(1, Ordering::Relaxed);
+            }
+            self.counted = paused;
+        }
+    }
+}
+
+impl Drop for OrphanPausedGuard {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
+
+/// How a job that carried the P5 DV7 -> 8.1 signal ended up (`tcpool_dv81_total`). Exactly one
+/// per signaled PLAYBACK job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dv81Outcome {
+    /// Output came from the converting pipeline.
+    Converted,
+    /// The source is DV7 but ffmpeg#1's first bytes carried no in-band RPU (e.g. the `hvcE`
+    /// Block Addition muxing); ran the plain remux.
+    FallbackNoRpu,
+    /// The source is not DV profile 7 (or ffprobe could not say): Jellyfin's signal did not
+    /// match the file; ran the plain remux.
+    FallbackNotP7,
+    /// Anything else before the first output (unsupported argv, spawn/convert error, ffmpeg#2
+    /// failing early); ran the plain remux.
+    FallbackError,
+}
+
+impl Dv81Outcome {
+    pub const ALL: [Dv81Outcome; 4] = [
+        Dv81Outcome::Converted,
+        Dv81Outcome::FallbackNoRpu,
+        Dv81Outcome::FallbackNotP7,
+        Dv81Outcome::FallbackError,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dv81Outcome::Converted => "converted",
+            Dv81Outcome::FallbackNoRpu => "fallback_no_rpu",
+            Dv81Outcome::FallbackNotP7 => "fallback_not_p7",
+            Dv81Outcome::FallbackError => "fallback_error",
+        }
+    }
 }
 
 impl Default for Metrics {
     fn default() -> Self {
         Metrics {
             jobs_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            dv81_total: std::array::from_fn(|_| AtomicU64::new(0)),
             job_seconds: Histogram::new(&DURATION_BUCKETS),
             job_speed: Mutex::new(HashMap::new()),
             next_job_id: AtomicU64::new(1),
+            orphans_paused: AtomicU64::new(0),
         }
     }
 }
@@ -141,6 +243,10 @@ impl Default for Metrics {
 impl Metrics {
     pub fn inc(&self, outcome: Outcome) {
         self.jobs_total[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_dv81(&self, outcome: Dv81Outcome) {
+        self.dv81_total[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn new_job_id(&self) -> u64 {
@@ -237,12 +343,38 @@ pub fn render(state: &State) -> String {
     let _ = writeln!(out, "# TYPE tcpool_jobs_active gauge");
     let _ = writeln!(out, "tcpool_jobs_active{{{labels}}} {}", state.usage.jobs());
 
+    let (batch_used, batch_jobs) = state.usage.batch_snapshot();
+    let _ = writeln!(out, "# TYPE tcpool_batch_units_used gauge");
+    let _ = writeln!(
+        out,
+        "tcpool_batch_units_used{{{labels}}} {}",
+        fmt_f64(batch_used)
+    );
+    let _ = writeln!(out, "# TYPE tcpool_batch_jobs_active gauge");
+    let _ = writeln!(out, "tcpool_batch_jobs_active{{{labels}}} {batch_jobs}");
+    let _ = writeln!(out, "# TYPE tcpool_batch_headroom_units gauge");
+    let _ = writeln!(
+        out,
+        "tcpool_batch_headroom_units{{{labels}}} {}",
+        fmt_f64(state.usage.headroom())
+    );
+
     let _ = writeln!(out, "# TYPE tcpool_jobs_total counter");
     for outcome in Outcome::ALL {
         let n = state.metrics.jobs_total[outcome as usize].load(Ordering::Relaxed);
         let _ = writeln!(
             out,
             "tcpool_jobs_total{{{labels},outcome=\"{}\"}} {n}",
+            outcome.as_str()
+        );
+    }
+
+    let _ = writeln!(out, "# TYPE tcpool_dv81_total counter");
+    for outcome in Dv81Outcome::ALL {
+        let n = state.metrics.dv81_total[outcome as usize].load(Ordering::Relaxed);
+        let _ = writeln!(
+            out,
+            "tcpool_dv81_total{{{labels},outcome=\"{}\"}} {n}",
             outcome.as_str()
         );
     }
@@ -296,6 +428,13 @@ pub fn render(state: &State) -> String {
         out,
         "tcpool_draining{{{labels}}} {}",
         *state.drain.borrow() as u8
+    );
+
+    let _ = writeln!(out, "# TYPE tcpool_orphans_paused gauge");
+    let _ = writeln!(
+        out,
+        "tcpool_orphans_paused{{{labels}}} {}",
+        state.metrics.orphans_paused.load(Ordering::Relaxed)
     );
 
     let _ = writeln!(out, "# TYPE tcpool_build_info gauge");
@@ -399,11 +538,18 @@ mod tests {
         m.inc(Outcome::Accepted);
         m.inc(Outcome::Accepted);
         m.inc(Outcome::ExitOk);
+        m.inc(Outcome::BusyHeadroom);
+        m.inc(Outcome::Preempted);
+        m.inc(Outcome::Preempted);
+        m.inc(Outcome::BatchAccepted);
         for outcome in Outcome::ALL {
             let n = m.jobs_total[outcome as usize].load(Ordering::Relaxed);
             match outcome {
                 Outcome::Accepted => assert_eq!(n, 2),
                 Outcome::ExitOk => assert_eq!(n, 1),
+                Outcome::BusyHeadroom => assert_eq!(n, 1),
+                Outcome::Preempted => assert_eq!(n, 2),
+                Outcome::BatchAccepted => assert_eq!(n, 1),
                 _ => assert_eq!(n, 0),
             }
         }

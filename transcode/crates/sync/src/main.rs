@@ -10,21 +10,30 @@
 //!   headless Service; every A/AAAA record is one agent) is resolved first, then any `TC_WORKERS`
 //!   entry for an address DNS did not return is merged in, so the static list still works during a
 //!   resolver outage.
-//! - An offer is `effective = the user's choice AND the pool can`. When it is off, why it is off
-//!   (the user disabled it vs a configured worker cannot output it) is recorded and served on
-//!   `/status` (crate::status).
+//! - Offers are not written until every worker this cycle knows about (`worker_set`: this round's
+//!   targets plus every worker already persisted) has been seen at least once, or TC_STARTUP_GRACE
+//!   has passed: a fresh start with no caps file would otherwise count a slow-to-answer worker as
+//!   H.264-only and switch HEVC off in Jellyfin for a cycle. Until then Jellyfin's current values
+//!   are left alone.
+//! - Every Jellyfin in JF_URL is reconciled (one per replica: each keeps its own encoding.xml). An
+//!   offer is `effective = the user's choice AND the pool can`, ANDed again across every JF_URL
+//!   target so the metric/`/status` reflect the strictest replica; one unreachable target does not
+//!   block the others.
+//! - When it is off, why it is off (the user disabled it vs a configured worker cannot output it)
+//!   is recorded and served on `/status` (crate::status).
 //!
-//! Env: TC_WORKERS_DNS, TC_WORKERS, JF_URL (default http://127.0.0.1:8096), JF_API_KEY,
-//! TC_CAPS_FILE (default /config/tc-mesh-caps.json), TC_SYNC_EVERY (s, default 30), TC_TRANSCODE_DIR,
+//! Env: TC_WORKERS_DNS, TC_WORKERS, JF_URL (comma-separated list, default http://127.0.0.1:8096),
+//! JF_API_KEY (shared by all JF_URL targets), TC_CAPS_FILE (default /config/tc-mesh-caps.json),
+//! TC_SYNC_EVERY (s, default 30), TC_STARTUP_GRACE (s, default 120), TC_TRANSCODE_DIR,
 //! TC_SYNC_ONCE, TC_METRICS_PORT (Prometheus metrics and the /status JSON on one port).
 
 mod metrics;
 mod status;
 
 use serde::{Deserialize, Serialize};
+use status::Offer;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
-use status::Offer;
 use tcpool_proto::worker_client::WorkerClient;
 use tcpool_proto::HelloRequest;
 use tonic::transport::Endpoint;
@@ -168,7 +177,9 @@ async fn targets() -> Vec<Target> {
         Some((host, port)) => match resolve_dns(&host, port).await {
             Ok(t) => t,
             Err(e) => {
-                log(&format!("TC_WORKERS_DNS {host}:{port} did not resolve: {e}"));
+                log(&format!(
+                    "TC_WORKERS_DNS {host}:{port} did not resolve: {e}"
+                ));
                 Vec::new()
             }
         },
@@ -275,6 +286,21 @@ fn worker_set(targets: &[Target], known: &BTreeMap<String, Known>) -> Vec<String
     names.into_iter().collect()
 }
 
+/// Configured workers that have never reported (not in `known`, persisted or fresh).
+fn unseen(configured: &[String], known: &BTreeMap<String, Known>) -> Vec<String> {
+    configured
+        .iter()
+        .filter(|n| !known.contains_key(*n))
+        .cloned()
+        .collect()
+}
+
+/// Hold off writing offers while the worker view is incomplete, until `grace` has passed since
+/// startup; after that an unseen worker is treated as H.264-only (the conservative default).
+fn hold_offers(unseen: &[String], since_start: Duration, grace: Duration) -> bool {
+    !unseen.is_empty() && since_start < grace
+}
+
 /// Which configured workers cannot output `token`. A worker that has never reported is assumed
 /// h264-only -- the same fallback `common` uses, so the two never disagree about a worker.
 fn lacking(configured: &[String], known: &BTreeMap<String, Known>, token: &str) -> Vec<String> {
@@ -288,6 +314,20 @@ fn lacking(configured: &[String], known: &BTreeMap<String, Known>, token: &str) 
         })
         .cloned()
         .collect()
+}
+
+/// JF_URL: one or more Jellyfin base URLs, comma-separated (blank entries ignored).
+fn jf_targets(raw: &str) -> Vec<String> {
+    let v: Vec<String> = raw
+        .split(',')
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .collect();
+    if v.is_empty() {
+        vec!["http://127.0.0.1:8096".to_string()]
+    } else {
+        v
+    }
 }
 
 fn jf_agent() -> ureq::Agent {
@@ -367,28 +407,28 @@ fn decide(
     )
 }
 
-/// Reconciles Jellyfin's encoding options with `common`, and returns the offers for
-/// `tcpool_jellyfin_offer` / `/status` -- read back from `enc` (Jellyfin's actual config), not just
-/// the value tcpool intended to write, so the result reflects Jellyfin's now-current state rather
-/// than a POST that silently no-opped.
-fn apply_offers(
+/// Reconciles one Jellyfin's encoding options with `common`/`decide`'s per-offer intent, and
+/// returns the offers read back from `enc` (Jellyfin's actual config), not just the value tcpool
+/// intended to write, so the result reflects Jellyfin's now-current state rather than a POST that
+/// silently no-opped -- plus the next `OfferState` to persist for this target's intent tracking.
+fn apply_offers_to(
+    agent: &ureq::Agent,
+    base: &str,
+    auth: &str,
     common: &[String],
     configured: &[String],
     known: &BTreeMap<String, Known>,
     prev_state: &BTreeMap<String, OfferState>,
 ) -> Result<(Vec<Offer>, BTreeMap<String, OfferState>), String> {
-    let base = env("JF_URL", "http://127.0.0.1:8096");
-    let auth = format!("MediaBrowser Token=\"{}\"", env("JF_API_KEY", ""));
-    let agent = jf_agent();
     let url = format!("{base}/System/Configuration/encoding");
     let mut enc: serde_json::Value = agent
         .get(&url)
-        .header("Authorization", &auth)
+        .header("Authorization", auth)
         .call()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{base}: {e}"))?
         .body_mut()
         .read_json()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{base}: {e}"))?;
     let mut changed = false;
     let mut offers = Vec::new();
     let mut next_state = BTreeMap::new();
@@ -406,7 +446,7 @@ fn apply_offers(
         );
         if raw != Some(offer.effective) {
             log(&format!(
-                "offer {option}: -> {} ({})",
+                "{base}: offer {option}: -> {} ({})",
                 offer.effective, offer.reason
             ));
             enc[*option] = serde_json::Value::Bool(offer.effective);
@@ -415,15 +455,12 @@ fn apply_offers(
         next_state.insert((*option).to_string(), state);
         offers.push(offer);
     }
-    if common.iter().any(|c| c == "hevc") && !common.iter().any(|c| c == "hevc10") {
-        log("note: every worker encodes HEVC 8-bit but not all encode HEVC 10-bit; Jellyfin has no separate 10-bit offer");
-    }
     if changed {
         agent
             .post(&url)
-            .header("Authorization", &auth)
+            .header("Authorization", auth)
             .send_json(&enc)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{base}: {e}"))?;
     }
     for offer in &mut offers {
         offer.effective = enc
@@ -432,6 +469,49 @@ fn apply_offers(
             .unwrap_or(false);
     }
     Ok((offers, next_state))
+}
+
+/// Reconciles every Jellyfin in `targets` (each replica keeps its own encoding.xml). One
+/// unreachable target does not stop the others; the cycle fails (and the offer metric keeps its
+/// last value) if any target failed. A returned offer is `effective` only if it is on in every
+/// target; the persisted `OfferState` (intent tracking) is taken from the first target that
+/// answered, since intent is the operator's single choice, not a per-replica one.
+fn apply_offers(
+    targets: &[String],
+    auth: &str,
+    common: &[String],
+    configured: &[String],
+    known: &BTreeMap<String, Known>,
+    prev_state: &BTreeMap<String, OfferState>,
+) -> Result<(Vec<Offer>, BTreeMap<String, OfferState>), String> {
+    let agent = jf_agent();
+    if common.iter().any(|c| c == "hevc") && !common.iter().any(|c| c == "hevc10") {
+        log("note: every worker encodes HEVC 8-bit but not all encode HEVC 10-bit; Jellyfin has no separate 10-bit offer");
+    }
+    let mut merged: Option<Vec<Offer>> = None;
+    let mut merged_state: Option<BTreeMap<String, OfferState>> = None;
+    let mut errors = Vec::new();
+    for base in targets {
+        match apply_offers_to(&agent, base, auth, common, configured, known, prev_state) {
+            Ok((offers, state)) => {
+                match &mut merged {
+                    None => merged = Some(offers),
+                    Some(m) => {
+                        for (mo, o) in m.iter_mut().zip(offers) {
+                            mo.effective &= o.effective;
+                        }
+                    }
+                }
+                merged_state.get_or_insert(state);
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    if errors.is_empty() {
+        Ok((merged.unwrap_or_default(), merged_state.unwrap_or_default()))
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 /// Jellyfin wipes its transcode dir (marker included) at startup, and every transcode re-creates
@@ -459,7 +539,14 @@ fn keep_marker(dir: String) {
     });
 }
 
-async fn sync_once(state: &mut StateFile, targets: &[Target]) -> Result<Vec<Offer>, String> {
+/// One Hello round plus offer reconciliation. `Ok(None)`: offers deliberately not written this
+/// cycle (incomplete worker view during the startup grace).
+async fn sync_once(
+    state: &mut StateFile,
+    targets: &[Target],
+    since_start: Duration,
+    grace: Duration,
+) -> Result<Option<Vec<Offer>>, String> {
     let mut live = Vec::new();
     for Target { name, addr, .. } in targets {
         match hello(addr).await {
@@ -504,15 +591,27 @@ async fn sync_once(state: &mut StateFile, targets: &[Target]) -> Result<Vec<Offe
     state.common = common.clone();
     state.live = live;
     state.synced_unix = now_unix();
+    let missing = unseen(&names, &state.workers);
+    if hold_offers(&missing, since_start, grace) {
+        log(&format!(
+            "not writing offers yet: no report from {} ({}s of {}s startup grace)",
+            missing.join(", "),
+            since_start.as_secs(),
+            grace.as_secs()
+        ));
+        return Ok(None);
+    }
     let workers = state.workers.clone();
     let prev_offers = state.offers.clone();
+    let jf = jf_targets(&env("JF_URL", ""));
+    let auth = format!("MediaBrowser Token=\"{}\"", env("JF_API_KEY", ""));
     let (offers, next_state) = tokio::task::spawn_blocking(move || {
-        apply_offers(&common, &names, &workers, &prev_offers)
+        apply_offers(&jf, &auth, &common, &names, &workers, &prev_offers)
     })
     .await
     .map_err(|e| e.to_string())??;
     state.offers = next_state;
-    Ok(offers)
+    Ok(Some(offers))
 }
 
 /// Rebuild the metrics/status snapshot from the latest sync state and this cycle's discovery.
@@ -579,6 +678,8 @@ async fn main() {
     }
     let caps_file = env("TC_CAPS_FILE", "/config/tc-mesh-caps.json");
     let every = Duration::from_secs(env("TC_SYNC_EVERY", "30").parse().unwrap_or(30));
+    let grace = Duration::from_secs(env("TC_STARTUP_GRACE", "120").parse().unwrap_or(120));
+    let started = std::time::Instant::now();
     let mut state: StateFile = std::fs::read_to_string(&caps_file)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -596,8 +697,9 @@ async fn main() {
 
     loop {
         let targets = targets().await;
-        match sync_once(&mut state, &targets).await {
-            Ok(offers) => {
+        match sync_once(&mut state, &targets, started.elapsed(), grace).await {
+            Ok(None) => refresh_metrics(&shared_metrics, &state, &targets, None),
+            Ok(Some(offers)) => {
                 state.last_success_unix = now_unix();
                 refresh_metrics(&shared_metrics, &state, &targets, Some(&offers));
             }
@@ -626,6 +728,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     fn known(outputs: &[&str]) -> Known {
         Known {
@@ -734,6 +837,38 @@ mod tests {
     }
 
     #[test]
+    fn offers_held_until_every_worker_seen_or_grace_over() {
+        let mut known_map = BTreeMap::new();
+        known_map.insert("qsv".to_string(), known(&["h264", "hevc"]));
+        let cfg = vec!["qsv".to_string(), "nvenc".to_string()];
+        let missing = unseen(&cfg, &known_map);
+        assert_eq!(missing, vec!["nvenc"]);
+        let grace = Duration::from_secs(120);
+        assert!(hold_offers(&missing, Duration::from_secs(0), grace));
+        assert!(hold_offers(&missing, Duration::from_secs(119), grace));
+        // Grace over: fall back to "unseen = H.264 only".
+        assert!(!hold_offers(&missing, Duration::from_secs(120), grace));
+        // Complete view (persisted entries count): write at once.
+        known_map.insert("nvenc".to_string(), known(&["h264", "hevc"]));
+        assert!(unseen(&cfg, &known_map).is_empty());
+        assert!(!hold_offers(
+            &unseen(&cfg, &known_map),
+            Duration::ZERO,
+            grace
+        ));
+    }
+
+    #[test]
+    fn jf_url_is_a_list() {
+        assert_eq!(
+            jf_targets("http://a:8096, http://b:8096/ ,,"),
+            vec!["http://a:8096", "http://b:8096"]
+        );
+        assert_eq!(jf_targets("http://a:8096"), vec!["http://a:8096"]);
+        assert_eq!(jf_targets(""), vec!["http://127.0.0.1:8096"]);
+    }
+
+    #[test]
     fn first_run_trusts_jellyfin_and_reports_the_pool_as_the_blocker() {
         let (offer, state) = decide(
             "AllowHevcEncoding",
@@ -790,7 +925,13 @@ mod tests {
         assert!(offer.intent, "the user's choice is still on");
         assert!(offer.effective, "and the offer comes back with the pool");
         assert_eq!(offer.cause, "enabled");
-        assert_eq!(state, OfferState { intent: true, applied: Some(true) });
+        assert_eq!(
+            state,
+            OfferState {
+                intent: true,
+                applied: Some(true)
+            }
+        );
 
         // Still cannot: reported as the pool's fault, with the worker named.
         let (offer, _) = decide(
@@ -823,7 +964,13 @@ mod tests {
         assert!(!offer.intent);
         assert!(!offer.effective);
         assert_eq!(offer.cause, "user_disabled");
-        assert_eq!(state, OfferState { intent: false, applied: Some(false) });
+        assert_eq!(
+            state,
+            OfferState {
+                intent: false,
+                applied: Some(false)
+            }
+        );
         // And the reverse: the user turns it back on.
         let prev = OfferState {
             intent: false,
@@ -852,10 +999,7 @@ mod tests {
             None,
         );
         assert_eq!(offer.cause, "pool_cannot");
-        assert_eq!(
-            offer.reason,
-            "p4, 10.42.0.9:9901 cannot output hevc"
-        );
+        assert_eq!(offer.reason, "p4, 10.42.0.9:9901 cannot output hevc");
     }
 
     #[test]
@@ -881,5 +1025,157 @@ mod tests {
         assert_eq!(state.workers["arc"].capacity, 14.0);
         assert!(state.offers.is_empty());
         assert_eq!(state.workers["arc"].addr, "");
+    }
+
+    /// Minimal Jellyfin stand-in: GET returns `enc`, POST bodies are recorded. Serves until the
+    /// test ends; every response closes the connection.
+    fn fake_jellyfin(enc: serde_json::Value) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let log: Arc<Mutex<Vec<String>>> = Default::default();
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut r = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    r.read_line(&mut h).unwrap();
+                    if h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0u8; len];
+                r.read_exact(&mut body).unwrap();
+                let method = line.split(' ').next().unwrap_or("").to_string();
+                seen.lock()
+                    .unwrap()
+                    .push(format!("{method} {}", String::from_utf8_lossy(&body)));
+                let resp = if method == "GET" {
+                    let b = enc.to_string();
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())
+                } else {
+                    "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
+                };
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (base, log)
+    }
+
+    #[test]
+    fn every_jellyfin_target_is_written() {
+        // AllowHevcEncoding starts true: with no persisted OfferState this is read as the user's
+        // own intent (the upgrade path -- see `decide`'s doc comment), so the pool being able to
+        // do hevc keeps it effective=true (no POST needed for this option). AllowAv1Encoding
+        // starts true (the user wants it) but the pool cannot do av1, so `decide` flips it to
+        // false and a POST is required -- exercising the write path this test is named for.
+        let enc =
+            serde_json::json!({"AllowHevcEncoding": true, "AllowAv1Encoding": true, "Keep": 7});
+        let (qsv, qsv_log) = fake_jellyfin(enc.clone());
+        let (nvenc, nvenc_log) = fake_jellyfin(enc);
+        let mut known_map = BTreeMap::new();
+        known_map.insert("qsv".to_string(), known(&["h264", "hevc", "av1"]));
+        known_map.insert("nvenc".to_string(), known(&["h264", "hevc"]));
+        let cfg = vec!["qsv".to_string(), "nvenc".to_string()];
+        let common = common(&cfg, &known_map);
+        let (offers, _) = apply_offers(
+            &[qsv, nvenc],
+            "t",
+            &common,
+            &cfg,
+            &known_map,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let by_option: BTreeMap<&str, bool> =
+            offers.iter().map(|o| (o.option, o.effective)).collect();
+        assert!(by_option["AllowHevcEncoding"]);
+        assert!(!by_option["AllowAv1Encoding"]);
+        for log in [qsv_log, nvenc_log] {
+            let log = log.lock().unwrap();
+            assert_eq!(log.len(), 2, "{log:?}");
+            assert!(log[0].starts_with("GET"));
+            let posted: serde_json::Value =
+                serde_json::from_str(log[1].strip_prefix("POST ").unwrap()).unwrap();
+            assert_eq!(posted["AllowHevcEncoding"], true);
+            assert_eq!(posted["AllowAv1Encoding"], false);
+            assert_eq!(posted["Keep"], 7, "other encoding options preserved");
+        }
+    }
+
+    #[test]
+    fn one_unreachable_target_does_not_block_the_other() {
+        let (up, up_log) = fake_jellyfin(serde_json::json!({"AllowHevcEncoding": false}));
+        let down = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        }; // listener dropped: connection refused
+        let mut known_map = BTreeMap::new();
+        known_map.insert("qsv".to_string(), known(&["h264", "hevc"]));
+        let cfg = vec!["qsv".to_string()];
+        let err = apply_offers(
+            &[down.clone(), up],
+            "t",
+            &["h264".into(), "hevc".into()],
+            &cfg,
+            &known_map,
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains(&down), "{err}");
+        assert_eq!(
+            up_log.lock().unwrap().len(),
+            2,
+            "reachable target still written"
+        );
+    }
+
+    /// The startup bug: no caps file, a worker that doesn't answer the first Hello. Before the fix
+    /// this wrote AllowHevcEncoding=false to Jellyfin; now Jellyfin is not contacted at all.
+    #[tokio::test]
+    async fn fresh_start_with_silent_worker_writes_nothing() {
+        let (jf, jf_log) = fake_jellyfin(serde_json::json!({"AllowHevcEncoding": true}));
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        // Only this test sets these variables.
+        std::env::set_var("JF_URL", &jf);
+        let targets = vec![t("nvenc", &dead, "static")];
+        let mut state = StateFile::default();
+        let r = sync_once(
+            &mut state,
+            &targets,
+            Duration::ZERO,
+            Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
+        assert!(r.is_none());
+        assert!(
+            jf_log.lock().unwrap().is_empty(),
+            "Jellyfin must not be touched"
+        );
+        // Grace over: the conservative write happens.
+        let r = sync_once(
+            &mut state,
+            &targets,
+            Duration::from_secs(120),
+            Duration::from_secs(120),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let hevc = r.iter().find(|o| o.option == "AllowHevcEncoding").unwrap();
+        assert!(!hevc.effective);
+        std::env::remove_var("JF_URL");
     }
 }

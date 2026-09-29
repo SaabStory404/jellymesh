@@ -1,0 +1,500 @@
+diff --git a/Jellyfin.Api/Controllers/DynamicHlsController.cs b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+--- a/Jellyfin.Api/Controllers/DynamicHlsController.cs
++++ b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+@@ -1977,7 +1977,16 @@
+             var clientSupportsDoVi = requestedRange.Contains(VideoRangeType.DOVI.ToString(), StringComparison.OrdinalIgnoreCase);
+             var videoIsDoVi = EncodingHelper.IsDovi(state.VideoStream);
+ 
+-            if (EncodingHelper.IsCopyCodec(codec)
++            var doviP7ToP81TagArgs = isActualOutputVideoCodecHevc && EncodingHelper.IsCopyCodec(codec)
++                ? _encodingHelper.GetDoviP7ToP81CodecTagArgs(state)
++                : string.Empty;
++
++            if (doviP7ToP81TagArgs.Length > 0)
++            {
++                // JELLYMESH_DOVI_P7_TO_81 (bughunt 17): see GetDoviP7ToP81CodecTagArgs.
++                args += doviP7ToP81TagArgs;
++            }
++            else if (EncodingHelper.IsCopyCodec(codec)
+                 && (videoIsDoVi && clientSupportsDoVi)
+                 && !_encodingHelper.IsDoviRemoved(state))
+             {
+diff --git a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+--- a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
++++ b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+@@ -1591,6 +1591,26 @@
+             return IsDoviP7ToP81Converted(state) ? " -metadata:s:v:0 JELLYMESH_DOVI_P7_TO_81=1" : string.Empty;
+         }
+ 
++        /// <summary>
++        /// JELLYMESH_DOVI_P7_TO_81 (bughunt 17): the sample-entry tag for a copied HEVC stream that
++        /// this job converts from profile 7 to profile 8.1, or an empty string when it does not
++        /// convert. The output has an HDR10-compatible base layer, so it is tagged <c>hvc1</c>
++        /// whatever ranges the client declared (the stock argument builder would pick <c>dvh1</c>
++        /// for a client that lists "DOVI"). With <c>-strict -2</c> the transcode pool's mp4 muxer
++        /// writes a <c>dvvC</c> box (profile 8, BL compatibility 1) under it. That is the sample
++        /// entry the master playlist's <c>CODECS="hvc1…"</c> +
++        /// <c>SUPPLEMENTAL-CODECS="dvh1.08.LL/db1p"</c> + <c>VIDEO-RANGE=PQ</c> describes (the
++        /// Apple HLS authoring specification's Dolby Vision 8.1 example); media3 reads Dolby Vision
++        /// from the <c>dvvC</c> box, and a player without Dolby Vision sees plain HEVC/HDR10.
++        /// MPEG-TS ignores the tag.
++        /// </summary>
++        /// <param name="state">The encoding job.</param>
++        /// <returns>The tag arguments (with a leading space), or an empty string.</returns>
++        public string GetDoviP7ToP81CodecTagArgs(EncodingJobInfo state)
++        {
++            return IsDoviP7ToP81Converted(state) ? " -tag:v:0 hvc1 -strict -2" : string.Empty;
++        }
++
+         public string GetBitStreamArgs(EncodingJobInfo state, MediaStreamType streamType)
+         {
+             if (state is null)
+diff --git a/MediaBrowser.Model/Dlna/StreamBuilder.cs b/MediaBrowser.Model/Dlna/StreamBuilder.cs
+--- a/MediaBrowser.Model/Dlna/StreamBuilder.cs
++++ b/MediaBrowser.Model/Dlna/StreamBuilder.cs
+@@ -836,7 +836,46 @@
+                 {
+                     SetStreamInfoOptionsFromTranscodingProfile(item, playlistItem, transcodingProfile);
+ 
+-                    BuildStreamVideoItem(playlistItem, options, item, videoStream, audioStream, candidateAudioStreams, transcodingProfile.Container, transcodingProfile.VideoCodec, transcodingProfile.AudioCodec);
++                    // JELLYMESH_DOVI_P7_TO_81 (bughunt 17): a profile-7 source that this job will serve
++                    // as profile 8.1 goes out as fMP4 HLS, not MPEG-TS. Only the dvvC box of an fMP4
++                    // init segment marks the 8.1 stream as Dolby Vision to the player: media3's
++                    // TsExtractor/H265Reader always report video/hevc, so Android TV decodes the base
++                    // layer as HDR10; Apple requires fMP4 for HEVC and Dolby Vision. It also lifts the
++                    // TS-only HLS audio list below, so a TrueHD track the client declares is copied
++                    // instead of transcoded. UseMostCompatibleTranscodingProfile (the client's retry
++                    // after a failed playback) keeps TS.
++                    var transcodingContainer = transcodingProfile.Container;
++                    // Only when the audio is copied too: Jellyfin's fMP4 argv (-copyts
++                    // -avoid_negative_ts disabled) gives an encoded AAC/AC-3 track a negative first
++                    // tfdt (the encoder priming, MEASURED -2048 for libfdk_aac), which media3's
++                    // FragmentedMp4Extractor rejects ("Top bit not zero"), so an audio transcode
++                    // stays on TS (HDR10, as before) rather than failing to play.
++                    var doviP7ToP81Fmp4 = !item.UseMostCompatibleTranscodingProfile
++                        && string.Equals(transcodingContainer, "ts", StringComparison.OrdinalIgnoreCase)
++                        && WillConvertDoviP7ToP81(options, item, videoStream, transcodingProfile, "mp4")
++                        && WillCopyAudio(options, item, audioStream, candidateAudioStreams, playlistItem, transcodingProfile.AudioCodec, "mp4");
++                    if (doviP7ToP81Fmp4)
++                    {
++                        transcodingContainer = "mp4";
++                        item.TranscodingContainer = transcodingContainer;
++                        playlistItem.Container = transcodingContainer;
++                    }
++
++                    BuildStreamVideoItem(playlistItem, options, item, videoStream, audioStream, candidateAudioStreams, transcodingContainer, transcodingProfile.VideoCodec, transcodingProfile.AudioCodec);
++
++                    // More than one audio codec left means the audio is transcoded, not copied: keep
++                    // the target list the TS profile would have had. The mp4 list can be longer
++                    // than DynamicHlsController accepts (AudioCodec is limited to 40 characters;
++                    // the Android TV app's list filtered for mp4 is 42) and would then fail the
++                    // whole playback with HTTP 400.
++                    if (doviP7ToP81Fmp4 && playlistItem.AudioCodecs.Count > 1)
++                    {
++                        var tsAudioCodecs = playlistItem.AudioCodecs.Where(codec => _supportedHlsAudioCodecsTs.Contains(codec)).ToList();
++                        if (tsAudioCodecs.Count > 0)
++                        {
++                            playlistItem.AudioCodecs = tsAudioCodecs;
++                        }
++                    }
+ 
+                     playlistItem.PlayMethod = PlayMethod.Transcode;
+ 
+@@ -869,6 +908,78 @@
+             return playlistItem;
+         }
+ 
++        /// <summary>
++        /// JELLYMESH_DOVI_P7_TO_81 (bughunt 17): whether an HLS job built from
++        /// <paramref name="transcodingProfile"/> (segments in <paramref name="container"/>) will have
++        /// EncodingHelper convert the profile-7 source to profile 8.1. Mirrors
++        /// EncodingHelper.ShouldRemoveDynamicHdrMetadata's ConvertDoviP7ToP81 case on the range
++        /// types this StreamInfo will send (the "&lt;codec&gt;-rangetype" option that
++        /// BuildStreamVideoItem derives from the applicable video CodecProfile conditions): the
++        /// flag is on, the source is DOVIWithEL (not DOVIWithELHDR10Plus), the source codec can be
++        /// copied, and the declared ranges include DOVI or DOVIWithHDR10 but not DOVIWithEL.
++        /// </summary>
++        private bool WillConvertDoviP7ToP81(MediaOptions options, MediaSourceInfo item, MediaStream? videoStream, TranscodingProfile transcodingProfile, string container)
++        {
++            if (!DoviP7ToP81Enabled
++                || transcodingProfile.Protocol != MediaStreamProtocol.hls
++                || videoStream is null
++                || videoStream.VideoRangeType != VideoRangeType.DOVIWithEL
++                || !options.AllowVideoStreamCopy
++                || string.IsNullOrEmpty(videoStream.Codec)
++                || !ContainerHelper.ContainsContainer(transcodingProfile.VideoCodec, videoStream.Codec))
++            {
++                return false;
++            }
++
++            var codec = videoStream.Codec;
++
++            // Same selection and order as BuildStreamVideoItem's appliedVideoConditions, applied to a
++            // scratch StreamInfo so only the resulting rangetype option is read.
++            var scratch = new StreamInfo { DeviceProfile = options.Profile };
++            var applied = options.Profile.CodecProfiles
++                .Where(i => i.Type == CodecType.Video
++                    && i.ContainsAnyCodec(codec, container, true)
++                    && !CheckVideoConditions(i.ApplyConditions, item, videoStream).Any())
++                .Reverse();
++            foreach (var codecProfile in applied)
++            {
++                ApplyTranscodingConditions(scratch, codecProfile.Conditions, codec, true, true);
++            }
++
++            var rangeTypes = ContainerHelper.Split(scratch.GetOption(codec, "rangetype"));
++            bool Has(VideoRangeType t) => rangeTypes.Contains(t.ToString(), StringComparer.OrdinalIgnoreCase);
++
++            return !Has(VideoRangeType.DOVIWithEL) && (Has(VideoRangeType.DOVI) || Has(VideoRangeType.DOVIWithHDR10));
++        }
++
++        /// <summary>
++        /// Bughunt 17: whether BuildStreamVideoItem, called for an HLS item with segments in
++        /// <paramref name="container"/>, would copy the audio stream rather than transcode it (or
++        /// there is no audio). The same checks, in the same order, as its audio part.
++        /// </summary>
++        private bool WillCopyAudio(MediaOptions options, MediaSourceInfo item, MediaStream? audioStream, IEnumerable<MediaStream> candidateAudioStreams, StreamInfo playlistItem, string? profileAudioCodecs, string container)
++        {
++            if (audioStream is null)
++            {
++                return true;
++            }
++
++            var audioCodecs = ContainerHelper.Split(profileAudioCodecs).ToList();
++            if (audioCodecs.Count == 0)
++            {
++                audioCodecs.Add(audioStream.Codec);
++            }
++
++            var hlsAudioCodecs = string.Equals(container, "mp4", StringComparison.OrdinalIgnoreCase) ? _supportedHlsAudioCodecsMp4 : _supportedHlsAudioCodecsTs;
++            audioCodecs = audioCodecs.Where(codec => hlsAudioCodecs.Contains(codec)).ToList();
++
++            var stream = candidateAudioStreams.FirstOrDefault(s => ContainerHelper.ContainsContainer(audioCodecs, false, s.Codec));
++            return stream is not null
++                && !(stream.Channels > (playlistItem.TranscodingMaxAudioChannels ?? int.MaxValue))
++                && GetCompatibilityAudioCodec(options, item, container, stream, null, true, false) == 0
++                && !playlistItem.TranscodeReasons.HasFlag(TranscodeReason.ContainerBitrateExceedsLimit);
++        }
++
+         private (TranscodingProfile? Profile, PlayMethod? PlayMethod) GetVideoTranscodeProfile(
+             MediaSourceInfo item,
+             MediaOptions options,
+diff --git a/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs b/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs
+--- a/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs
++++ b/tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs
+@@ -137,6 +137,7 @@
+             Assert.False(helper.IsHdr10PlusRemoved(state));
+             Assert.Equal("-bsf:v hevc_mp4toannexb", helper.GetBitStreamArgs(state, MediaStreamType.Video));
+             Assert.Equal(" -metadata:s:v:0 JELLYMESH_DOVI_P7_TO_81=1", helper.GetDoviP7ToP81MarkerArgs(state));
++            Assert.Equal(" -tag:v:0 hvc1 -strict -2", helper.GetDoviP7ToP81CodecTagArgs(state));
+             Assert.True(helper.CanStreamCopyVideo(state, state.VideoStream));
+         }
+     }
+@@ -162,6 +163,7 @@
+         Assert.False(helper.IsDoviP7ToP81Converted(state));
+         Assert.False(helper.IsDoviRemoved(state));
+         Assert.Equal(string.Empty, helper.GetDoviP7ToP81MarkerArgs(state));
++        Assert.Equal(string.Empty, helper.GetDoviP7ToP81CodecTagArgs(state));
+         Assert.Equal("-bsf:v hevc_mp4toannexb", helper.GetBitStreamArgs(state, MediaStreamType.Video));
+     }
+ 
+@@ -176,6 +178,7 @@
+         Assert.False(helper.IsDoviP7ToP81Converted(state));
+         Assert.True(helper.IsDoviRemoved(state));
+         Assert.Equal(string.Empty, helper.GetDoviP7ToP81MarkerArgs(state));
++        Assert.Equal(string.Empty, helper.GetDoviP7ToP81CodecTagArgs(state));
+         Assert.Contains("hevc_metadata=remove_dovi=1", helper.GetBitStreamArgs(state, MediaStreamType.Video), StringComparison.Ordinal);
+     }
+ 
+@@ -190,6 +193,7 @@
+         Assert.False(helper.IsDoviP7ToP81Converted(state));
+         Assert.False(helper.IsDoviRemoved(state));
+         Assert.Equal(string.Empty, helper.GetDoviP7ToP81MarkerArgs(state));
++        Assert.Equal(string.Empty, helper.GetDoviP7ToP81CodecTagArgs(state));
+         Assert.Equal("-bsf:v hevc_mp4toannexb", helper.GetBitStreamArgs(state, MediaStreamType.Video));
+     }
+ 
+@@ -206,6 +210,7 @@
+         // case) rather than silently serving unconverted profile-7 bytes as if they were 8.1.
+         Assert.False(helper.IsDoviP7ToP81Converted(state));
+         Assert.Equal(string.Empty, helper.GetDoviP7ToP81MarkerArgs(state));
++        Assert.Equal(string.Empty, helper.GetDoviP7ToP81CodecTagArgs(state));
+     }
+ 
+     [Fact]
+@@ -225,6 +230,7 @@
+         Assert.Equal(VideoRangeType.DOVIWithELHDR10Plus, state.VideoStream.VideoRangeType);
+         Assert.False(helper.IsDoviP7ToP81Converted(state));
+         Assert.Equal(string.Empty, helper.GetDoviP7ToP81MarkerArgs(state));
++        Assert.Equal(string.Empty, helper.GetDoviP7ToP81CodecTagArgs(state));
+ 
+         // Unconverted DOVIWithELHDR10Plus + a request lacking "DOVIWithEL" always strips today
+         // (EncodingHelper's pre-existing, untouched special case), regardless of DOVIWithHDR10.
+diff --git a/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Fmp4Tests.cs b/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Fmp4Tests.cs
+new file mode 100644
+--- /dev/null
++++ b/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Fmp4Tests.cs
+@@ -0,0 +1,250 @@
++using System;
++using Jellyfin.Data.Enums;
++using MediaBrowser.Model.Dlna;
++using MediaBrowser.Model.Dto;
++using MediaBrowser.Model.Entities;
++using MediaBrowser.Model.MediaInfo;
++using MediaBrowser.Model.Session;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.Model.Tests.Dlna;
++
++/// <summary>
++/// JELLYMESH_DOVI_P7_TO_81, bughunt 17: a profile-7 source that the HLS job will convert to
++/// profile 8.1 is served as fMP4 segments even when the client's only HLS TranscodingProfile is
++/// "ts", and the TrueHD track the client declares is then kept (the TS-only HLS audio list drops
++/// it). The device profile is shaped like the Android TV app's (0.19.x deviceProfile.kt): one hls/ts
++/// TranscodingProfile listing truehd among its audio codecs, and an HEVC CodecProfile that rejects
++/// the unsupported range types with a NotEquals condition gated by an EqualsAny ApplyCondition.
++/// </summary>
++// Same collection as the other JELLYMESH_DOVI_P7_TO_81 test class: both set that process-wide
++// environment variable, so they must not run in parallel with each other.
++[Collection("JELLYMESH_DOVI_P7_TO_81 env")]
++public class StreamBuilderDoviP7ToP81Fmp4Tests
++{
++    private const string DoviCapableExcluded = "DOVIInvalid|DOVIWithEL|DOVIWithELHDR10Plus";
++
++    [Fact]
++    public void ConvertedSource_TsProfile_ServedAsFmp4_WithTrueHdCopied()
++    {
++        var info = Build(enabled: true, DoviCapableExcluded);
++
++        Assert.NotNull(info);
++        Assert.Equal(PlayMethod.Transcode, info.PlayMethod);
++        Assert.Equal(MediaStreamProtocol.hls, info.SubProtocol);
++        Assert.Equal("mp4", info.Container, StringComparer.OrdinalIgnoreCase);
++        Assert.Equal(["truehd"], info.AudioCodecs);
++        Assert.Equal(1, info.AudioStreamIndex);
++        Assert.False(info.TranscodeReasons.HasFlag(TranscodeReason.AudioCodecNotSupported));
++
++        // The copy must not be refused later for bitrate (EncodingHelper compares the source
++        // bitrate with the AudioBitrate the URL carries).
++        Assert.True(info.AudioBitrate is null || info.AudioBitrate >= 4_000_000, "AudioBitrate " + info.AudioBitrate);
++
++        var url = info.ToUrl("http://server", "token", null);
++        Assert.Contains("SegmentContainer=mp4", url, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("AudioCodec=truehd", url, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("DOVIWithHDR10", url, StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public void ConvertedSource_AudioTranscoded_StaysOnTs()
++    {
++        // No audio stream may be copied here, so the audio would be encoded. Jellyfin's fMP4 argv
++        // starts an encoded track at a negative tfdt (encoder priming), which media3 cannot parse,
++        // and this profile's mp4 audio list ("aac,ac3,alac,dts,eac3,flac,mp3,opus,truehd", 42
++        // characters) is longer than DynamicHlsController's 40-character AudioCodec limit. So the
++        // job stays on TS (HDR10, as before) with the TS audio targets.
++        var info = Build(enabled: true, DoviCapableExcluded, noDefaultAudio: true);
++
++        Assert.NotNull(info);
++        Assert.Equal(PlayMethod.Transcode, info.PlayMethod);
++        Assert.Equal("ts", info.Container, StringComparer.OrdinalIgnoreCase);
++        Assert.Equal(["aac", "ac3", "eac3", "mp3"], info.AudioCodecs);
++    }
++
++    [Fact]
++    public void ConvertedSource_Ac3TrackChosen_ServedAsFmp4_WithAc3Copied()
++    {
++        var info = Build(enabled: true, DoviCapableExcluded, audioStreamIndex: 2);
++
++        Assert.NotNull(info);
++        Assert.Equal("mp4", info.Container, StringComparer.OrdinalIgnoreCase);
++        Assert.Equal(["ac3"], info.AudioCodecs);
++        Assert.Equal(2, info.AudioStreamIndex);
++    }
++
++    [Fact]
++    public void FlagOff_KeepsTs_AndTsAudioList()
++    {
++        var info = Build(enabled: false, DoviCapableExcluded);
++
++        Assert.NotNull(info);
++        Assert.Equal("ts", info.Container, StringComparer.OrdinalIgnoreCase);
++        Assert.DoesNotContain("truehd", info.AudioCodecs);
++    }
++
++    [Fact]
++    public void ClientDeclaringDoviWithEL_GetsUntouchedCopy_KeepsTs()
++    {
++        // The profile-7 stream is acceptable as is: Direct Play, no HLS job, no conversion.
++        var info = Build(enabled: true, "DOVIInvalid");
++
++        Assert.NotNull(info);
++        Assert.Equal(PlayMethod.DirectPlay, info.PlayMethod);
++        Assert.Equal("mkv", info.Container, StringComparer.OrdinalIgnoreCase);
++
++        // Forced through the HLS path (no Direct Play profile), the client still takes the
++        // untouched profile-7 copy, so the segments stay TS.
++        var hls = Build(enabled: true, "DOVIInvalid", directPlay: false);
++        Assert.NotNull(hls);
++        Assert.Equal(PlayMethod.Transcode, hls.PlayMethod);
++        Assert.Equal("ts", hls.Container, StringComparer.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void Hdr10OnlyClient_KeepsTs()
++    {
++        // Stripped to HDR10 server-side, not converted.
++        var info = Build(enabled: true, "DOVIInvalid|DOVIWithEL|DOVIWithELHDR10Plus|DOVI|DOVIWithHDR10|DOVIWithHDR10Plus");
++
++        Assert.NotNull(info);
++        Assert.Equal("ts", info.Container, StringComparer.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void MostCompatibleRetry_KeepsTs()
++    {
++        var info = Build(enabled: true, DoviCapableExcluded, mostCompatible: true);
++
++        Assert.NotNull(info);
++        Assert.Equal("ts", info.Container, StringComparer.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void DoviWithElHdr10PlusSource_NotConverted_KeepsTs()
++    {
++        var info = Build(enabled: true, DoviCapableExcluded, hdr10Plus: true);
++
++        Assert.NotNull(info);
++        Assert.Equal("ts", info.Container, StringComparer.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void NoVideoCopy_KeepsTs()
++    {
++        var info = Build(enabled: true, DoviCapableExcluded, allowVideoCopy: false);
++
++        Assert.NotNull(info);
++        Assert.Equal("ts", info.Container, StringComparer.OrdinalIgnoreCase);
++    }
++
++    private static StreamInfo? Build(bool enabled, string excludedRangeTypes, bool hdr10Plus = false, bool mostCompatible = false, bool allowVideoCopy = true, bool directPlay = true, bool noDefaultAudio = false, int? audioStreamIndex = null)
++    {
++        Environment.SetEnvironmentVariable("JELLYMESH_DOVI_P7_TO_81", enabled ? "1" : null);
++        try
++        {
++            var videoStream = new MediaStream
++            {
++                Type = MediaStreamType.Video,
++                Index = 0,
++                Codec = "hevc",
++                Profile = "Main 10",
++                Width = 3840,
++                Height = 2160,
++                BitDepth = 10,
++                BitRate = 40_000_000,
++                DvProfile = 7,
++                DvLevel = 6,
++                DvBlSignalCompatibilityId = 6,
++                RpuPresentFlag = 1,
++                BlPresentFlag = 1,
++                ElPresentFlag = 1,
++                ColorSpace = "bt2020nc",
++                ColorPrimaries = "bt2020",
++                ColorTransfer = "smpte2084",
++                Hdr10PlusPresentFlag = hdr10Plus ? true : null
++            };
++            Assert.Equal(hdr10Plus ? VideoRangeType.DOVIWithELHDR10Plus : VideoRangeType.DOVIWithEL, videoStream.VideoRangeType);
++
++            var mediaSource = new MediaSourceInfo
++            {
++                Id = "test-source",
++                Path = "/media/test.mkv",
++                Protocol = MediaProtocol.File,
++                Container = "mkv",
++                SupportsDirectPlay = true,
++                SupportsDirectStream = true,
++                SupportsTranscoding = true,
++                UseMostCompatibleTranscodingProfile = mostCompatible,
++                // "Play default audio track regardless of language" with no track flagged default:
++                // StreamBuilder then has no audio stream it may copy and transcodes it.
++                DefaultAudioIndexSource = noDefaultAudio ? AudioIndexSource.Default : AudioIndexSource.None,
++                MediaStreams =
++                [
++                    videoStream,
++                    new MediaStream { Type = MediaStreamType.Audio, Index = 1, Codec = "truehd", Profile = "Dolby TrueHD + Dolby Atmos", Channels = 8, SampleRate = 48000, BitDepth = 24, BitRate = 4_756_318, IsDefault = false },
++                    new MediaStream { Type = MediaStreamType.Audio, Index = 2, Codec = "ac3", Channels = 6, SampleRate = 48000, BitRate = 640_000 }
++                ]
++            };
++
++            const string AudioCodecs = "aac,ac3,alac,dca,dts,eac3,flac,mlp,mp2,mp3,opus,truehd,vorbis";
++            var profile = new DeviceProfile
++            {
++                Name = "Android TV app shape",
++                MaxStreamingBitrate = 120_000_000,
++                DirectPlayProfiles = directPlay
++                    ? [new DirectPlayProfile { Type = DlnaProfileType.Video, Container = "mkv,mp4", VideoCodec = "hevc,h264", AudioCodec = AudioCodecs }]
++                    : [],
++                CodecProfiles =
++                [
++                    new CodecProfile
++                    {
++                        Type = CodecType.Video,
++                        Codec = "hevc",
++                        Conditions = [new ProfileCondition(ProfileConditionType.NotEquals, ProfileConditionValue.VideoRangeType, excludedRangeTypes, false)],
++                        ApplyConditions = [new ProfileCondition(ProfileConditionType.EqualsAny, ProfileConditionValue.VideoRangeType, excludedRangeTypes, false)]
++                    }
++                ],
++                TranscodingProfiles =
++                [
++                    new TranscodingProfile
++                    {
++                        Type = DlnaProfileType.Video,
++                        Context = EncodingContext.Streaming,
++                        Protocol = MediaStreamProtocol.hls,
++                        Container = "ts",
++                        VideoCodec = "hevc,h264",
++                        AudioCodec = AudioCodecs,
++                        CopyTimestamps = false,
++                        EnableSubtitlesInManifest = true
++                    }
++                ]
++            };
++
++            var options = new MediaOptions
++            {
++                ItemId = new Guid("2B1C9C2E-6B90-4B7B-9C2E-8F6B90B4B7B9"),
++                MediaSourceId = mediaSource.Id,
++                MediaSources = [mediaSource],
++                DeviceId = "test-deviceId",
++                Profile = profile,
++                AllowAudioStreamCopy = true,
++                AllowVideoStreamCopy = allowVideoCopy,
++                EnableDirectPlay = true,
++                // MediaInfoHelper always turns Direct Stream off for PlaybackInfo.
++                EnableDirectStream = false,
++                AudioStreamIndex = audioStreamIndex
++            };
++
++            return new StreamBuilder(new Mock<ITranscoderSupport>().Object, new NullLogger<StreamBuilderDoviP7ToP81Fmp4Tests>())
++                .GetOptimalVideoStream(options);
++        }
++        finally
++        {
++            Environment.SetEnvironmentVariable("JELLYMESH_DOVI_P7_TO_81", null);
++        }
++    }
++}
+diff --git a/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Tests.cs b/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Tests.cs
+--- a/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Tests.cs
++++ b/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Tests.cs
+@@ -26,6 +26,9 @@
+ /// against the source's real, unconverted range type and must keep winning on that literal match
+ /// alone, exactly like bh-base -- see GetOptimalVideoStream_ElDeclaringCodecProfile_Enabled_ConstrainedProfileStillWins.
+ /// </summary>
++// Same collection as the other JELLYMESH_DOVI_P7_TO_81 test class: both set that process-wide
++// environment variable, so they must not run in parallel with each other.
++[Collection("JELLYMESH_DOVI_P7_TO_81 env")]
+ public class StreamBuilderDoviP7ToP81Tests
+ {
+     [Fact]

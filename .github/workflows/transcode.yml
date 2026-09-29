@@ -1,7 +1,6 @@
 ---
-# Transcode pool (transcode/): lint, unit + parity + property tests, static musl build, the
-# shim<->agent protocol suite against the native binaries, and a cargo-fuzz smoke run over the
-# IR parser (the security and correctness boundary).
+# Transcode pool (transcode/): lint, unit + parity + property tests, static musl build, and the
+# shim<->agent protocol suite against the native binaries.
 name: transcode
 
 on:
@@ -18,7 +17,8 @@ permissions:
 jobs:
   # Transcode pool native control plane (transcode): lint, unit + parity
   # tests, static musl build, and the shim<->agent protocol suite run against
-  # the native binaries (transcode/spike/proto_test.sh, 14 cases).
+  # the native binaries (transcode/spike/proto_test.sh, 21 cases: 1-16, 17a,
+  # 17b, 18, 19, 20 (20 itself run in four steps, 20a-20d), 21a-21h shared dir).
   tcpool:
     name: tcpool
     runs-on: ubuntu-latest
@@ -68,8 +68,8 @@ jobs:
           bin="$PWD/target/x86_64-unknown-linux-musl/release"
           out="$RUNNER_TEMP/proto.out"
           AGENT="$bin/tcpool-agent" SHIM="$bin/tcpool-shim" TC_PROTO_DIR="$RUNNER_TEMP/proto" \
-            timeout 600 bash spike/proto_test.sh > "$out" 2>&1 || true
-          grep -E "^==|exit=|shim gone|ffmpeg (fenced|gone|STILL)" "$out"
+            timeout 720 bash spike/proto_test.sh > "$out" 2>&1 || true
+          grep -E "^==|exit=|shim gone|ffmpeg (fenced|gone|STILL)|^batch:|^preempt-|^affinity:|^shared:" "$out"
           # every case must report its expected outcome
           test "$(grep -c '^exit=0' "$out")" -eq 7
           grep -q 'shim gone after [5-8] s' "$out"
@@ -85,6 +85,57 @@ jobs:
           grep -q 'refused: exit=0 agent_refusals=1' "$out"
           # mTLS: with a pool client cert the job runs; without one it is refused
           grep -q 'mtls: with-cert exit=0 ran_on_agent=1; without-cert fell_back=1' "$out"
+          # BATCH (trickplay): admitted on the pool with the same frame count as a local run
+          grep -q 'batch: on-pool exit=0 frames_match=yes worker=transcode -> worker batchw accepted=1' "$out"
+          # output outside TC_TRICKPLAY_OUTPUT_ROOT never reaches any worker
+          grep -q 'batch: outside-root exit=0 frames_match=yes pool_attempts=0' "$out"
+          # playback preempts a batch job BEFORE its first frame: local rerun, exit 0, full set
+          grep -q 'preempt-early: playback_exit=0 frames_at_trigger=0 batch_shim_exit=0 frames_match=yes local_runs=1 agent_preempted=1' "$out"
+          # playback preempts a batch job AFTER its first frame: shim exits non-zero (200), no
+          # local rerun, the partial set stays exactly as the pool left it
+          grep -q 'preempt-late: playback_exit=0 batch_shim_exit=200 partial=yes stable=yes local_runs=0 agent_preempted=1 no_rerun_logged=1' "$out"
+          # a batch worker is lost outright (agent + ffmpeg killed, not a preemption) AFTER its
+          # first frame: same no-local-rerun contract as preempt-late, via Attempt::Lost
+          grep -q 'batch: lost-after-frame exit=200 partial=yes stable=yes local_runs=0 no_rerun_logged=1' "$out"
+          # TC_ACCEPT_BATCH=0 and a headroom-full worker both fall back to a local run
+          grep -q 'batch: accept-off exit=0 frames_match=yes reason=1' "$out"
+          grep -q 'batch: headroom-full exit=0 frames_match=yes reason=1' "$out"
+          # TC_BATCH unset (default): trickplay never contacts the pool
+          grep -q 'batch: gate-off exit=0 frames_match=yes pool_attempts=0' "$out"
+          # Seek affinity: the initial start pins worker "affa" (both idle, listed first)
+          grep -q 'affinity: start exit=0 worker=affa pinned=affa' "$out"
+          # a seek (-start_number, same output prefix) stays on the pin even though the other
+          # worker is now the freer one by rank()'s own metric
+          grep -q 'affinity: seek exit=0 worker=affa pinned=affa same_worker=yes' "$out"
+          grep -q 'affinity hit: pinning worker affa to the front' "$out"
+          # killing the pinned worker mid-stream: 255 exit, pin cleared before it, not after
+          grep -q 'affinity: kill exit=255 pinned=absent' "$out"
+          grep -q 'affinity cleared: worker affa lost' "$out"
+          # the restart after the kill lands on the survivor and re-pins to it
+          grep -q 'affinity: restart exit=0 worker=affb pinned=affb' "$out"
+          # a stall (agent watchdog kills ffmpeg; agent itself stays healthy) also clears the pin
+          # -- regression for the gap where only the dropped-connection (Lost) path cleared it
+          grep -q 'affinity: stall exit=247 pinned=absent' "$out"
+          # the code in this log line is the agent's raw signal-derived value (-9), not the
+          # masked 247 the shim process actually exits with (see the `stall exit=247` line above)
+          grep -q 'affinity cleared: worker affb exited -9 after the first segment' "$out"
+          # Shared transcode dir (docs/SHARED-TRANSCODE.md): the shim dies, the same ffmpeg keeps
+          # writing and the agent keeps the lease fresh; a seek from another replica takes the
+          # output over (orphaned or attached holder); a stale keepalive ends and cleans up
+          grep -q 'shared: detached same_ffmpeg=yes growing=yes lease_fresh=yes' "$out"
+          grep -q 'shared: takeover exit=0 old_ffmpeg=gone seek_segment=yes took_over_logged=1' "$out"
+          grep -q 'shared: attached-takeover old_exit=0 new_exit=0 seek_segment=yes' "$out"
+          grep -q 'shared: orphan-expired ffmpeg_gone=yes .* files_left=0 keepalive=removed' "$out"
+          # a throttler-paused (p) job whose shim dies gets u from the agent
+          grep -q 'shared: paused-detach keys_pu=1' "$out"
+          # a detached job throttles itself against the viewer's position sidecar: pauses when
+          # too far ahead (the lead then stays put), resumes when the viewer catches up, pauses
+          # again, runs unthrottled once the position goes stale, and the sidecar is cleaned up
+          grep -q 'shared: throttle keys=pupu bounded=yes repaused=yes stale_resume_after=[0-9]*s runs_after=yes sidecar=removed .*stale_logged=1' "$out"
+          # agent drain (SIGTERM) resumes a paused job so it ends at its next segment: an
+          # orphan paused by the agent's throttle, and an attached job paused by Jellyfin
+          grep -q 'shared: drain-paused-orphan keys=pu next_segment=yes drained_logged=1 ' "$out"
+          grep -q 'shared: drain-paused-attached keys=pu next_segment=yes drained_logged=1 ' "$out"
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
@@ -95,84 +146,70 @@ jobs:
             transcode/target/x86_64-unknown-linux-musl/release/tcpool-shim
             transcode/target/x86_64-unknown-linux-musl/release/tcpool-sync
 
-  # Fuzz smoke for tcpool-ir (transcode/fuzz, a separate workspace so nightly + libfuzzer never
-  # leak into the stable build above). Each of the three targets runs for a bounded 120 s against
-  # the seeded corpora in transcode/fuzz/corpus: validate() and render()/translate() over the
-  # 134-command Jellyfin corpus, and the filter parser over the corpus filter chains. This is a
-  # smoke run, not a proof -- it keeps the parser from regressing while the weekly chaos CronJob
-  # (P2 checklist) does the long runs. Any libFuzzer crash artifact fails the job and is uploaded.
-  fuzz:
-    name: fuzz smoke
+  # Fuzz smoke: each cargo-fuzz target against the committed seed corpus for a short, fixed
+  # time, on nightly (cargo-fuzz requires the nightly-only sanitizer/coverage instrumentation).
+  # Separate job/toolchain from `tcpool` above so a stable-toolchain failure there can't mask a
+  # fuzz regression, and vice versa. `cargo fuzz run` exits non-zero on any crash/timeout/OOM
+  # found in the corpus or the short run, which is this job's pass/fail signal.
+  fuzz-smoke:
+    name: fuzz-smoke
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      CARGO_FUZZ_VERSION: "0.13.2"
     defaults:
       run:
-        working-directory: transcode/fuzz
+        working-directory: transcode
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Nightly toolchain
         run: |
-          # cargo-fuzz builds with -Zsanitizer=address, which only nightly accepts, and it is the
-          # `cargo` on PATH that it re-invokes -- so every fuzz command below goes through
-          # `cargo +nightly`. No musl target and no rust-src needed for the smoke run.
           rustup toolchain install nightly --profile minimal
-          cargo +nightly --version
+          rustup +nightly component add rust-src
           rustc +nightly --version
 
-      - name: Cargo cache
+      - name: Cache cargo-fuzz binary
+        id: cargo-fuzz-cache
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin/cargo-fuzz
-            transcode/fuzz/target
-          key: tcpool-fuzz-${{ runner.os }}-cargo-fuzz-0.13.2-${{ hashFiles('transcode/fuzz/Cargo.lock') }}
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ runner.os }}-${{ env.CARGO_FUZZ_VERSION }}
 
-      - name: cargo-fuzz
-        run: |
-          if ! command -v cargo-fuzz >/dev/null; then
-            # Pinned: the tool decides the sanitizer flags and the artifact layout this job reads.
-            cargo install cargo-fuzz --locked --version 0.13.2
-          fi
-          cargo +nightly fuzz --version
-          cargo +nightly fuzz list
+      - name: Install cargo-fuzz
+        if: steps.cargo-fuzz-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
 
-      - name: Fuzz smoke (validate, render, filters)
-        run: |
-          set -uo pipefail
-          # Work on a copy of the seeded corpora: libFuzzer appends its own finds to the corpus
-          # directory it is given, and the checked-in seed set should stay exactly what the
-          # corpus test uses.
-          work="$RUNNER_TEMP/seeds"
-          status=0
-          for t in validate render filters; do
-            echo "::group::cargo fuzz run $t"
-            mkdir -p "$work/$t"
-            seeds="$(ls -A corpus/$t | wc -l)"
-            echo "$t: $seeds seed files"
-            cp -n corpus/$t/* "$work/$t/" 2>/dev/null || true
-            # A crash makes cargo fuzz exit non-zero; keep going so all three targets report.
-            cargo +nightly fuzz run "$t" "$work/$t" -- -max_total_time=120 -rss_limit_mb=4096 || {
-              echo "::error::$t failed (crash or timeout)"
-              status=1
-            }
-            echo "::endgroup::"
-            if [ -n "$(ls -A artifacts/$t 2>/dev/null)" ]; then
-              echo "::error::$t wrote crash artifacts:"
-              ls -l artifacts/$t
-              status=1
-            fi
-          done
-          exit $status
+      - name: Fuzz target cache
+        uses: actions/cache@v4
+        with:
+          path: transcode/fuzz/target
+          key: tcpool-fuzz-${{ runner.os }}-${{ hashFiles('transcode/fuzz/Cargo.lock') }}
+
+      - name: cargo +nightly fuzz build
+        run: cargo +nightly fuzz build
+
+      # 60 s per target against the corpus already committed under fuzz/corpus/<target>/ --
+      # long enough to replay the whole seed set and spend the remainder mutating, short enough
+      # to keep this job fast. A crash, timeout (-timeout=10) or OOM makes cargo-fuzz exit
+      # non-zero, which fails the step.
+      - name: fuzz validate (60s)
+        run: cargo +nightly fuzz run validate fuzz/corpus/validate -- -max_total_time=60 -timeout=10
+
+      - name: fuzz render (60s)
+        run: cargo +nightly fuzz run render fuzz/corpus/render -- -max_total_time=60 -timeout=10
+
+      - name: fuzz filters (60s)
+        run: cargo +nightly fuzz run filters fuzz/corpus/filters -- -max_total_time=60 -timeout=10
+
+      - name: fuzz trickplay (60s)
+        run: cargo +nightly fuzz run trickplay fuzz/corpus/trickplay -- -max_total_time=60 -timeout=10
 
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: tcpool-fuzz-artifacts
-          path: transcode/fuzz/artifacts
-          if-no-files-found: ignore
+          name: fuzz-crash-artifacts
+          path: transcode/fuzz/artifacts/
