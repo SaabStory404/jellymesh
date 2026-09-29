@@ -125,10 +125,10 @@ index deeb0a77d..9c725614b 100644
          /// The level validation regex string.
          /// This regular expression matches strings representing a double.
 diff --git a/MediaBrowser.Model/Dlna/StreamBuilder.cs b/MediaBrowser.Model/Dlna/StreamBuilder.cs
-index 7d7939d62..4a54f2dd0 100644
+index 7d7939d62..5e649a947 100644
 --- a/MediaBrowser.Model/Dlna/StreamBuilder.cs
 +++ b/MediaBrowser.Model/Dlna/StreamBuilder.cs
-@@ -836,24 +836,30 @@ namespace MediaBrowser.Model.Dlna
+@@ -836,47 +836,67 @@ namespace MediaBrowser.Model.Dlna
                  {
                      SetStreamInfoOptionsFromTranscodingProfile(item, playlistItem, transcodingProfile);
  
@@ -145,10 +145,8 @@ index 7d7939d62..4a54f2dd0 100644
 +                    // whether or not the audio is copied. Only the dvvC box of an fMP4 init segment
 +                    // marks the 8.1 stream as Dolby Vision to the player: media3's TsExtractor/H265Reader
 +                    // always report video/hevc, so Android TV decodes the base layer as HDR10; Apple
-+                    // requires fMP4 for HEVC and Dolby Vision. It also lifts the TS-only HLS audio codec
-+                    // list, so a TrueHD track the client declares is copied instead of transcoded when
-+                    // it can be. UseMostCompatibleTranscodingProfile (the client's retry after a failed
-+                    // playback) keeps TS.
++                    // requires fMP4 for HEVC and Dolby Vision. UseMostCompatibleTranscodingProfile (the
++                    // client's retry after a failed playback) keeps TS.
 +                    //
 +                    // bughunt 17 originally gated this on WillCopyAudio(...) too: Jellyfin's fMP4 argv
 +                    // (-copyts -avoid_negative_ts disabled) gave an encoded AAC/AC-3 track a negative
@@ -171,12 +169,15 @@ index 7d7939d62..4a54f2dd0 100644
 -                        && WillConvertDoviP7ToP81(options, item, videoStream, transcodingProfile, "mp4")
 -                        && WillCopyAudio(options, item, audioStream, candidateAudioStreams, playlistItem, transcodingProfile.AudioCodec, "mp4");
 +                        && WillConvertDoviP7ToP81(options, item, videoStream, transcodingProfile, "mp4");
++                    var transcodingAudioCodec = transcodingProfile.AudioCodec;
                      if (doviP7ToP81Fmp4)
                      {
                          transcodingContainer = "mp4";
-@@ -863,20 +869,6 @@ namespace MediaBrowser.Model.Dlna
- 
-                     BuildStreamVideoItem(playlistItem, options, item, videoStream, audioStream, candidateAudioStreams, transcodingContainer, transcodingProfile.VideoCodec, transcodingProfile.AudioCodec);
+                         item.TranscodingContainer = transcodingContainer;
+                         playlistItem.Container = transcodingContainer;
+-                    }
+-
+-                    BuildStreamVideoItem(playlistItem, options, item, videoStream, audioStream, candidateAudioStreams, transcodingContainer, transcodingProfile.VideoCodec, transcodingProfile.AudioCodec);
  
 -                    // More than one audio codec left means the audio is transcoded, not copied: keep
 -                    // the target list the TS profile would have had. The mp4 list can be longer
@@ -187,15 +188,43 @@ index 7d7939d62..4a54f2dd0 100644
 -                    {
 -                        var tsAudioCodecs = playlistItem.AudioCodecs.Where(codec => _supportedHlsAudioCodecsTs.Contains(codec)).ToList();
 -                        if (tsAudioCodecs.Count > 0)
--                        {
++                        // JELLYMESH bughunt 18 (gh-14): the official Android TV app (v0.19.10, media3
++                        // 1.8.0) cannot play TrueHD from fragmented MP4 -- FragmentedMp4Extractor has no
++                        // TrueHdSampleRechunker (androidx/media#1519 open, PR #3411 unmerged). Copying
++                        // TrueHD into fMP4 (bughunt 17's behaviour) played video with no audio on the
++                        // TrueHD track (MEASURED, SHIELD, Alien: Romulus). Drop truehd/mlp from the
++                        // candidate list for this job so a TrueHD/MLP source is transcoded instead of
++                        // copied, and prefer eac3 as the transcode target (ffmpeg's eac3 encoder caps at
++                        // 5.1) by moving it to the front of the list when the client offers it; otherwise
++                        // keep the client's order minus truehd/mlp. A copyable ac3/eac3 source is
++                        // unaffected -- BuildStreamVideoItem still copies it when eligible. DTS-HD in
++                        // fMP4 on media3 is untested; dts is left in the list as-is.
++                        var codecs = ContainerHelper.Split(transcodingProfile.AudioCodec)
++                            .Where(c => !string.Equals(c, "truehd", StringComparison.OrdinalIgnoreCase)
++                                && !string.Equals(c, "mlp", StringComparison.OrdinalIgnoreCase))
++                            .ToList();
++                        var eac3Index = codecs.FindIndex(c => string.Equals(c, "eac3", StringComparison.OrdinalIgnoreCase));
++                        if (eac3Index > 0)
+                         {
 -                            playlistItem.AudioCodecs = tsAudioCodecs;
--                        }
--                    }
--
++                            var eac3 = codecs[eac3Index];
++                            codecs.RemoveAt(eac3Index);
++                            codecs.Insert(0, eac3);
+                         }
++
++                        // BuildStreamVideoItem treats an empty codec list as "unspecified" and falls
++                        // back to the source stream's own codec -- for a client that only offered
++                        // truehd/mlp, that would silently readmit truehd. Fall back to "aac" instead
++                        // (universally supported by the mp4 HLS list) so the job still transcodes.
++                        transcodingAudioCodec = codecs.Count > 0 ? string.Join(',', codecs) : "aac";
+                     }
+ 
++                    BuildStreamVideoItem(playlistItem, options, item, videoStream, audioStream, candidateAudioStreams, transcodingContainer, transcodingProfile.VideoCodec, transcodingAudioCodec);
++
                      playlistItem.PlayMethod = PlayMethod.Transcode;
  
                      if (subtitleStream is not null)
-@@ -952,34 +944,6 @@ namespace MediaBrowser.Model.Dlna
+@@ -952,34 +972,6 @@ namespace MediaBrowser.Model.Dlna
              return !Has(VideoRangeType.DOVIWithEL) && (Has(VideoRangeType.DOVI) || Has(VideoRangeType.DOVIWithHDR10));
          }
  
@@ -231,15 +260,55 @@ index 7d7939d62..4a54f2dd0 100644
              MediaSourceInfo item,
              MediaOptions options,
 diff --git a/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Fmp4Tests.cs b/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Fmp4Tests.cs
-index 9329cb7c0..dcde4f9b8 100644
+index 9329cb7c0..94b430f46 100644
 --- a/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Fmp4Tests.cs
 +++ b/tests/Jellyfin.Model.Tests/Dlna/StreamBuilderDoviP7ToP81Fmp4Tests.cs
-@@ -50,19 +50,22 @@ public class StreamBuilderDoviP7ToP81Fmp4Tests
+@@ -27,42 +27,69 @@ public class StreamBuilderDoviP7ToP81Fmp4Tests
+     private const string DoviCapableExcluded = "DOVIInvalid|DOVIWithEL|DOVIWithELHDR10Plus";
+ 
+     [Fact]
+-    public void ConvertedSource_TsProfile_ServedAsFmp4_WithTrueHdCopied()
++    public void ConvertedSource_TsProfile_ServedAsFmp4_WithTrueHdTranscodedToEac3()
+     {
+-        var info = Build(enabled: true, DoviCapableExcluded);
++        // bughunt 18 (gh-14): the official Android TV app (v0.19.10, media3 1.8.0) cannot play
++        // TrueHD from fragmented MP4 -- FragmentedMp4Extractor has no TrueHdSampleRechunker
++        // (androidx/media#1519 open, PR #3411 unmerged). bughunt 17 copied a declared TrueHD track
++        // into fMP4; MEASURED on a SHIELD, Alien: Romulus showed Dolby Vision video but no audio on
++        // that track. Force the TrueHD track (index 1) as the only candidate (explicit
++        // AudioStreamIndex disables StreamBuilder's stream reselection, so the AC3 track at index 2
++        // is never considered): bughunt 18 drops truehd/mlp from the candidate list and prefers
++        // eac3 (present in this profile's AudioCodecs), so the TrueHD source is transcoded to EAC3
++        // instead of copied.
++        var info = Build(enabled: true, DoviCapableExcluded, audioStreamIndex: 1);
+ 
+         Assert.NotNull(info);
+         Assert.Equal(PlayMethod.Transcode, info.PlayMethod);
+         Assert.Equal(MediaStreamProtocol.hls, info.SubProtocol);
+         Assert.Equal("mp4", info.Container, StringComparer.OrdinalIgnoreCase);
+-        Assert.Equal(["truehd"], info.AudioCodecs);
+-        Assert.Equal(1, info.AudioStreamIndex);
+-        Assert.False(info.TranscodeReasons.HasFlag(TranscodeReason.AudioCodecNotSupported));
++        Assert.Equal(["eac3", "aac", "ac3", "alac", "dts", "flac", "mp3", "opus"], info.AudioCodecs);
+ 
+-        // The copy must not be refused later for bitrate (EncodingHelper compares the source
+-        // bitrate with the AudioBitrate the URL carries).
+-        Assert.True(info.AudioBitrate is null || info.AudioBitrate >= 4_000_000, "AudioBitrate " + info.AudioBitrate);
++        // The source TrueHD codec is (correctly) not in the offered list, so TranscodeReasons
++        // reflects a codec-driven transcode, same as any other audio transcode.
++        Assert.True(info.TranscodeReasons.HasFlag(TranscodeReason.AudioCodecNotSupported));
+ 
+         var url = info.ToUrl("http://server", "token", null);
+         Assert.Contains("SegmentContainer=mp4", url, StringComparison.OrdinalIgnoreCase);
+-        Assert.Contains("AudioCodec=truehd", url, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("AudioCodec=eac3", url, StringComparison.OrdinalIgnoreCase);
++        Assert.DoesNotContain("truehd", url, StringComparison.OrdinalIgnoreCase);
+         Assert.Contains("DOVIWithHDR10", url, StringComparison.Ordinal);
      }
  
      [Fact]
 -    public void ConvertedSource_AudioTranscoded_StaysOnTs()
-+    public void ConvertedSource_AudioTranscoded_ServedAsFmp4()
++    public void ConvertedSource_AudioTranscoded_ServedAsFmp4_Eac3First_TrueHdDropped()
      {
 -        // No audio stream may be copied here, so the audio would be encoded. Jellyfin's fMP4 argv
 -        // starts an encoded track at a negative tfdt (encoder priming), which media3 cannot parse,
@@ -252,8 +321,10 @@ index 9329cb7c0..dcde4f9b8 100644
 +        // audio list ("aac,ac3,alac,dts,eac3,flac,mp3,opus,truehd", 42 characters) was longer than
 +        // DynamicHlsController's 40-character AudioCodec limit. bughunt 18 fixes the negative tfdt
 +        // at the ffmpeg argv level (avoid_negative_ts make_non_negative for mp4 segments) and raises
-+        // the AudioCodec cap to 128 characters, so the job now takes the fMP4 path -- and the full
-+        // mp4 audio codec list, not a TS-only subset -- like a copyable audio track does.
++        // the AudioCodec cap to 128 characters, so the job now takes the fMP4 path. truehd/mlp are
++        // dropped from the candidate list (media3 can't demux TrueHD from fMP4) and eac3 is moved
++        // to the front so the encoder targets EAC3 (ffmpeg's eac3 encoder caps at 5.1) rather than
++        // whatever the client listed first.
          var info = Build(enabled: true, DoviCapableExcluded, noDefaultAudio: true);
  
          Assert.NotNull(info);
@@ -261,7 +332,55 @@ index 9329cb7c0..dcde4f9b8 100644
 -        Assert.Equal("ts", info.Container, StringComparer.OrdinalIgnoreCase);
 -        Assert.Equal(["aac", "ac3", "eac3", "mp3"], info.AudioCodecs);
 +        Assert.Equal("mp4", info.Container, StringComparer.OrdinalIgnoreCase);
-+        Assert.Equal(["aac", "ac3", "alac", "dts", "eac3", "flac", "mp3", "opus", "truehd"], info.AudioCodecs);
++        Assert.Equal(["eac3", "aac", "ac3", "alac", "dts", "flac", "mp3", "opus"], info.AudioCodecs);
++    }
++
++    [Fact]
++    public void ConvertedSource_ClientListWithoutEac3_TrueHdDropped_NoReorder()
++    {
++        // bughunt 18 (gh-14): when the client's audio codec list has no eac3, truehd/mlp are still
++        // dropped (media3 can't demux TrueHD from fMP4), but there's nothing to move to the front --
++        // the rest of the client's order is preserved.
++        var info = Build(enabled: true, DoviCapableExcluded, noDefaultAudio: true, audioCodecs: "aac,ac3,truehd,mlp,dts");
++
++        Assert.NotNull(info);
++        Assert.Equal(PlayMethod.Transcode, info.PlayMethod);
++        Assert.Equal("mp4", info.Container, StringComparer.OrdinalIgnoreCase);
++        Assert.Equal(["aac", "ac3", "dts"], info.AudioCodecs);
      }
  
      [Fact]
+@@ -141,7 +168,7 @@ public class StreamBuilderDoviP7ToP81Fmp4Tests
+         Assert.Equal("ts", info.Container, StringComparer.OrdinalIgnoreCase);
+     }
+ 
+-    private static StreamInfo? Build(bool enabled, string excludedRangeTypes, bool hdr10Plus = false, bool mostCompatible = false, bool allowVideoCopy = true, bool directPlay = true, bool noDefaultAudio = false, int? audioStreamIndex = null)
++    private static StreamInfo? Build(bool enabled, string excludedRangeTypes, bool hdr10Plus = false, bool mostCompatible = false, bool allowVideoCopy = true, bool directPlay = true, bool noDefaultAudio = false, int? audioStreamIndex = null, string? audioCodecs = null)
+     {
+         Environment.SetEnvironmentVariable("JELLYMESH_DOVI_P7_TO_81", enabled ? "1" : null);
+         try
+@@ -190,13 +217,13 @@ public class StreamBuilderDoviP7ToP81Fmp4Tests
+                 ]
+             };
+ 
+-            const string AudioCodecs = "aac,ac3,alac,dca,dts,eac3,flac,mlp,mp2,mp3,opus,truehd,vorbis";
++            var audioCodecList = audioCodecs ?? "aac,ac3,alac,dca,dts,eac3,flac,mlp,mp2,mp3,opus,truehd,vorbis";
+             var profile = new DeviceProfile
+             {
+                 Name = "Android TV app shape",
+                 MaxStreamingBitrate = 120_000_000,
+                 DirectPlayProfiles = directPlay
+-                    ? [new DirectPlayProfile { Type = DlnaProfileType.Video, Container = "mkv,mp4", VideoCodec = "hevc,h264", AudioCodec = AudioCodecs }]
++                    ? [new DirectPlayProfile { Type = DlnaProfileType.Video, Container = "mkv,mp4", VideoCodec = "hevc,h264", AudioCodec = audioCodecList }]
+                     : [],
+                 CodecProfiles =
+                 [
+@@ -217,7 +244,7 @@ public class StreamBuilderDoviP7ToP81Fmp4Tests
+                         Protocol = MediaStreamProtocol.hls,
+                         Container = "ts",
+                         VideoCodec = "hevc,h264",
+-                        AudioCodec = AudioCodecs,
++                        AudioCodec = audioCodecList,
+                         CopyTimestamps = false,
+                         EnableSubtitlesInManifest = true
+                     }

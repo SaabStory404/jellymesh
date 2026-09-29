@@ -5,12 +5,16 @@
 #                  17: JELLYMESH_DOVI_P7_TO_81=1: an HLS job that converts a DV profile-7 source to 8.1
 #                      gets fMP4 segments even from a client whose only HLS profile is TS (so the init
 #                      segment's dvvC box marks the stream as Dolby Vision; media3's TS extractor only
-#                      ever reports HEVC), a declared TrueHD track is copied instead of transcoded, and
-#                      the video is tagged hvc1 to match CODECS="hvc1..."+SUPPLEMENTAL-CODECS. Flag off
-#                      = unchanged.
+#                      ever reports HEVC), and the video is tagged hvc1 to match
+#                      CODECS="hvc1..."+SUPPLEMENTAL-CODECS. Flag off = unchanged. Superseded by 18: 17
+#                      also copied a declared TrueHD track into fMP4, which the official Android TV app
+#                      (media3 1.8.0) cannot play (FragmentedMp4Extractor has no TrueHdSampleRechunker,
+#                      androidx/media#1519) -- MEASURED on a SHIELD as video with no audio.
 #                  18: gh-14 -- mp4 HLS segments use -avoid_negative_ts make_non_negative (no negative audio
 #                      tfdt) and audioCodec accepts a 128-char list, so an audio transcode also gets fMP4.
-#                      Flag off = unchanged.
+#                      A TrueHD/MLP source is now transcoded to EAC3 (ffmpeg's eac3 encoder caps at 5.1)
+#                      instead of copied; eac3 is preferred first in the candidate list when the client
+#                      offers it. A copyable ac3/eac3 source is still copied. Flag off = unchanged.
 #
 # Everything else is jm8.1's, unchanged: the pool-r1 shim and sync, the Galera provider,
 # install-plugins.sh and /opt/jellymesh/SHA256SUMS. Agents: any (pool-r1 3ed52b3 recommended); the
