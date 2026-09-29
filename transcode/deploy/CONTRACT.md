@@ -75,8 +75,10 @@ to a worker that is shutting down.
 
 ### tcpool-sync (sidecar, one replica)
 
-`JF_URL` (`http://127.0.0.1:8096`), `JF_API_KEY` (from the `tcpool-sync` Secret),
-`TC_CAPS_FILE` (`/config/tc-mesh-caps.json`), `TC_SYNC_EVERY` (`30`),
+`JF_URL` (`http://127.0.0.1:8096`; a comma-separated list, one per Jellyfin replica, since each
+keeps its own encoding.xml), `JF_API_KEY` (from the `tcpool-sync` Secret, shared by every `JF_URL`),
+`TC_CAPS_FILE` (`/config/tc-mesh-caps.json`), `TC_SYNC_EVERY` (`30`), `TC_STARTUP_GRACE` (`120`: offers
+are not written until every worker has reported once or this many seconds have passed),
 `TC_TRANSCODE_DIR` (`/transcodes/jf` — its own subdirectory), and the same `TC_TLS_*` client set.
 
 **OPEN:** `tcpool-sync` reads `TC_WORKERS`, not `TC_WORKERS_DNS` (`crates/sync/src/main.rs`). Either
