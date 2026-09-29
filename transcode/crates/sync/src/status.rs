@@ -133,7 +133,10 @@ mod tests {
     #[test]
     fn status_reports_worker_state_units_and_offer_reason() {
         let mut workers = BTreeMap::new();
-        workers.insert("10.42.0.7:9901".to_string(), worker("10.42.0.7:9901", true, 1000));
+        workers.insert(
+            "10.42.0.7:9901".to_string(),
+            worker("10.42.0.7:9901", true, 1000),
+        );
         workers.insert(
             "10.42.0.9:9901".to_string(),
             worker("10.42.0.9:9901", false, 900),
@@ -196,10 +199,7 @@ mod tests {
             },
         );
         // Down, and carrying units that must NOT be added to the live totals.
-        workers.insert(
-            "p4".to_string(),
-            worker("10.42.0.9:9901", false, 900),
-        );
+        workers.insert("p4".to_string(), worker("10.42.0.9:9901", false, 900));
         let snap = Snapshot {
             workers,
             ..Default::default()
