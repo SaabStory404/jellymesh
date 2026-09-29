@@ -1,0 +1,10 @@
+Summary:
+  Frames: 973
+  Profile: 7 (FEL)
+  DM version: 1 (CM v2.9)
+  Scene/shot count: 40
+  RPU mastering display: 0.0001/1000 nits
+  RPU content light level (L1): MaxCLL: 482.63 nits, MaxFALL: 26.13 nits
+  L6 metadata: Mastering display: 0.0001/1000 nits. MaxCLL: 617 nits, MaxFALL: 496 nits
+  L5 offsets: top=64, bottom=64, left=0, right=0
+  L2 trims: 100 nits
