@@ -21,29 +21,48 @@ this session could find. Either they came from a session/host not captured in th
 this repo, or they were asserted without a durable record. Flagged to Brian
 (needs_brian), not blocking -- a new, documented measurement was run instead.
 
-## Method actually used (Track A: direct FEL residual, not vs-nlq reconstruction)
+## Method actually used (direct FEL residual, not vs-nlq reconstruction)
 
 Reconstructing the vs-nlq (NLQ inverse-quantization) output the "correct" way needs the
 quietvoid/vs-nlq VapourSynth plugin, which was not present anywhere in this repo/handoff
-and was not attempted from scratch this session (time-boxed decision, see advisor
-guidance in the session transcript: don't spend more than one image-build iteration on
-an unproven toolchain when a direct measurement answers the same question).
+and was not attempted from scratch this session (time-boxed decision: don't spend more
+than one image-build iteration on an unproven toolchain when a direct measurement
+answers the same question).
 
 Instead: for each clip, `dovi_tool demux` splits the HEVC bitstream into base-layer (BL)
-and enhancement-layer (EL) sub-streams directly (this is the same demux dovi_tool's own
-NLQ reconstruction path uses internally before applying the NLQ curve). We decode BL and
-EL luma planes and compute the residual `EL - BL` directly, in two forms:
+and enhancement-layer (EL) sub-streams directly. `dovi_tool export -d all=rpu.json` on
+the extracted RPU (frame 0) gives `nlq_offset` and `linear_deadzone_threshold` in native
+10-bit units -- MEASURED nlq_offset=512 (the exact 10-bit midpoint) on every title
+checked, confirming nlq_method_idc=LinearDeadzone. The EL substream is NOT "BL plus a
+residual" -- each EL sample IS the coded residual itself, centered on `nlq_offset`. An
+early version of this pipeline computed `EL - BL`, which is wrong (dominated by BL's own
+luma level, producing a nonsense ~10dB "PSNR" implying FEL is hugely visible); caught by
+advisor review before the real measurement ran. The corrected residual is
+`EL_sample - nlq_offset`.
 
-  - full-frame residual RMS -> approximate PSNR (20*log10(65535/RMS), 16-bit)
-  - residual restricted to pixels where BL luma exceeds a threshold (highlight mask)
+Computed via `ffprobe`/`lutyuv`/`signalstats` filtergraphs (see `residual.sh`), not a
+Python/numpy pixel pass -- numpy was not available in the runtime image and installing
+it was unreliable on this node this session (see `## Job` below). `lutyuv` evaluates its
+expression once per the 1024 possible 10-bit values then does table lookups at decode
+speed, MEASURED equivalent output to the naive `geq` per-pixel expression interpreter
+(byte-identical to printed precision on a 20-frame sample) at roughly 2 orders of
+magnitude less wall time (geq: minutes and incomplete; lutyuv: ~18s for a full
+970-frame pass).
+
+Metric reported: mean **absolute** residual (`mean(|EL - nlq_offset|)`), full-frame and
+restricted to pixels where BL luma exceeds a threshold (highlight mask), both in 10-bit
+units (0-1023) and as a fraction of full range. NOT RMS/PSNR -- an RMS variant was tried
+via `geq` (squaring needs `geq`, which was already the slow path) and found broken (the
+`geq` internal pipeline clamps/truncates to 0-1023 integer luma before the division
+needed to keep the squared term in range, producing values ~10,000x too small).
 
 This is NOT the same number as an actual NLQ-reconstructed-vs-BL VMAF comparison -- the
 NLQ curve applies a monotonic (usually non-linear) transform to the EL residual before
 it's added back to BL, so magnitudes will differ from a true vs-nlq run. But it directly
 answers the visibility question: if EL carries near-zero residual energy in the highlight
-mask, no NLQ curve can conjure detail that isn't in the substream, so this is a legitimate
-(if approximate) proxy, clearly labeled as such in every JSON result
-(`"method": "fel_residual_direct (Track A -- ...)"`, `--threshold` state, mask coverage).
+mask, no NLQ curve can conjure detail that isn't in the substream, so this is a
+legitimate (if approximate) proxy, clearly labeled as such in every JSON result
+(`"method": "fel_nlq_residual_ffmpeg_lutyuv (...)"`, threshold and coverage stated).
 
 ## Titles
 
@@ -55,8 +74,9 @@ Selected 4 bright/highlight-heavy FEL titles that exist on tank
   - Top Gun: Maverick (2022) -- jet cockpit glare, sun-drenched flight sequences
   - WALL-E (2008) -- bright space/reflective-surface animation
   - Iron Man (2008) -- arc reactor, explosions, desert daylight
-  - Raiders of the Lost Ark (1981) -- desert daylight scenes (already hostPath-mounted
-    in tc-lab from a prior session, avoided adding a new mount)
+  - Raiders of the Lost Ark (1981) -- desert daylight scenes (a hostPath mount for this
+    title already existed on tc-jellyfin from an unrelated prior session, reused rather
+    than duplicated, but this Job adds its own dedicated mounts for all 4 titles)
 
 Bright ~40s window per title picked programmatically via `find_bright.sh`
 (ffmpeg signalstats YAVG sampled every 5 min across the middle 80% of runtime, at
@@ -64,15 +84,19 @@ Bright ~40s window per title picked programmatically via `find_bright.sh`
 
 ## Resource footprint
 
-- Clip cut: `-c copy`, no re-encode, ~500MB-1.5GB per 40s clip at typical 4K remux
-  bitrates (50-80 Mbps).
-- BL/EL demux: comparable size split across two files.
-- Raw gray16 decode: 4K luma-only 16-bit ~33.2 MB/frame *before* considering EL may be a
-  different (often lower) resolution; at 24fps for 40s that's up to ~32GB per
-  layer if EL matches BL resolution -- large. Written to `$SCRATCH/gh15/<slug>/` (PVC
-  `tc-scratch-quota`, 200Gi, 194Gi free MEASURED via pod exec `df -h /transcodes`
-  before the run) and deleted by `analyze.sh` after each title's JSON result is written.
-  Nothing touches `/data/media` (all title mounts are `readOnly: true`).
+MEASURED, actual sizes from the final run: `-c copy` clip cut (no re-encode) ranged
+~244-346 MB per 40s clip depending on title bitrate; BL/EL demux split each clip into a
+BL file (~200-310 MB, full 4K resolution) and a much smaller EL file (~19-40 MB, half
+resolution in each dimension for FEL). No raw pixel dumps were written at any point --
+the corrected pipeline (`residual.sh`) computes everything via `ffprobe`/`lutyuv`
+filtergraphs reading the HEVC files directly, never materializing decoded frames to
+disk. Peak footprint per title was clip+BL+EL together, roughly 500-650 MB, written to
+`$SCRATCH/gh15/<slug>/` (PVC `tc-scratch-quota`, 200Gi, 194Gi free MEASURED via pod exec
+`df -h /transcodes` before the run) and deleted by `analyze.sh` immediately after each
+title's JSON result is written -- confirmed via `du -sh /transcodes/gh15` after the Job
+finished (41 KB left, just the four small JSON results, cleaned up manually after
+copying into this repo). Nothing touches `/data/media` (all title mounts are
+`readOnly: true`).
 
 ## Job
 
@@ -136,6 +160,16 @@ WALL-E's highlight coverage on this particular bright clip was tiny (0.05% of pi
 making its ratio less statistically solid than the other three (based on far fewer
 highlight pixels).
 
+**Unverified caveat (Iron Man):** during the `lutyuv`-vs-`geq` equivalence smoke test,
+the first 20 frames of Iron Man's EL clip averaged ~29.8 mean|residual| (10-bit), but
+the full-clip (970-frame) result reported here is 10.51 -- lower, not higher, so this
+doesn't inflate Iron Man's headline number, but the discrepancy itself was never
+explained. Either the opening ~1s of that clip is genuinely higher-residual than the
+rest, or the leading GOP after the `-ss ... -c copy` cut decoded oddly (ffmpeg logged
+"PPS changed between slices" / "Skipping invalid undecodable NALU" warnings on EL
+streams across all 4 titles' clip cuts, not just Iron Man). The intermediates were
+deleted before this was noticed, so it could not be re-checked this session.
+
 This is a residual-energy proxy, not a perceptual visibility measurement (no vs-nlq
 NLQ-curve reconstruction, no VMAF/PSNR against a true BL+FEL frame -- see the method
 section above). It answers "does the coded EL residual carry more signal in bright
@@ -155,6 +189,6 @@ server-side FEL reconstruction based on this evidence, but do not treat this as 
 closed question -- the method here is a residual-energy proxy, not the vs-nlq
 reconstruction + VMAF the issue actually asked for, and that harder measurement was
 not attempted this session (no working vs-nlq toolchain found or built; would need a
-VapourSurece + quietvoid/vs-nlq plugin build, out of scope for the time spent here).
+VapourSynth + quietvoid/vs-nlq plugin build, out of scope for the time spent here).
 `close_issue=false`: the numbers are suggestive, not conclusive, and the issue's own
 requested method (vs-nlq reconstruction + VMAF/PSNR) was not run.
