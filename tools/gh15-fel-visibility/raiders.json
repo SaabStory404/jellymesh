@@ -1,0 +1,17 @@
+{
+  "title": "raiders",
+  "method": "fel_nlq_residual_ffmpeg_lutyuv (residual = EL - nlq_offset via ffprobe/lutyuv/signalstats filtergraphs, 10-bit native tv-range scale; mean|residual| only; NOT a full vs-nlq curve reconstruction; see gh-15-notes.md)",
+  "nlq_offset_10bit": 512,
+  "deadzone_threshold_10bit": 0,
+  "highlight_threshold_10bit_code": 600,
+  "highlight_threshold_tv_range_normalized": 0.6119,
+  "highlight_mask_coverage_pct": 1.326,
+  "full_frame_residual_mean_abs_10bit": 8.9603,
+  "full_frame_residual_mean_abs_normalized": 0.008759,
+  "highlight_residual_mean_abs_10bit": 5.0491,
+  "highlight_residual_mean_abs_normalized": 0.004936,
+  "highlight_vs_full_ratio": 0.563,
+  "clip_start_seconds": 2491,
+  "clip_duration_seconds": 40,
+  "frames": 966
+}
