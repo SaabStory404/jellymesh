@@ -1,0 +1,433 @@
+# The workers: one DaemonSet per hardware class (PLAN §1 "DaemonSet per vendor class", §2
+# "Placement"). A node that gains an Arc, a P4 or the CPU-spill label gets a pod; nothing else has
+# to be edited, because discovery is the headless Service in 30-service.yaml and the shim resolves
+# its A records on every transcode.
+#
+# The three DaemonSets below are deliberately near-identical and written out in full rather than
+# factored behind a YAML anchor: they are meant to be read one against the other, and a diff that
+# shows the mount list changing in one class and not the others is the review signal we want. The
+# ONLY intended per-class differences are marked `# per class:` in each document:
+#   qsv   -> Intel node label + gpu.intel.com/i915, TC_KIND=qsv,   TC_CAPACITY=14, TC_WEIGHT_4K=2.3
+#   nvenc -> NVIDIA node label + nvidia.com/gpu, TC_KIND=nvenc,    TC_CAPACITY=6,  TC_WEIGHT_4K=2
+#   cpu   -> the dl380 by hostname, no device,   TC_KIND=cpu,      TC_CAPACITY=3,  TC_WEIGHT_4K=3
+#             plus TC_HW_FILTERS=0 (no GPU filter chain on the spill worker, CONTRACT)
+#
+# Everything else - env, volumes, mounts, probes, grace period, resources - must stay in lockstep.
+# The mount and env tables are CONTRACT.md's ("Required mounts", "TC_* environment"); the numbers
+# are PLAN §7's.
+---
+# ---------------------------------------------------------------------------------------------
+# Intel Arc A380 / QSV.
+# ---------------------------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tcpool-agent-qsv
+  namespace: media
+  labels:
+    app.kubernetes.io/name: tcpool-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: tcpool
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tcpool-agent
+      tcpool.io/class: qsv
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tcpool-agent
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/part-of: tcpool
+        tcpool.io/class: qsv
+      annotations:
+        # Scrape hint. This cluster has no monitoring.coreos.com CRDs (verified with
+        # `kubectl api-resources`), so scraping is vmagent's `vm-scrape-config` ConfigMap, not a
+        # ServiceMonitor - see deploy/k8s/README.md for the exact job block to merge, which uses
+        # pod SD the way the gpu-exporter job already does. The annotations are here for any
+        # annotation-driven scraper and are inert otherwise.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9903"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: tcpool-agent
+      # per class: the Intel GPU device plugin labels the node it can serve. NFD's intel GPU hook
+      # sets this; the device plugin's own installer turns it on (intel-device-plugins-for-
+      # kubernetes, gpu plugin). A node without the label must NOT get a pod: the pod would come up
+      # without a device and report QSV caps it cannot serve.
+      nodeSelector:
+        intel.feature.node.kubernetes.io/gpu: "true"
+      # Drain is bounded at ~13.5 s inside the agent (12 s waiting for the last segment + 0.5 s for
+      # the exit messages + 1 s for the HTTP/2 shutdown, crates/agent/src/main.rs). 30 s leaves room
+      # for the kubelet's own SIGTERM round-trip; CONTRACT's floor is 15.
+      terminationGracePeriodSeconds: 30
+      # per class: the render group. /dev/dri is injected by the device plugin as root:render, and
+      # the image has no `render` group of its own (MEASURED, Containerfile.agent). 993 is the
+      # render GID on both GPU nodes.
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        supplementalGroups: [993]
+      containers:
+        - name: tcpool-agent
+          # Never :latest (CONTRACT "Images"): a mutable tag makes a deploy diff lie about what is
+          # running. Replace GIT_SHA with the commit the images were built from.
+          image: ghcr.io/saabstory404/tcpool-agent:GIT_SHA
+          imagePullPolicy: IfNotPresent
+          # tcpool-entry is PID 1 (image ENTRYPOINT) so SIGTERM is relayed to the agent and the
+          # freeze drills can still `kill -STOP` it. Do not override the entrypoint.
+          env:
+            # NODE_NAME first: TC_NAME's $(NODE_NAME) only expands for variables defined earlier
+            # in this list (CONTRACT).
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: TC_NAME
+              value: qsv-$(NODE_NAME)
+            - { name: TC_KIND, value: qsv }
+            # Hard admission ceiling in resolution-weighted units. Must be set: with neither
+            # TC_CAPACITY nor TC_MAX_JOBS the agent defaults to 1000 units, i.e. unbounded.
+            - { name: TC_CAPACITY, value: "14" }
+            - { name: TC_WEIGHT_4K, value: "2.3" }
+            - { name: TC_HEALTH_PORT, value: "9902" }
+            - { name: TC_METRICS_PORT, value: "9903" }
+            # Prod pods can never fall back to plaintext: missing TC_TLS_* is a hard exit(2).
+            - { name: TC_TLS_REQUIRED, value: "1" }
+            - { name: TC_TLS_CERT, value: /tls/tls.crt }
+            - { name: TC_TLS_KEY, value: /tls/tls.key }
+            - { name: TC_TLS_CA, value: /tls/ca.crt }
+            # Allowlist roots. Both are also image defaults; stated here so the policy is visible
+            # next to the mounts it depends on.
+            - { name: TC_INPUT_ROOTS, value: /data/media }
+            - { name: TC_OUTPUT_ROOT, value: /transcodes }
+            - { name: TC_READ_ROOTS, value: /config/data/data/subtitles,/config/data/data/attachments }
+          ports:
+            - { name: grpc, containerPort: 9901, protocol: TCP }
+            - { name: health, containerPort: 9902, protocol: TCP }
+            - { name: metrics, containerPort: 9903, protocol: TCP }
+          # gRPC health on the plaintext port: the kubelet's gRPC probe cannot speak TLS and 9902
+          # serves health and nothing else (tonic-health `grpc.health.v1.Health`).
+          startupProbe:
+            grpc: { port: 9902 }
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            grpc: { port: 9902 }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          livenessProbe:
+            grpc: { port: 9902 }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # preStop starts the drain before the kubelet's own SIGTERM, then gives DNS ~3 s to drop
+          # the pod: the agent flips health to NOT_SERVING immediately, readiness fails, and with
+          # `publishNotReadyAddresses` unset the shim stops seeing the address (CONTRACT "Ports").
+          # PID 1 is tcpool-entry, which relays the TERM to the agent.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "kill -TERM 1 2>/dev/null; sleep 3"]
+          resources:
+            # Starting point, NOT measured: the agent itself is a light static binary, but each
+            # admitted job is a jellyfin-ffmpeg child that owns the CPU side of a transcode. The
+            # GPU is not the only shared resource - decode, scale and the muxer run in ffmpeg's
+            # processes. Watch actual usage before tightening.
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 8
+              memory: 8Gi
+              # per class: one device per node, from the Intel GPU device plugin.
+              gpu.intel.com/i915: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: media, mountPath: /data/media, readOnly: true }
+            - { name: scratch, mountPath: /transcodes }
+            - { name: subtitles, mountPath: /config/data/data/subtitles, readOnly: true }
+            - { name: attachments, mountPath: /config/data/data/attachments, readOnly: true }
+            - { name: tls, mountPath: /tls, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        # Same path in and out, so no TC_PATHMAP: the agents run the command line Jellyfin emitted,
+        # unchanged, which is why the media root must be mounted at the same path prod Jellyfin
+        # sees (CONTRACT "TC_* environment", TC_PATHMAP).
+        - name: media
+          hostPath: { path: /data/media, type: Directory }
+        - name: scratch
+          persistentVolumeClaim:
+            claimName: transcode-scratch
+        # Subtitle burn-in and attachment fonts (PLAN §2). `type: Directory`, never
+        # DirectoryOrCreate: a missing directory must fail the pod visibly rather than have the
+        # kubelet plant a root:root directory inside prod Jellyfin's own config tree (CONTRACT).
+        - name: subtitles
+          hostPath: { path: /srv/appdata/media/jellyfin/data/data/subtitles, type: Directory }
+        - name: attachments
+          hostPath: { path: /srv/appdata/media/jellyfin/data/data/attachments, type: Directory }
+        - name: tls
+          secret:
+            secretName: tcpool-agent-tls
+            defaultMode: 0440
+        # The CUDA JIT cache lives here; without a writable /tmp every ffmpeg recompiled its
+        # kernels (~12 s on the P4, MEASURED). Also the image's default HOME.
+        - name: tmp
+          emptyDir: {}
+---
+# ---------------------------------------------------------------------------------------------
+# NVIDIA Tesla P4 / NVENC.
+# ---------------------------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tcpool-agent-nvenc
+  namespace: media
+  labels:
+    app.kubernetes.io/name: tcpool-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: tcpool
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tcpool-agent
+      tcpool.io/class: nvenc
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tcpool-agent
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/part-of: tcpool
+        tcpool.io/class: nvenc
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9903"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: tcpool-agent
+      # per class: the NVIDIA GPU operator's node label. Unlike the Intel side there is no
+      # supplementalGroups entry: the container runtime injects /dev/nvidia* through the device
+      # plugin, and the image is already uid 1000.
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: tcpool-agent
+          image: ghcr.io/saabstory404/tcpool-agent:GIT_SHA
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: TC_NAME
+              value: nvenc-$(NODE_NAME)
+            - { name: TC_KIND, value: nvenc }
+            - { name: TC_CAPACITY, value: "6" }
+            - { name: TC_WEIGHT_4K, value: "2" }
+            - { name: TC_HEALTH_PORT, value: "9902" }
+            - { name: TC_METRICS_PORT, value: "9903" }
+            - { name: TC_TLS_REQUIRED, value: "1" }
+            - { name: TC_TLS_CERT, value: /tls/tls.crt }
+            - { name: TC_TLS_KEY, value: /tls/tls.key }
+            - { name: TC_TLS_CA, value: /tls/ca.crt }
+            - { name: TC_INPUT_ROOTS, value: /data/media }
+            - { name: TC_OUTPUT_ROOT, value: /transcodes }
+            - { name: TC_READ_ROOTS, value: /config/data/data/subtitles,/config/data/data/attachments }
+          ports:
+            - { name: grpc, containerPort: 9901, protocol: TCP }
+            - { name: health, containerPort: 9902, protocol: TCP }
+            - { name: metrics, containerPort: 9903, protocol: TCP }
+          startupProbe:
+            grpc: { port: 9902 }
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            grpc: { port: 9902 }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          livenessProbe:
+            grpc: { port: 9902 }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "kill -TERM 1 2>/dev/null; sleep 3"]
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 8
+              memory: 8Gi
+              # per class: one device per node, from the NVIDIA device plugin.
+              nvidia.com/gpu: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: media, mountPath: /data/media, readOnly: true }
+            - { name: scratch, mountPath: /transcodes }
+            - { name: subtitles, mountPath: /config/data/data/subtitles, readOnly: true }
+            - { name: attachments, mountPath: /config/data/data/attachments, readOnly: true }
+            - { name: tls, mountPath: /tls, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: media
+          hostPath: { path: /data/media, type: Directory }
+        - name: scratch
+          persistentVolumeClaim:
+            claimName: transcode-scratch
+        - name: subtitles
+          hostPath: { path: /srv/appdata/media/jellyfin/data/data/subtitles, type: Directory }
+        - name: attachments
+          hostPath: { path: /srv/appdata/media/jellyfin/data/data/attachments, type: Directory }
+        - name: tls
+          secret:
+            secretName: tcpool-agent-tls
+            defaultMode: 0440
+        - name: tmp
+          emptyDir: {}
+---
+# ---------------------------------------------------------------------------------------------
+# CPU spill worker (PLAN §7: "slow, a last resort").
+# ---------------------------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tcpool-agent-cpu
+  namespace: media
+  labels:
+    app.kubernetes.io/name: tcpool-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: tcpool
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tcpool-agent
+      tcpool.io/class: cpu
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tcpool-agent
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/part-of: tcpool
+        tcpool.io/class: cpu
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9903"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: tcpool-agent
+      # per class: PLAN §7 puts the CPU worker on the dl380 (24 threads), not the tower, which
+      # already carries Frigate. CLUSTER-SPECIFIC - the one value here that must be checked before
+      # the first apply, and the one failure it produces is silent: a selector matching no node
+      # means this DaemonSet schedules nowhere and the pool simply has no spill capacity. The node
+      # is named k3s-dl380 in this cluster; the repo's own name for it (PLAN §7) is `dl380`.
+      nodeSelector:
+        kubernetes.io/hostname: dl380
+      # This host also runs no GPU, so the CPU worker is the only one whose limits can starve a
+      # neighbour. 8 threads requested against 24 is deliberately well under full occupancy.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: tcpool-agent
+          image: ghcr.io/saabstory404/tcpool-agent:GIT_SHA
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: TC_NAME
+              value: cpu-$(NODE_NAME)
+            - { name: TC_KIND, value: cpu }
+            - { name: TC_CAPACITY, value: "3" }
+            # per class: an estimate, not a measurement (CONTRACT).
+            - { name: TC_WEIGHT_4K, value: "3" }
+            # per class: no GPU filter chain on the spill worker; scale/tonemap run on the CPU.
+            - { name: TC_HW_FILTERS, value: "0" }
+            - { name: TC_HEALTH_PORT, value: "9902" }
+            - { name: TC_METRICS_PORT, value: "9903" }
+            - { name: TC_TLS_REQUIRED, value: "1" }
+            - { name: TC_TLS_CERT, value: /tls/tls.crt }
+            - { name: TC_TLS_KEY, value: /tls/tls.key }
+            - { name: TC_TLS_CA, value: /tls/ca.crt }
+            - { name: TC_INPUT_ROOTS, value: /data/media }
+            - { name: TC_OUTPUT_ROOT, value: /transcodes }
+            - { name: TC_READ_ROOTS, value: /config/data/data/subtitles,/config/data/data/attachments }
+          ports:
+            - { name: grpc, containerPort: 9901, protocol: TCP }
+            - { name: health, containerPort: 9902, protocol: TCP }
+            - { name: metrics, containerPort: 9903, protocol: TCP }
+          startupProbe:
+            grpc: { port: 9902 }
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            grpc: { port: 9902 }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          livenessProbe:
+            grpc: { port: 9902 }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "kill -TERM 1 2>/dev/null; sleep 3"]
+          resources:
+            requests:
+              cpu: 2
+              memory: 1Gi
+            limits:
+              # A software encode of a 4K source wants every thread it can get; the ceiling is
+              # here so a run of CPU-spill jobs cannot starve the node's other tenants (Frigate is
+              # on the tower, not here, but the dl380 is not otherwise idle either).
+              cpu: 20
+              memory: 16Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: media, mountPath: /data/media, readOnly: true }
+            - { name: scratch, mountPath: /transcodes }
+            - { name: subtitles, mountPath: /config/data/data/subtitles, readOnly: true }
+            - { name: attachments, mountPath: /config/data/data/attachments, readOnly: true }
+            - { name: tls, mountPath: /tls, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: media
+          hostPath: { path: /data/media, type: Directory }
+        - name: scratch
+          persistentVolumeClaim:
+            claimName: transcode-scratch
+        - name: subtitles
+          hostPath: { path: /srv/appdata/media/jellyfin/data/data/subtitles, type: Directory }
+        - name: attachments
+          hostPath: { path: /srv/appdata/media/jellyfin/data/data/attachments, type: Directory }
+        - name: tls
+          secret:
+            secretName: tcpool-agent-tls
+            defaultMode: 0440
+        - name: tmp
+          emptyDir: {}

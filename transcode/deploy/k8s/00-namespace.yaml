@@ -1,0 +1,15 @@
+# The transcode pool lives beside Jellyfin, not beside the monitoring stack: PLAN §10 P3 puts the
+# agents in namespace `media` next to the transcoding Jellyfin pods, so the client certificate
+# secret and the scratch PVC are in the same namespace as the workload that uses them (no
+# cross-namespace Secret copying, no RBAC to read a secret in another namespace).
+#
+# The namespace already exists in this cluster (the `placer` Service in `vm-scrape-config` is
+# `placer.media.svc.cluster.local.`), so this document is a no-op there. Keeping it in the tree
+# makes the apply order self-contained for a fresh cluster. Apply it as-is: the labels below are
+# the only fields this manager owns.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: media
+  labels:
+    app.kubernetes.io/part-of: tcpool

@@ -1,0 +1,56 @@
+# Discovery, and the scrape targets.
+#
+# `tcpool-agents` is the headless Service CONTRACT.md names as TC_WORKERS_DNS: the shim resolves
+# its A records on every transcode and treats each one as a worker, so adding a card is a
+# DaemonSet scheduling a pod and nothing else. There is no scheduler and no worker list to edit
+# (PLAN §1).
+#
+# `publishNotReadyAddresses` is deliberately NOT set. That is the whole mechanism by which a
+# rolling upgrade (or a cert rotation, which drains the same way) stops handing new jobs to a
+# worker that is shutting down: the agent flips `grpc.health.v1.Health` to NOT_SERVING on SIGTERM,
+# the readiness probe fails, and the address leaves DNS within ~3 s. Setting it would leave a
+# draining agent in the A records until the process exited.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tcpool-agents
+  namespace: media
+  labels:
+    app.kubernetes.io/name: tcpool-agent
+    app.kubernetes.io/part-of: tcpool
+spec:
+  clusterIP: None
+  selector:
+    # All three classes: the shim scores whichever worker answers, and the agent's Caps say what
+    # it can do. One Service, not one per class.
+    app.kubernetes.io/name: tcpool-agent
+  ports:
+    - { name: grpc, port: 9901, targetPort: grpc, protocol: TCP }
+    # health and metrics are on the Service so a ServiceMonitor (or a static target list) has a
+    # named port to point at. Neither is on the transcode path.
+    - { name: health, port: 9902, targetPort: health, protocol: TCP }
+    - { name: metrics, port: 9903, targetPort: metrics, protocol: TCP }
+---
+# Scrape target for tcpool-sync's :9904, which does NOT run on the agents: sync is a sidecar of
+# the Jellyfin Deployment (CONTRACT "tcpool-sync"), so its metrics port belongs to a pod this
+# directory does not own. This Service is the hook for it.
+#
+# It is empty until the Jellyfin rollout adds the label below to that pod, which is harmless - a
+# Service with no endpoints scrapes nothing. deploy/k8s/jellyfin-patch.md is where that label and
+# the named `sync-metrics` container port are specified, and it is the pool side's requirement of
+# the Jellyfin deployment, not JellyMesh's rollout plan.
+apiVersion: v1
+kind: Service
+metadata:
+  name: tcpool-sync-metrics
+  namespace: media
+  labels:
+    app.kubernetes.io/name: tcpool-sync
+    app.kubernetes.io/part-of: tcpool
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/component: tcpool-sync
+  ports:
+    - { name: sync-metrics, port: 9904, targetPort: sync-metrics, protocol: TCP }
