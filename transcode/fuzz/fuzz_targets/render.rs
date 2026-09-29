@@ -15,6 +15,7 @@ fuzz_target!(|data: &[u8]| {
             let opts = TranslateOpts {
                 pathmap: vec![("/media".to_string(), "/local/media".to_string())],
                 gpu_filters,
+                ..Default::default()
             };
             let _ = translate(&args, backend, &opts);
             let _ = render(&args, backend, &opts);
@@ -27,6 +28,7 @@ fuzz_target!(|data: &[u8]| {
             &TranslateOpts {
                 pathmap: vec![("/media".to_string(), "/local/media".to_string())],
                 gpu_filters: false,
+                ..Default::default()
             },
         );
         // Structural invariants that hold for *any* input, trickplay-shaped or not. Stated as
