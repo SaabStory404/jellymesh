@@ -3,10 +3,21 @@
 MEASURED 2026-09-29 in jm-lab (2-replica `jm-jf` StatefulSet, `TraefikService` `jm-failover`:
 `failover` mode, primary `jm-jf-0`, fallback `jm-jf-1`, `errors.status: 502-504`,
 `ServersTransport` `jm-fast-dial` dialTimeout 500ms). Test file: a 26,976,301-byte static FLAC
-(any large static direct-play file exercises the same code path as video; auth is not required —
-`/Videos/{id}/stream?static=true` answered range requests unauthenticated in this lab). Client:
-plain `curl` against the real ingress path (`https://jm-lab.lan` → Traefik LB `10.10.20.200`),
-not a synthetic pod, so results reflect the actual proxy hop viewers use.
+(any large static direct-play file exercises the same code path as video; served over HTTP/2).
+Client: plain `curl` against the real ingress path (`https://jm-lab.lan` → Traefik LB
+`10.10.20.200`), not a synthetic pod, so results reflect the actual proxy hop viewers use.
+Detection latency below is a curl/HTTP2-RST_STREAM number; a client on HTTP/1.1 (plain TCP
+reset) or using OkHttp/ExoPlayer may detect a dead connection faster or slower — not measured.
+
+`/Videos/{id}/stream` and `/Audio/{id}/stream` both answered range requests with no token or
+session — **MEASURED as stock Jellyfin, not a jellymesh regression**: `VideosController.
+GetVideoStream` and `AudioController`'s equivalent action carry no `[Authorize]` attribute (code
+read, `Jellyfin.Api/Controllers/VideosController.cs` line ~314 and `AudioController.cs`), and the
+API has no global `AuthorizeFilter` forcing authorization by default (`Jellyfin.Server/Extensions/
+ApiServiceCollectionExtensions.cs`) — so these two actions are reachable without auth by design,
+likely for DLNA/Chromecast/external-player compatibility. Cross-replica behaviour of an
+*authenticated* Range retry (real API key in the URL) was not measured this session — see
+`needs_brian`.
 
 ## What actually breaks
 
@@ -17,11 +28,16 @@ inherent to the failover primitive, not a misconfiguration.
 
 Two kill methods were tried:
 - **Graceful `kubectl delete pod`** (default 30s `terminationGracePeriodSeconds`): Kestrel drains
-  in-flight requests during shutdown. In both graceful-delete trials the entire in-flight download
-  (up to 20-30s of streamed bytes at the test rate) completed with **no visible interruption** —
-  the connection outlived the graceful-shutdown window. This is a real result, not a test escape:
-  a rolling restart of jm-lab is unlikely to cut off an in-flight direct-play stream at all, as
-  long as no viewer's connection outlasts the grace period.
+  in-flight requests during shutdown — readiness went to `connection refused` ~21s after the
+  "Killing" event, i.e. the container kept serving already-open connections for roughly that long
+  past SIGTERM. One usable trial (a second graceful-delete run was itself killed by the test
+  harness's own `timeout` before it could log a result, so only one is reported): a 20-25s
+  in-flight download completed **inside** that ~21-30s drain window with no interruption. This
+  does **not** show that graceful restarts are safe for real playback — it shows a request needing
+  under ~25s more data finished before the drain ended. A feature-length direct-play stream (often
+  minutes to hours) will almost always still be open when the grace period expires and gets cut at
+  the eventual SIGKILL; the client Range-retry path below is needed for rolling restarts too, not
+  just hard crashes.
 - **Hard kill** (`kill -9` on the in-container `jellyfin` PID, s6-supervised — the base image is
   hotio's s6-overlay, so PID 1 is `s6-svscan`/supervisors, not `jellyfin`; killing PID 1 has no
   effect, the real target is the supervised `jellyfin` PID, found via `pgrep -f /usr/bin/jellyfin`):
@@ -39,11 +55,11 @@ A client that, on disconnect, reissues the same URL with `Range: bytes=<last-rec
 the full file across a hard kill of the primary replica, confirmed via Traefik access logs
 (`msg_ServiceName`/`msg_ServiceAddr`, VictoriaLogs `container:"traefik"`):
 
-| Attempt | Service (backend) | Status | Bytes | Notes |
+| Attempt | Service (backend) | Traefik `OriginStatus`/`DownstreamStatus` | Bytes | Notes |
 |---|---|---|---|---|
-| 1 | `jm-jf-0` (primary, killed at T+11s) | 200 (interrupted) | 8,407,732 of 26,976,301 | connection reset mid-body |
-| 2 | `jm-jf-1` (fallback) | 206 | 10,240,000 | `Range: bytes=8407732-`, correct resume offset |
-| 3 | `jm-jf-1` | 206 | 8,328,569 | completed the file, byte-identical to source |
+| 1 | `jm-jf-0` (primary, killed at T+11s) | 0 / 200 | 8,407,732 of 26,976,301 | origin aborted mid-body (`OriginStatus 0`); Traefik still logs downstream 200 since headers had already gone out |
+| 2 | `jm-jf-1` (fallback) | 0 / 206 | 10,240,000 | `Range: bytes=8407732-`; this attempt ended at the test script's own 20s `--max-time` cap, not a second disconnect — origin never returned a terminal status for it |
+| 3 | `jm-jf-1` | 206 / 206 | 8,328,569 | completed cleanly, file byte-identical to source |
 
 The `failover` TraefikService did its job for the *retry*, not the *original request*: jm-jf-0 was
 unhealthy (readiness probe failing) by the time the client's Range retry landed, so failover sent
@@ -52,11 +68,12 @@ media mount. **This works because direct play is a static file on shared storage
 can serve any byte range of it identically, so the resume is correct without session affinity or
 sticky cookies.
 
-Gap duration (SIGKILL to first byte of resumed stream), from Traefik log timestamps:
-kill → client detects the reset: ~5.1s (dominated by how long the client's read call was already
-blocked, not by anything server-side); detect → retry issued: ~0.35s (bounded by the test
-script's own loop, not the proxy); retry → 206: immediate. Total viewer-visible gap ≈ 5-6s,
-essentially all client-side detection latency.
+Gap duration (SIGKILL to first byte of resumed stream), from Traefik log timestamps, **single
+run, n=1**: kill → client detects the reset: ~5.1s (dominated by how long the client's read call
+was already blocked and by HTTP/2 RST_STREAM propagation, not by anything server-side); detect →
+retry issued: ~0.35s (bounded by the test script's own loop, not the proxy); retry → 206:
+immediate. Total viewer-visible gap ≈ 5-6s in this one trial — treat as an order-of-magnitude
+estimate, not a precise bound, until repeated.
 
 ## Recommendation
 
@@ -76,9 +93,9 @@ version-dependent:
 
 | Client | Reconnect-with-range on drop? | Source |
 |---|---|---|
-| Android TV official app (ExoPlayer/Media3) | ExoPlayer has a configurable `LoadErrorHandlingPolicy` with retry+backoff (`minLoadableRetryCount` default 3) for load errors, which for `DefaultHttpDataSource` includes reopening with the correct byte range; whether the Jellyfin Android TV app's specific config uses this to survive a full backend death (vs surfacing "Player error, will retry... giving up") is not confirmed — multiple open issues describe "will retry... too many errors, giving up" on unrelated playback errors, so behaviour on a real backend-death disconnect is unverified. |
-| Moonfin | Documented (its own repo) 3-step reconnect: stall/freeze detection (8s stall or 15s no-first-frame) then reconnect attempts at 4s/10s/20s backoff; on the 3rd attempt it can fall back to direct-stream (remux) instead of direct play. This is the most explicit resume behaviour found in this search. |
-| Swiftfin (tvOS/iOS, VLCKit/MPVKit-based playback) | No explicit reconnect-with-range documentation found; a cited report shows Swiftfin (MPVKit) failing to even start playback on high-jitter links where AVFoundation-based clients (official app, Safari) succeed — suggests its HTTP/demux layer is less tolerant of interruption generally, not that it lacks a retry path specifically. |
+| Android TV official app (ExoPlayer/Media3) | ExoPlayer has a configurable `LoadErrorHandlingPolicy` with retry+backoff (`minLoadableRetryCount` default 3) for load errors, which for `DefaultHttpDataSource` includes reopening with the correct byte range ([Android Developers: Media3 ExoPlayer customization](https://developer.android.com/media/media3/exoplayer/customization); [Load error handling in ExoPlayer, Medium](https://medium.com/google-exoplayer/load-error-handling-in-exoplayer-488ab6908137)); whether the Jellyfin Android TV app's specific config uses this to survive a full backend death (vs surfacing "Player error, will retry... giving up") is not confirmed — see [jellyfin-androidtv#1703](https://github.com/jellyfin/jellyfin-androidtv/issues/1703), [jellyfin#15634](https://github.com/jellyfin/jellyfin/issues/15634), [jellyfin#16175](https://github.com/jellyfin/jellyfin/issues/16175), all "will retry... too many errors, giving up" on unrelated playback errors — behaviour on a real backend-death disconnect specifically is unverified. |
+| Moonfin | Documented 3-step reconnect: stall/freeze detection (8s stall or 15s no-first-frame) then reconnect attempts at 4s/10s/20s backoff; on the 3rd attempt it can fall back to direct-stream (remux) instead of direct play — [Moonfin-Core PR #1639](https://github.com/Moonfin-Client/Moonfin-Core/pull/1639). This is the most explicit resume behaviour found in this search, though the PR covers Live TV/IPTV playback specifically; whether the same path covers on-demand direct play is not confirmed. |
+| Swiftfin (tvOS/iOS, VLCKit/MPVKit-based playback) | No explicit reconnect-with-range documentation found; [streamyfin#2037](https://github.com/streamyfin/streamyfin/issues/2037) reports Swiftfin (MPVKit) failing to even start playback on high-jitter cellular links where AVFoundation-based clients (official app, Safari) succeed — suggests its HTTP/demux layer is less tolerant of interruption generally, not confirmation that it lacks a retry path specifically. |
 | Web (jellyfin-web) | Not researched this session. |
 | Infuse | No specific interruption-recovery documentation found; commonly used as a fallback player for files Swiftfin can't handle, not evaluated here for resume behaviour. |
 
