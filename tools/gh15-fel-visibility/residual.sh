@@ -2,9 +2,9 @@
 # jellymesh issue #15: compute FEL enhancement-layer residual energy vs base-layer
 # highlight regions, entirely via ffmpeg/ffprobe filters (no numpy -- MEASURED not
 # available in the jm6 image this Job runs in, and installing it via apt was
-# unreliable on this node's egress this session; see gh-15-notes.md).
+# unreliable on this node's egress this session; see docs/engineering/gh15-fel-visibility.md).
 #
-# CORRECTED method: residual = EL sample - nlq_offset (NOT el - bl; see gh-15-notes.md
+# CORRECTED method: residual = EL sample - nlq_offset (NOT el - bl; see docs/engineering/gh15-fel-visibility.md
 # "correction" section -- the first version of this pipeline had that bug, caught by
 # advisor review before the real Job ran). nlq_offset/deadzone come from
 # `dovi_tool export -d all` on the clip's RPU, frame 0, in native 10-bit units.
@@ -86,7 +86,7 @@ result = {
     "title": title,
     "method": "fel_nlq_residual_ffmpeg_lutyuv (residual = EL - nlq_offset via ffprobe/lutyuv/"
               "signalstats filtergraphs, 10-bit native tv-range scale; mean|residual| only; "
-              "NOT a full vs-nlq curve reconstruction; see gh-15-notes.md)",
+              "NOT a full vs-nlq curve reconstruction; see docs/engineering/gh15-fel-visibility.md)",
     "nlq_offset_10bit": nlq_offset,
     "deadzone_threshold_10bit": deadzone,
     "highlight_threshold_10bit_code": hi_thresh,

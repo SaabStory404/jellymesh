@@ -1,6 +1,8 @@
+> Status: working log. This file holds the design plan, the live checklist and the measurement journal, so parts of it are dated snapshots. For current Dolby Vision behavior see `docs/dolby-vision.md`; for the transcode pool overview see `transcode/README.md`.
+
 # Transcode pool: production plan
 
-Status: PLAN, 2026-09-26. It builds on the spike in `transcode/spike/` (PR #154). The prod rollout is coordinated with JellyMesh (PR #155, `arr-stack/k3s/jellymesh/COMBINED-ROLLOUT.md`).
+Status: PLAN, 2026-09-26 (Dolby Vision P5 item is live in production, reported by the maintainer 2026-09-29; see `docs/dolby-vision.md`). It builds on the spike in `transcode/spike/` (PR #154). The prod rollout is coordinated with JellyMesh (PR #155, `arr-stack/k3s/jellymesh/COMBINED-ROLLOUT.md`).
 
 The goal is to treat every transcode-capable device as **one pool**:
 - load spreads across all of them;
@@ -241,7 +243,7 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
       handler carries the same `playSessionId` straight through
       (`Jellyfin.Api/Helpers/StreamingHelpers.cs:377-386`, `DynamicHlsController.cs:229` et al. in
       `~/.cache/jellymesh-vendor/jellyfin-src`), so it is stable **server-side** across any restart
-      that carries an existing `playSessionId`, and changes only on a genuinely new session.
+      that carries an existing `playSessionId`, and changes only on a new session.
       Verified for a seek; whether a client-driven track/bitrate change reuses `PlaySessionId`
       rather than re-invoking `/PlaybackInfo` (which mints a fresh one --
       `MediaInfoHelper.cs:132`) was not independently checked -- no jellyfin-web client source is
@@ -473,12 +475,12 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
 
       Done when the Bravia shows the Dolby Vision badge on a DV7 title with Direct Stream (remux) and
       no extra disk use.
-- [x] Baseline measured (P0, calibration/README.md): Arc delivers 16-22% of the cap, VMAF 87.1/87.5 @8M
+- [x] Baseline measured (P0, transcode-calibration.md): Arc delivers 16-22% of the cap, VMAF 87.1/87.5 @8M
       (h264/hevc); P4 94.8/93.2; Arc-vs-P4 gap 5.4-7.8 (a failover is visible). Calibrated settings
       measured Arc 93.5/97.6, P4 93.5/96.9, gap +0.04/+0.72
 - [x] **Next session, step 1** (docs/tcpool-next-session.md): calibrated rate control + presets in render()
       (branch `p5-ratecontrol`, 2026-09-27; `apply_rate_control`, agent `TC_RC=calibrated|legacy`,
-      golden `corpus/goldens/render-calibrated.json`). Lab-measured in calibration/README.md "P5 applied".
+      golden `corpus/goldens/render-calibrated.json`). Lab-measured in transcode-calibration.md "P5 applied".
       Not yet deployed to tc-lab agents or prod.
 - [x] Rate-control mapping per encoder from the calibration (fix the bitrate undershoot): MEASURED
       delivered Arc 94.1-96.6% of the cap (never over; was 7-22%), P4 93.7-102.4%; Arc +0.83..+1.49
@@ -495,7 +497,7 @@ Updated 2026-09-27. `[x]` done and verified · `[~]` in progress · `[ ]` to do.
 ### P6 Latency
 - [x] Probe clamp: Jellyfin's `-probesize 1G` cost 8-12 s over the tower's 1 GbE link; clamped to 50M/5M
       (mapped streams unchanged on all 3 titles) → first segment 0.78-0.88 s (2026-09-27)
-- [x] P0 latency baseline: first segment p50 0.8-1.35 s warm (calibration/README.md)
+- [x] P0 latency baseline: first segment p50 0.8-1.35 s warm (transcode-calibration.md)
 - [ ] Hedged start: if no first segment after ~4 s, start a second attempt elsewhere and keep the first to finish
 - [ ] Tower uplink: 1 GbE saturates on a remux probe (enp5s0f1 unused); faster link or bond
 - [ ] Readahead/FS-Cache trial, warm contexts; cold-cache latency run still owed
@@ -526,7 +528,7 @@ ffmpeg unconditionally; trickplay does too unless `TC_BATCH=1` and its output di
 | Hardware decoding checkboxes, low-power encoders, VPP tonemap | Not used in `none` mode. Each agent hardware-decodes what its card supports and falls back to CPU decode per job (e.g. no AV1 decode on the P4) | works, by design |
 | Enable tone mapping | Jellyfin emits `tonemapx`; the agents run it on the GPU (CPU fallback per job) | works |
 | Tone-map algorithm / peak / desat / range | Carried in `tonemapx`. Honoured on the P4 (`tonemap_cuda` takes them). **Dropped on the Arc**: `tonemap_vaapi` only takes primaries/transfer/matrix | **fix (P5):** a non-default algorithm routes the Arc through OpenCL tonemap, or the UI note says the Arc uses a fixed curve |
-| Encoder preset, H.264/H.265 CRF | Preset mapped per encoder; CRF → per-encoder rate control from the calibration | P5: QSV `-global_quality` is CQP and ignores the cap (16-22% of cap, calibration/README.md) |
+| Encoder preset, H.264/H.265 CRF | Preset mapped per encoder; CRF → per-encoder rate control from the calibration | P5: QSV `-global_quality` is CQP and ignores the cap (16-22% of cap, transcode-calibration.md) |
 | Throttle transcodes, segment deletion | Pass-through; the agent honours ffmpeg's pause/resume keys | works (suite case 11) |
 | Per-user bitrate limit, "allow video transcoding" | Enforced by Jellyfin before the pool is involved | works |
 | Thread count | Irrelevant to GPU workers | ignored |

@@ -1,4 +1,4 @@
-//! On-the-fly Dolby Vision profile 7 -> 8.1 conversion core (`transcode/docs/PLAN.md` P5).
+//! On-the-fly Dolby Vision profile 7 -> 8.1 conversion core (`docs/engineering/transcode-plan.md` P5).
 //!
 //! The per-access-unit NAL rewrite: Annex-B NAL splitting, enhancement-layer removal, and RPU
 //! profile rewriting via the `dolby_vision` crate (the crate dovi_tool itself is built on). The
@@ -11,7 +11,7 @@
 //! (mapping type `hvcE`; ffmpeg logs `unknown Block Addition Mapping type 68766345`), and an
 //! ffmpeg stream copy of those contains zero type-62 NALs. `job.rs` detects that on the first
 //! bytes of ffmpeg#1's output (no RPU seen) and falls back to the plain remux; reading `hvcE`
-//! Block Additions is future work (PLAN.md P5).
+//! Block Additions is future work (docs/engineering/transcode-plan.md P5).
 //!
 //! **Enhancement-layer shape.** In a single-track (BD-style) DV7 bitstream the EL NALs are
 //! encapsulated as `nal_unit_type` 63 (UNSPEC63) on layer 0 -- dovi_tool's `demux` treats 63 as

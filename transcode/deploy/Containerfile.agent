@@ -13,7 +13,7 @@
 # VERSION SKEW, open: prod Jellyfin (arr-stack/k3s/30-media.yaml) still runs
 # ghcr.io/hotio/jellyfin:release-12.0. This pin matches the PLANNED JellyMesh image
 # ghcr.io/saabstory404/jellymesh-jellyfin:12.1-jm3, which is built FROM release-12.1 - bump the two
-# together. TODO: transcode/docs/PLAN.md §2 says the shim refuses a major ffmpeg
+# together. TODO: docs/engineering/transcode-plan.md §2 says the shim refuses a major ffmpeg
 # mismatch; the shim does not implement that check yet (rank() filters on outputs only), so for now
 # this digest pin is the only thing holding the versions together.
 #

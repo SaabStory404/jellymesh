@@ -771,7 +771,7 @@ async fn pump(mut from: impl tokio::io::AsyncRead + Unpin, tx: Tx, ctl: Arc<Ctl>
 }
 
 // ---------------------------------------------------------------------------------------------
-// P5: DV profile 7 -> 8.1 remux (transcode/docs/PLAN.md). ffmpeg#1 demuxes the video to MPEG-TS,
+// P5: DV profile 7 -> 8.1 remux (docs/engineering/transcode-plan.md). ffmpeg#1 demuxes the video to MPEG-TS,
 // this process rewrites it (dv81_ts + dv81), ffmpeg#2 muxes Jellyfin's HLS from it plus the
 // source's other streams. ffmpeg#2 reads the video on fd 3 (`pipe:3`), NOT stdin: stdin stays
 // Jellyfin's key channel (p/u/q throttling), exactly as on the plain path.

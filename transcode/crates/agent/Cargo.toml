@@ -17,7 +17,7 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tonic-health = { workspace = true }
 futures = { workspace = true }
-# P5 (transcode/docs/PLAN.md): RPU parsing/rewriting for the DV7->8.1 conversion core
+# P5 (docs/engineering/transcode-plan.md): RPU parsing/rewriting for the DV7->8.1 conversion core
 # (crates/agent/src/dv81.rs). The crate dovi_tool itself is built on.
 dolby_vision = "3"
 # P5: parses ffprobe's `-of json` output in `probe::source_dovi`.

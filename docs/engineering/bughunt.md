@@ -1,3 +1,5 @@
+> Status: engineering log of the 2026-09-27 bug hunt and patch series 00-19; a record of what was found and measured on those dates, not a user guide. Patch series usage: `jellyfin-perf/README.md`.
+
 # Jellyfin 12.1 bug hunt
 
 Date: 2026-09-27. Scope: a targeted hunt against Jellyfin 12.1 (tag `v12.1`), starting from six
@@ -30,7 +32,9 @@ change for any plugin that *implements* one of those interfaces; none of the plu
 JellyMesh does (Galera provider, Leader), so the practical risk is low, but check before loading a
 third-party plugin that replaces one of these services.
 
-**Deployment: nothing here has been built into an image or deployed.** Every number in this
+> Update 2026-09-29: superseded in part. Dolby Vision 7 to 8.1 (patches 13, 17, 18, 19) is deployed in production, as reported by the maintainer; see [dolby-vision.md](../dolby-vision.md).
+
+**Deployment (as of 2026-09-27): nothing here had been built into an image or deployed.** Every number in this
 document comes from the build/test/measurement commands shown; the owning session builds and
 ships the image separately.
 
@@ -383,7 +387,9 @@ review rounds: round 1 found HTTP candidates could win the ranking via the subst
 found an EL-declaring condition regressed with the flag on; each was fixed with a test that
 fails before the fix (MEASURED) and passes after. Round 3 approved.
 
-**Not verified here (INHERITED):** that the Bravia/Android TV client plays the converted 8.1
+> Update 2026-09-29: the maintainer reports the converted stream plays as Dolby Vision on an NVIDIA SHIELD (Android TV app) in production; see [dolby-vision.md](../dolby-vision.md).
+
+**Not verified here (Not measured):** that the Bravia/Android TV client plays the converted 8.1
 stream, and that FEL titles convert acceptably (the conversion drops the EL; MEL titles lose
 nothing, FEL titles lose the EL's extra detail). Both need the pool half and a real device. Known,
 non-regressing gaps from review: a device condition that lists only literal `DOVI` (not

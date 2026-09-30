@@ -609,7 +609,7 @@ mod tests {
         assert!(validate(&b, &Policy::default(), Shape::Hls).is_err());
     }
 
-    // P5 (transcode/docs/PLAN.md): the DV7->8.1 signal (`crate::DV81_SIGNAL_FLAG`/
+    // P5 (docs/engineering/transcode-plan.md): the DV7->8.1 signal (`crate::DV81_SIGNAL_FLAG`/
     // `DV81_SIGNAL_VALUE`) is not special-cased anywhere in this allowlist -- it is just another
     // `-metadata:s:vN` option/value pair, which was already opaque to `validate()` before P5
     // existed. This test is regression coverage for that fact, not a widening: if a future change

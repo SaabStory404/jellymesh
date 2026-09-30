@@ -192,7 +192,7 @@ otherwise the same as the plain remux, and a shim that cannot even reach the poo
 DV-removal rewrite itself before running ffmpeg locally — the one sanctioned exception to execing
 your argv byte-for-byte. Counted in `tcpool_dv81_total{outcome}`. So the badge changes (to a real
 8.1 record) only for in-band-RPU DV7 titles, and every other signaled title still gets a decodable
-HDR10 stream instead of raw DV7; details and measurements in `transcode/docs/PLAN.md` P5.
+HDR10 stream instead of raw DV7; details and measurements in `docs/engineering/transcode-plan.md` P5.
 
 ## Rollback
 

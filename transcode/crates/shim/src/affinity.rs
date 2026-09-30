@@ -22,7 +22,7 @@
 //! change, reuses `PlaySessionId` rather than the client re-invoking `/PlaybackInfo` (which mints
 //! a fresh `PlaySessionId` every time -- `MediaInfoHelper.cs:132`, `Guid.NewGuid()`) was **not
 //! verified for any of the three** -- no jellyfin-web client source is vendored here to check,
-//! and it was not independently re-traced (see docs/PLAN.md §10). The suite's own case 20b, which
+//! and it was not independently re-traced (see docs/engineering/transcode-plan.md §10). The suite's own case 20b, which
 //! restarts with a different `-start_number` on a playlist path the test script controls
 //! directly, proves the shim's handling of a repeated `playSessionId`, not that a real client
 //! actually sends one on a seek. If the client instead re-invokes `/PlaybackInfo` for any of
@@ -170,7 +170,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 /// deliberately leaves its own pin alone (a later seek/track-change restart must still find it),
 /// so without a sweep the file has no owner left to delete it once the session truly ends and is
 /// never touched again -- `read()`'s TTL check only makes such a file stop being *used*, it never
-/// unlinks it (see docs/PLAN.md §10). Every PLAYBACK output shares one scratch directory, so
+/// unlinks it (see docs/engineering/transcode-plan.md §10). Every PLAYBACK output shares one scratch directory, so
 /// calling this from any active session's `run()` also reaps every other session's leftover
 /// files in the same directory, not just its own. Best-effort: every I/O error here is swallowed,
 /// same as the rest of this module -- affinity is an optimization, cleanup is a nice-to-have on

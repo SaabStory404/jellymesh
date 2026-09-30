@@ -246,7 +246,7 @@ pub struct SourceDovi {
 /// The first video track's Dolby Vision configuration record, index and the container start
 /// time, via ffprobe; `None` if ffprobe fails, times out, or finds no video stream.
 ///
-/// This is the source-truth half of the P5 gate (`transcode/docs/PLAN.md`): `tcpool_ir::wants_dv81`
+/// This is the source-truth half of the P5 gate (`docs/engineering/transcode-plan.md`): `tcpool_ir::wants_dv81`
 /// says what Jellyfin's decision patch asked for; this says what the file actually is. `job.rs`
 /// requires `profile == Some(7)` before converting; anything else (including `None` from a
 /// timeout) falls through to the plain remux -- fail closed, never convert an unconfirmed source.

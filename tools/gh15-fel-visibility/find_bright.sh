@@ -3,7 +3,7 @@
 # (10-bit native scale via the `movie=` filter's `seek_point` option + `-read_intervals`
 # -- MEASURED this combination seeks without a full decode from start, unlike
 # `-read_intervals` alone which errored "Could not seek" on a bare movie= source with
-# no seek_point. See gh-15-notes.md), sampled every 5 minutes across the middle 80% of
+# no seek_point. See docs/engineering/gh15-fel-visibility.md), sampled every 5 minutes across the middle 80% of
 # the runtime, then prints "start_seconds duration_seconds" for the highest-YAVG
 # window found.
 set -euo pipefail

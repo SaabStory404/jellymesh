@@ -126,7 +126,7 @@ pub struct TranslateOpts {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RateControl {
     /// P5: bitrate-targeted rate control per encoder from the calibration
-    /// (`calibration/README.md`), so the delivered bitrate tracks the client's cap and the two
+    /// (`docs/engineering/transcode-calibration.md`), so the delivered bitrate tracks the client's cap and the two
     /// cards land at the same quality. See `apply_rate_control`.
     #[default]
     Calibrated,
@@ -733,7 +733,7 @@ pub fn required_output(args: &[String]) -> Option<&'static str> {
 
 /// The Jellyfin-side decision patch's signal for an on-the-fly DV profile 7 -> 8.1 remux: an
 /// explicit per-stream output metadata tag, appended once on the video stream when Jellyfin's
-/// playback decision selects a DV7 source for a client that plays DV 8.1 (`transcode/docs/PLAN.md`
+/// playback decision selects a DV7 source for a client that plays DV 8.1 (`docs/engineering/transcode-plan.md`
 /// P5). Chosen because it is a real, harmless ffmpeg option (arbitrary output metadata): any
 /// fallback path that execs ffmpeg with this argv unmodified (an older agent, or the shim's own
 /// `exec_real` when the pool is unreachable) still runs correctly and just tags the output file
