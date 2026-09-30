@@ -1,8 +1,6 @@
 # JellyMesh Jellyfin image
 
-The `image/` directory holds the Containerfiles that build the JellyMesh Jellyfin image, `ghcr.io/saabstory404/jellymesh-jellyfin`, as a chain of tags on top of hotio's Jellyfin 12.1. Each tag adds patches, the Galera provider, or the transcode pool shim.
-
-**Status:** Implemented. No workflow builds this image; you build it with podman. The tag the maintainer's cluster runs is deployment-specific and not recorded here.
+The `image/` directory holds the Containerfiles that build the JellyMesh Jellyfin image, `ghcr.io/saabstory404/jellymesh-jellyfin`, as a chain of tags on top of hotio's Jellyfin 12.1. Each tag adds patches, the Galera provider, or the transcode pool shim. No workflow builds this image, so you build it yourself with podman. I haven't recorded which tag my own cluster runs.
 
 ## What it does
 
@@ -26,9 +24,9 @@ Each `image/Containerfile.jmN` builds one tag on top of an earlier published tag
 
 The lineage is not a single chain. jm8.1 is built from jm7.1, and jm8.2, jm8.3, and jm8.4 are siblings that are each built from jm8.1.
 
-Patch 16 was numbered 14 before the jm7.1 rebase (`docs/engineering/bughunt.md`). The startup-wipe scoping and the shared-directory segment wait for `JELLYMESH_SHARED_TRANSCODE_DIR` are patch 03 (`03-k2-incident-and-shared-dir`), which `Containerfile.jm6` names as the origin of that flag; patch 16 adds the keepalive, cleanup, and takeover parts. For what patches 13 and 17-19 do, see [Dolby Vision](../docs/dolby-vision.md).
+Patch 16 was numbered 14 before the jm7.1 rebase. The startup-wipe scoping and the shared-directory segment wait for `JELLYMESH_SHARED_TRANSCODE_DIR` are patch 03 (`03-k2-incident-and-shared-dir`), which `Containerfile.jm6` names as the origin of that flag; patch 16 adds the keepalive, cleanup, and takeover parts. For what patches 13 and 17-19 do, see [Dolby Vision](../docs/dolby-vision.md).
 
-The jm8.2 audio result is Measured on a SHIELD: the official Android TV app showed Dolby Vision video with no audio on the default TrueHD track, while AC3 played (`docs/engineering/bughunt.md`, correction under patch 17).
+Why jm8.2 is marked bad: on my SHIELD the official Android TV app showed Dolby Vision video with no audio on the default TrueHD track, while AC3 played.
 
 ### Image internals
 
@@ -59,7 +57,7 @@ podman build -f image/Containerfile.jm8.4 \
   -t ghcr.io/saabstory404/jellymesh-jellyfin:12.1-jm8.4 <ctx>
 ```
 
-`<ctx>` is your staging directory. The build context differs per Containerfile:
+`<ctx>` is your staging directory. You assemble it yourself; it isn't shipped here. What it has to hold differs per Containerfile, and each Containerfile's header comment repeats the list:
 
 | Containerfile | Context holds |
 | --- | --- |
@@ -69,8 +67,6 @@ podman build -f image/Containerfile.jm8.4 \
 | `Containerfile.jm7` | `overlay/`, `galera/`, and `install-plugins.sh`. |
 | `Containerfile.jm5` | The static musl binaries only. The header uses `transcode/target/x86_64-unknown-linux-musl/release` as the context. |
 | `Containerfile` (jm3-era base) | Cannot be built from the repo; see Limitations. |
-
-The staging directory is assembled per deployment and not shipped here; the lists above and each Containerfile's header comment state what it must hold.
 
 ### Pool images
 
@@ -90,7 +86,7 @@ Jellyfin loads plugins only from `$JELLYFIN_DATA_DIR/plugins`. The image carries
 
 The script copies each `*.dll` into `${JELLYFIN_DATA_DIR:-/config/data}/plugins/<folder>`. It skips a file that is byte-identical (`cmp`). For a changed file it writes `<dll>.jmnew` and renames it over the target, so the file gets a new inode.
 
-The script never overwrites a DLL in place. An in-place overwrite crashed a live replica with `BadImageFormatException` ("Bad IL range"). That was Measured in a podman lab, with a jm6 process running under a jm7 Galera DLL copy (`image/install-plugins.sh` header). The Galera plugin folder is `JellyMesh Galera_1.0.0.0` (the name contains a space).
+The script never overwrites a DLL in place, because an in-place overwrite crashed a live replica with `BadImageFormatException` ("Bad IL range"). I hit that in a podman lab, with a jm6 process running under a jm7 Galera DLL copy. The Galera plugin folder is `JellyMesh Galera_1.0.0.0` (the name contains a space).
 
 ## Test
 
@@ -100,15 +96,6 @@ There is no test for the image build. The patch series has its own tests, listed
 
 - The staging context is not in the repo, and `image/Containerfile` refers to `stage_jm3.py`, which is not in the repo either. The base image cannot be rebuilt from the repo alone.
 - The jm8.x Containerfiles take the shim and sync binaries from jm8.1. They do not rebuild them.
-
-## Related docs
-
-- [Operations](../docs/operations.md): deploy, upgrade, and roll back the image.
-- [Configuration reference](../docs/configuration.md): environment variables.
-- [Dolby Vision](../docs/dolby-vision.md): what patches 13 and 17-19 do.
-- [jellyfin-perf](../jellyfin-perf/README.md): the patch series and its build.
-- [Transcode pool](../transcode/README.md): the shim, agent, and sync.
-- [Leader plugin](../leader/README.md): one of the plugins the image carries.
 
 ## License
 

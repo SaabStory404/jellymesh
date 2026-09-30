@@ -1,8 +1,8 @@
-> Status: working log. This file holds the design plan, the live checklist and the measurement journal, so parts of it are dated snapshots. For current Dolby Vision behavior see `docs/dolby-vision.md`; for the transcode pool overview see `transcode/README.md`.
+> Working log: the design plan, the live checklist and the measurement journal all live here, so parts of it are dated snapshots rather than current state. For what Dolby Vision does now see `docs/dolby-vision.md`, and for the transcode pool overall see `transcode/README.md`.
 
 # Transcode pool: production plan
 
-Status: PLAN, 2026-09-26 (Dolby Vision P5 item is live in production, reported by the maintainer 2026-09-29; see `docs/dolby-vision.md`). It builds on the spike in `transcode/spike/` (PR #154). The prod rollout is coordinated with JellyMesh (PR #155, `arr-stack/k3s/jellymesh/COMBINED-ROLLOUT.md`).
+This is the plan as of 2026-09-26; the Dolby Vision P5 item has been live in production since 2026-09-29 (see `docs/dolby-vision.md`). It builds on the spike in `transcode/spike/` (PR #154). The prod rollout is coordinated with JellyMesh (PR #155, `arr-stack/k3s/jellymesh/COMBINED-ROLLOUT.md`).
 
 The goal is to treat every transcode-capable device as **one pool**:
 - load spreads across all of them;

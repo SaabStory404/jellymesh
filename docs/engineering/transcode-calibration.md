@@ -1,4 +1,4 @@
-> Status: calibration record. The "Recommendation (first pass ...)" table is superseded by the "P5 applied" section below. Raw data files stay in `transcode/calibration/`; file names below such as `2026-09-26-p0.csv` are relative to that directory.
+> Calibration record from 2026-09-26/27. The "Recommendation (first pass ...)" table below is superseded by the "P5 applied" section further down. Raw data files stay in `transcode/calibration/`, and file names below such as `2026-09-26-p0.csv` are relative to that directory.
 
 # Transcode pool calibration — P0, 2026-09-26/27
 

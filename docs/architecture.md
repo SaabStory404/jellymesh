@@ -1,10 +1,6 @@
 # Architecture
 
-JellyMesh runs several Jellyfin 12.1 servers against one shared MySQL-compatible database, so any server can answer any request. This page explains how the parts fit together, why each part exists, and what happens when a node, a database member, or a GPU worker fails.
-
-**Status:** Implemented. Only Dolby Vision 7 -> 8.1 conversion is Production (reported by the maintainer, 2026-09-29): the TV plays Dolby Vision through the Android TV app, and the EAC3 audio passes through to an AV receiver as Dolby Digital Plus (maintainer report, 2026-09-30). Per-component labels are in the [component map](#component-map).
-
-Terms such as [Galera](#glossary) link to the [glossary](#glossary) at first use.
+JellyMesh runs several Jellyfin 12.1 servers against one shared MySQL-compatible database, so any server can answer any request. The one piece I'd call production is the Dolby Vision 7 -> 8.1 conversion: since 2026-09-29 the TV has been playing Dolby Vision through the Android TV app, and as of 2026-09-30 the EAC3 audio passes through to an AV receiver as Dolby Digital Plus. Nothing else is what I'd call production yet.
 
 ## How it fits together
 
@@ -20,19 +16,19 @@ The design does not remove all per-node state. [Shared state](#shared-state) lis
 
 ## Component map
 
-| Component | Directory | Role | Status |
-|---|---|---|---|
-| Galera provider plugin | `galera/Jellyfin.Database.Providers.Galera` | Runs Jellyfin 12.1 on MySQL 8.4 / [PXC](#glossary) through [Pomelo](#glossary) | Implemented, Lab-verified. Production use not documented |
-| Pomelo build and patch | `galera/pomelo` | Builds Pomelo from community EF Core 10 PR #2047 at a pinned commit and applies `jellymesh-pomelo.patch`. No upstream Pomelo release supports EF Core 10, so the provider depends on an unmerged community PR | Implemented |
-| `jellyfin-dbmigrate` | `galera/Jellyfin.DbMigrate` | Copies and verifies data between SQLite and the provider (`model`, `copy`, `verify`) | Implemented |
-| Query and shared-DB patch | `jellyfin-perf/jellyfin-12.1-perf.patch` | Fixes [N+1](#glossary) query shapes, retries user-data writes, adds `JELLYFIN_SHARED_DB=1` | Implemented, lab-verified |
-| Bughunt patch series 00-19 | `jellyfin-perf/bughunt` | Playback, transcode-directory, cache-invalidation, and Dolby Vision fixes; some behavior is opt-in | Implemented. Patches 13, 17-19 (Dolby Vision) Production, 2026-09-29 |
-| Leader plugin | `leader` | Runs each Jellyfin scheduled task once cluster-wide using a Kubernetes [Lease](#glossary) | Implemented |
-| Transcode pool | `transcode` | Rust workspace with crates `ir`, `proto`, `agent`, `shim`, `sync`, plus a C# `plugin` dashboard | Implemented. Dolby Vision path: Production, 2026-09-29. Shared transcode directory: Lab-verified, off by default |
-| Container image | `image` | Layered Containerfiles (`Containerfile.jm5` to `.jm8.4`) that ship the patched Jellyfin, plugins, shim, and `jellyfin-dbmigrate` | Implemented |
-| Traefik failover route | [`deploy/examples/traefik-failover.yaml`](../deploy/examples/traefik-failover.yaml) | [TraefikService](#glossary) in failover mode in front of two replicas; documented only from lab evidence | Lab-verified. Example manifest ships in `deploy/examples/` |
+| Component | Directory | Role |
+|---|---|---|
+| Galera provider plugin | `galera/Jellyfin.Database.Providers.Galera` | Runs Jellyfin 12.1 on MySQL 8.4 / [PXC](#glossary) through [Pomelo](#glossary) |
+| Pomelo build and patch | `galera/pomelo` | Builds Pomelo from community EF Core 10 PR #2047 at a pinned commit and applies `jellymesh-pomelo.patch`. No upstream Pomelo release supports EF Core 10, so the provider depends on an unmerged community PR |
+| `jellyfin-dbmigrate` | `galera/Jellyfin.DbMigrate` | Copies and verifies data between SQLite and the provider (`model`, `copy`, `verify`) |
+| Query and shared-DB patch | `jellyfin-perf/jellyfin-12.1-perf.patch` | Fixes [N+1](#glossary) query shapes, retries user-data writes, adds `JELLYFIN_SHARED_DB=1` |
+| Bughunt patch series 00-19 | `jellyfin-perf/bughunt` | Playback, transcode-directory, cache-invalidation, and Dolby Vision fixes; some behavior is opt-in |
+| Leader plugin | `leader` | Runs each Jellyfin scheduled task once cluster-wide using a Kubernetes [Lease](#glossary) |
+| Transcode pool | `transcode` | Rust workspace with crates `ir`, `proto`, `agent`, `shim`, `sync`, plus a C# `plugin` dashboard |
+| Container image | `image` | Layered Containerfiles (`Containerfile.jm5` to `.jm8.4`) that ship the patched Jellyfin, plugins, shim, and `jellyfin-dbmigrate` |
+| Traefik failover route | [`deploy/examples/traefik-failover.yaml`](../deploy/examples/traefik-failover.yaml) | [TraefikService](#glossary) in failover mode in front of two replicas; documented only from lab evidence |
 
-The Traefik route is described from measurements in [the direct-play failover report](engineering/direct-play-failover.md). The names in that report (`jm-failover`, `jm-fast-dial`) come from prose; no manifest exists in this repository.
+What's written here about the Traefik route comes from the measurements in [the direct-play failover report](engineering/direct-play-failover.md). The names in that report (`jm-failover`, `jm-fast-dial`) come from prose; no manifest exists in this repository.
 
 ## Request and transcode paths
 
@@ -60,12 +56,12 @@ Each replica runs the shim in place of ffmpeg and the leader plugin in-process. 
 
 ## Shared state
 
-Setting `JELLYFIN_SHARED_DB=1` on each replica changes how Jellyfin treats its caches (source: `jellyfin-perf/README.md`, `jellyfin-perf/jellyfin-12.1-perf.patch`).
+Setting `JELLYFIN_SHARED_DB=1` on each replica changes how Jellyfin treats its caches.
 
 | Behavior | With `JELLYFIN_SHARED_DB=1` |
 |---|---|
 | User data (watch state, favorites) | Read from the database every time; no per-node LRU |
-| Item cache | Entries live 5 s only. Removing the cache cost throughput in the one-store comparison (105 -> 36 req/s, `jellyfin-perf/README.md`) |
+| Item cache | Entries live 5 s only. Removing the cache cost throughput in the one-store comparison (105 -> 36 req/s) |
 | Login sessions (Devices) | Looked up in the database instead of a startup snapshot |
 | Cross-node item invalidation | [Patch 15](../jellyfin-perf/bughunt/15-shared-item-cache-invalidation.patch) adds a `JellyMeshItemInvalidation` table in the same database, created with `CREATE TABLE IF NOT EXISTS` on first use; each node polls it every 250 ms by default |
 | Opt out of invalidation | `JELLYFIN_SHARED_INVALIDATION=0` |
@@ -73,14 +69,14 @@ Setting `JELLYFIN_SHARED_DB=1` on each replica changes how Jellyfin treats its c
 
 No second data store is required. The invalidation table lives in the same database as Jellyfin's data.
 
-Measured coherence (2 Jellyfin servers on a 3-node Galera cluster, single workstation, lab):
+Coherence as I measured it, with 2 Jellyfin servers on a 3-node Galera cluster, all on one workstation in the lab:
 
-| Test | Result | Source |
-|---|---|---|
-| Write on node A, read on node B | Visible at the first poll in 8 of 8 trials, about 40 ms; a stock node stayed stale after 65 s | `docs/RESULTS.md`, `jellyfin-perf/README.md` |
-| Token issued on node B, used on node C | Accepted 150 ms later; refused on both right after logout | `docs/RESULTS.md`, `jellyfin-perf/README.md` |
+| Test | Result |
+|---|---|
+| Write on node A, read on node B | Visible at the first poll in 8 of 8 trials, about 40 ms; a stock node stayed stale after 65 s |
+| Token issued on node B, used on node C | Accepted 150 ms later; refused on both right after logout |
 
-Two constraints affect plugin authors. The series adds members to `IMediaStreamRepository`, `IMediaAttachmentRepository`, `IMediaSegmentManager`, and `IMediaSourceManager` (patch 08, non-default) and one defaulted member to `IUserDataManager` (patch 07), so third-party plugins that implement these interfaces can break. The patches target Jellyfin tag `v12.1` only and need a rebase for each new release (`jellyfin-perf/README.md`). In shared mode the startup wipe of the transcode directory deletes only files older than 6 h.
+Two constraints affect plugin authors. The series adds members to `IMediaStreamRepository`, `IMediaAttachmentRepository`, `IMediaSegmentManager`, and `IMediaSourceManager` (patch 08, non-default) and one defaulted member to `IUserDataManager` (patch 07), so third-party plugins that implement these interfaces can break. The patches target Jellyfin tag `v12.1` only and need a rebase for each new release. In shared mode the startup wipe of the transcode directory deletes only files older than 6 h.
 
 These stay per node:
 
@@ -89,22 +85,22 @@ These stay per node:
 | Live sessions (now playing, remote control) | Not visible across replicas |
 | Client capabilities | Held per node |
 | Running transcodes | Owned by the node that started them, unless the shared transcode directory is enabled |
-| Playback progress pings | Sent to one node; a job owner's kill timer can fire while the client is served through the other replica. Patch 16 partly addresses this (cross-node ping affinity in `docs/ROADMAP.md`; from code reading and one lab incident) |
+| Playback progress pings | Sent to one node; a job owner's kill timer can fire while the client is served through the other replica. Patch 16 partly addresses this; the rest is cross-node ping affinity in `docs/ROADMAP.md`. I have the code and one lab incident to go on |
 | Forgot-password PIN file | Local file on one node |
 | `MaxActiveSessions` | Enforced per node, not per cluster |
 | Plugins with their own SQLite (for example Playback Reporting) | Not shared-DB safe |
 
-Sources: `README.md`, `docs/engineering/bughunt.md` (found-not-fixed items c1 and c2). Plugin compatibility work is planned in the [roadmap](ROADMAP.md). Until then Intro Skipper, Playback Reporting, and Kodi Sync Queue are blocked on the fallback server, which pauses their features during a failover (`docs/ROADMAP.md`).
+For the detail behind this table, read the found-not-fixed items c1 and c2 in the [bughunt report](engineering/bughunt.md). Plugin compatibility work is planned in the [roadmap](ROADMAP.md). Until then Intro Skipper, Playback Reporting, and Kodi Sync Queue are blocked on the fallback server, which pauses their features during a failover.
 
 ## Database layer
 
-The provider registers under the key `Jellyfin-Galera` (`GaleraDatabaseProvider.cs`). Jellyfin loads it through `database.xml` with `DatabaseType` set to `PLUGIN_PROVIDER` and `PluginName` set to `JellyMesh Galera`. The connection string is required; without it the provider throws `InvalidOperationException`.
+The provider registers under the key `Jellyfin-Galera`. Jellyfin loads it through `database.xml` with `DatabaseType` set to `PLUGIN_PROVIDER` and `PluginName` set to `JellyMesh Galera`. The connection string is required; without it the provider throws `InvalidOperationException`.
 
 `JELLYMESH_DB_PASSWORD`, when non-empty, overrides the password in the connection string so the secret stays out of `database.xml`. The provider logs the connection string with the password masked.
 
-The provider pins the server version to 8.4.0 so it does not open a connection at startup. Only PXC 8.4 was run in the lab. Galera does not replicate named locks, so `GET_LOCK` cannot elect a leader; this is why the leader plugin uses a Lease. PXC with `pxc_strict_mode=ENFORCING` rejects `GET_LOCK`, which EF Core uses for its migration lock, and the lab runs `PERMISSIVE` (`galera/README.md`).
+The provider pins the server version to 8.4.0 so it does not open a connection at startup. Only PXC 8.4 was run in the lab. Galera does not replicate named locks, so `GET_LOCK` cannot elect a leader; this is why the leader plugin uses a Lease. PXC with `pxc_strict_mode=ENFORCING` rejects `GET_LOCK`, which EF Core uses for its migration lock, and the lab runs `PERMISSIVE`.
 
-Model rules (`GaleraModel.cs`):
+Model rules:
 
 | Rule | Value |
 |---|---|
@@ -119,21 +115,21 @@ The provider's backup hook does not back up: `MigrationBackupFast` only sets the
 
 ### Single-writer and multi-writer
 
-The original recommendation in `galera/README.md` is single-writer operation: every Jellyfin lists the nodes in the same order with `LoadBalance=FailOver`, and the other members act as synchronous standbys. Multi-writer became viable after the perf patch added a user-data retry.
+The original recommendation was single-writer operation: every Jellyfin lists the nodes in the same order with `LoadBalance=FailOver`, and the other members act as synchronous standbys. Multi-writer became viable after the perf patch added a user-data retry.
 
-| Mode | Evidence | Source |
-|---|---|---|
-| Single-writer | Primary kill: 206 requests, 0 failed, 2.9 s gap. Remains the conservative choice for a stock Jellyfin build | `galera/README.md`; single workstation, lab |
-| Multi-writer, stock Jellyfin | 200 concurrent writes to one UserData row from different nodes gave 69 HTTP 500 responses (35%, `Deadlock found`); the same test on one node gave none | `galera/README.md`; lab drill |
-| Multi-writer, patched Jellyfin | 200 of 200 writes succeeded; 120.2 req/s at 32 clients with 0 errors | `jellyfin-perf/README.md`, `docs/RESULTS.md`; single workstation, lab |
+| Mode | Evidence |
+|---|---|
+| Single-writer | Primary kill on one workstation in the lab: 206 requests, 0 failed, 2.9 s gap. Still the conservative choice for a stock Jellyfin build |
+| Multi-writer, stock Jellyfin | In a lab drill, 200 concurrent writes to one UserData row from different nodes gave 69 HTTP 500 responses (35%, `Deadlock found`); the same test on one node gave none |
+| Multi-writer, patched Jellyfin | 200 of 200 writes succeeded; 120.2 req/s at 32 clients with 0 errors, again on the single lab workstation |
 
-`UserDataManager.SaveUserData` retries with a fresh context and jittered backoff, 6 attempts, so multi-writer depends on the patched build. Retrying every Jellyfin transaction is not possible in the provider, because the EF Core retrying execution strategy rejects Jellyfin's `BeginTransaction`. The mode the maintainer's cluster runs is deployment-specific and not recorded here.
+`UserDataManager.SaveUserData` retries with a fresh context and jittered backoff, 6 attempts, so multi-writer depends on the patched build. Retrying every Jellyfin transaction is not possible in the provider, because the EF Core retrying execution strategy rejects Jellyfin's `BeginTransaction`. I haven't recorded which mode my own cluster runs.
 
 ## Scheduled tasks
 
-Jellyfin runs scheduled tasks on every replica. The leader plugin (`leader/LeaseLeaderService.cs`) makes one replica the holder of a `coordination.k8s.io/v1` Lease so each task runs once.
+Jellyfin runs scheduled tasks on every replica. The leader plugin (`leader/LeaseLeaderService.cs`) makes one replica the holder of a `coordination.k8s.io/v1` Lease so each task runs once. Here is what the code does:
 
-| Item | Behavior (from code reading) |
+| Item | Behavior |
 |---|---|
 | Identity | `HOSTNAME`, falling back to the machine name; replicas must have different hostnames |
 | Lease name | `JELLYMESH_LEASE`, default `jellyfin-tasks` |
@@ -147,11 +143,11 @@ Jellyfin runs scheduled tasks on every replica. The leader plugin (`leader/Lease
 | Task started on a follower | Cancelled there and forwarded through the Lease annotation `jellymesh.io/run-task` as `<task key>|<unix ms>`; the holder runs it if the worker is idle, otherwise logs a skip |
 | RBAC | The pod's service account needs `get`, `create`, `update`, `patch` on `leases` in its namespace |
 
-Forwarding is best effort with a single annotation slot, so two forwarded tasks in quick succession can overwrite each other. Without a graceful stop, leader failover takes up to the lease duration; that time is Not measured.
+Forwarding is best effort with a single annotation slot, so two forwarded tasks in quick succession can overwrite each other. Without a graceful stop, leader failover takes up to the lease duration, and I haven't timed it.
 
 ## Transcode pool
 
-Stock Jellyfin runs ffmpeg as a child process on the node that serves the viewer. JellyMesh runs Jellyfin with hardware acceleration set to `none` (`transcode/README.md`) and lets the shim send the software command line to a pool of GPU workers. The base HLS path needs no Jellyfin changes; the shared transcode directory needs bughunt patches 03 and 16, and Dolby Vision needs patches 13 and 17-19.
+Stock Jellyfin runs ffmpeg as a child process on the node that serves the viewer. JellyMesh runs Jellyfin with hardware acceleration set to `none` and lets the shim send the software command line to a pool of GPU workers. The base HLS path needs no Jellyfin changes; the shared transcode directory needs bughunt patches 03 and 16, and Dolby Vision needs patches 13 and 17-19.
 
 | Part | Role |
 |---|---|
@@ -164,21 +160,21 @@ Discovery uses the headless Service `tcpool-agents` (port 9901 over gRPC with [m
 
 Capacity is counted in weighted capacity units, set with `TC_CAPACITY`; the agent refuses new jobs when full. Other `TC_*` variables are in the [configuration reference](configuration.md).
 
-| Worker class | Capacity | 4K job weight | Source |
-|---|---|---|---|
-| Arc | 14 | 2.3 | `transcode/deploy/k8s/20-agents.yaml` |
-| Tesla P4 | 6 | 2 | `transcode/deploy/k8s/20-agents.yaml` |
-| CPU | 3 | 3 | `transcode/deploy/k8s/20-agents.yaml` |
+| Worker class | Capacity | 4K job weight |
+|---|---|---|
+| Arc | 14 | 2.3 |
+| Tesla P4 | 6 | 2 |
+| CPU | 3 | 3 |
 
-The CPU worker runs at 0.18-0.59x realtime, so it serves spill work only, not playback (`docs/engineering/transcode-calibration.md`). Shared scratch must be NFS with `actimeo=1` and `lookupcache=positive`, as the manifests set; with default options new segments stayed invisible to other nodes for 12-23 s (`transcode/deploy/k8s/15-scratch.yaml`, `transcode/README.md`).
+The CPU worker runs at 0.18-0.59x realtime, so it serves spill work only, not playback. Shared scratch must be NFS with `actimeo=1` and `lookupcache=positive`, as the manifests set; with default options new segments stayed invisible to other nodes for 12-23 s.
 
 Other coordination mechanisms:
 
 - **Per-output lease.** The agent creates `<md5>.tcpool.lock` in scratch with `O_EXCL`, so one encoder owns each output.
 - **Seek affinity.** A session is pinned to its first worker through `<md5>.worker` (`TC_AFFINITY`, on by default; `TC_AFFINITY_TTL_SECS`, default 6 h).
-- **Shared transcode directory.** With `JELLYMESH_SHARED_TRANSCODE_DIR=1` (patches 03 and 16), replicas share one transcode directory. Jellyfin passes `JELLYMESH_KEEPALIVE` to the shim; the agent detaches a job when its shim dies (`TC_DETACH`), heartbeats the lease, and lets a replica take over after a seek, waiting up to 8 s. Status: Implemented, off by default, Lab-verified. Lab proof (three drills, 3 sessions each, through the Traefik failover route in the lab cluster): pod delete of the serving replica, 0 failed of 162 segments; `kill -9` of the serving Jellyfin, 0 of 162; restart of the other replica, 0 of 223. Source: `transcode/docs/SHARED-TRANSCODE.md`. Two Jellyfins must not share one `TranscodingTempPath` root, and replicas need distinct `HOSTNAME`.
+- **Shared transcode directory.** With `JELLYMESH_SHARED_TRANSCODE_DIR=1` (patches 03 and 16), replicas share one transcode directory. Jellyfin passes `JELLYMESH_KEEPALIVE` to the shim; the agent detaches a job when its shim dies (`TC_DETACH`), heartbeats the lease, and lets a replica take over after a seek, waiting up to 8 s. It is off by default and I have only run it in the lab: three drills through the Traefik failover route in the lab cluster, 3 sessions each, gave a pod delete of the serving replica with 0 failed of 162 segments, a `kill -9` of the serving Jellyfin with 0 of 162, and a restart of the other replica with 0 of 223. Two Jellyfins must not share one `TranscodingTempPath` root, and replicas need distinct `HOSTNAME`. The whole design is written up in `transcode/docs/SHARED-TRANSCODE.md`.
 
-Dolby Vision 7 -> 8.1 conversion also runs in the agent; see [Dolby Vision conversion](dolby-vision.md). It is Production (maintainer report, 2026-09-29): the TV plays Dolby Vision. Dolby Digital Plus passthrough to an AV receiver works (maintainer report, 2026-09-30).
+Dolby Vision 7 -> 8.1 conversion also runs in the agent; see [Dolby Vision conversion](dolby-vision.md). That is the part that is live on my cluster.
 
 ### Worker failure semantics
 
@@ -208,22 +204,22 @@ sequenceDiagram
 
 ## Failover behavior
 
-| Event | Outcome | Source | Test bed |
-|---|---|---|---|
-| Database node killed under load (SIGKILL, `FailOver` list) | 204 requests, 0 failed, longest gap 2.9 s; node Synced 7 s after restart | `galera/README.md`, `galera/lab/galera_drill.py` | Single workstation, lab, 3-node cluster |
-| Single-writer primary kill | 206 requests, 0 failed, 2.9 s gap | `galera/README.md` | Single workstation, lab |
-| [Direct-play](#glossary) replica hard kill (`kill -9`) | Connection reset; a client that retries with a `Range` header ([Range retry](#glossary)) recovers a byte-identical file | `docs/engineering/direct-play-failover.md` | Lab cluster, 2026-09-29, n=1 |
-| Direct-play gap before recovery | 5-6 s, order of magnitude only | Same report | Lab cluster, n=1 |
-| Direct-play plain `curl` after kill | About 6.2 MB of 26 MB, no resume | Same report | Lab cluster, n=1 |
-| Direct-play graceful pod delete | Kestrel drains for about 21 s; one usable trial, which does not show graceful restarts are safe | Same report | Lab cluster, n=1 |
-| HLS transcode, shared transcode directory | 0 failed segments in three drills (see [Transcode pool](#transcode-pool)) | `transcode/docs/SHARED-TRANSCODE.md` | Lab cluster, 3 sessions per drill |
-| HLS [remux](#glossary) through a replica failover | ffmpeg restarts on the fallback and again on the primary; a Safari remux on 2026-09-27 restarted twice and the viewer reported A/V drift | `docs/ROADMAP.md` (only source; no separate report) | Lab, n=1 |
-| Sticky server failover | Planned: a sticky cookie on the route, because a remux restart resumes video on a keyframe and audio at the exact second. See the [roadmap](ROADMAP.md) | `docs/ROADMAP.md` | n/a |
-| Transcode worker failure | See [Worker failure semantics](#worker-failure-semantics) | `transcode/README.md`, agent and shim code | From code reading |
+| Event | Outcome | Test bed |
+|---|---|---|
+| Database node killed under load (SIGKILL, `FailOver` list) | 204 requests, 0 failed, longest gap 2.9 s; node Synced 7 s after restart | Single workstation, lab, 3-node cluster |
+| Single-writer primary kill | 206 requests, 0 failed, 2.9 s gap | Single workstation, lab |
+| [Direct-play](#glossary) replica hard kill (`kill -9`) | Connection reset; a client that retries with a `Range` header ([Range retry](#glossary)) recovers a byte-identical file | Lab cluster, 2026-09-29, one run |
+| Direct-play gap before recovery | 5-6 s, order of magnitude only | Lab cluster, one run |
+| Direct-play plain `curl` after kill | About 6.2 MB of 26 MB, no resume | Lab cluster, one run |
+| Direct-play graceful pod delete | Kestrel drains for about 21 s; one usable trial, which does not show graceful restarts are safe | Lab cluster, one run |
+| HLS transcode, shared transcode directory | 0 failed segments in three drills (see [Transcode pool](#transcode-pool)) | Lab cluster, 3 sessions per drill |
+| HLS [remux](#glossary) through a replica failover | ffmpeg restarts on the fallback and again on the primary; a Safari remux on 2026-09-27 restarted twice and the viewer reported A/V drift | Lab, one run; written up only in `docs/ROADMAP.md`, there is no separate report |
+| Sticky server failover | Planned: a sticky cookie on the route, because a remux restart resumes video on a keyframe and audio at the exact second. See the [roadmap](ROADMAP.md) | n/a |
+| Transcode worker failure | See [Worker failure semantics](#worker-failure-semantics) | Read from the code, not measured |
 
 Direct play works with a client retry because the file is static on shared storage. The client behavior matrix in the [failover report](engineering/direct-play-failover.md) (Android TV, Moonfin, Swiftfin, Web, Infuse) was taken from public trackers, not measured.
 
-Not measured:
+What I haven't measured:
 
 - A repeated drill of HLS transcode failover behind Traefik with the default (non-shared) transcode directory; only the observations above exist.
 - Leader failover time.
@@ -232,10 +228,10 @@ Not measured:
 ## Security model
 
 - **Transport.** Shim-to-agent traffic uses gRPC over mTLS with a dedicated pool CA created by cert-manager (`transcode/deploy/k8s/10-tls.yaml`). Client certificates are required, and `TC_TLS_REQUIRED=1` turns missing certificates into a hard exit with code 2. The agent drains itself when its certificate files change.
-- **Command allowlist.** Agents accept only ffmpeg commands whose inputs sit under `TC_INPUT_ROOTS`, reads under `TC_READ_ROOTS`, and outputs under `TC_OUTPUT_ROOT`. In the protocol suite, 134 real commands pass and 11 attacks are rejected (case 13; sources `docs/RESULTS.md` and `docs/engineering/transcode-plan.md`). The suite has 21 cases per `.github/workflows/transcode.yml`; `transcode/README.md` says the earlier count was 14, and the workflow is the newer source.
+- **Command allowlist.** Agents accept only ffmpeg commands whose inputs sit under `TC_INPUT_ROOTS`, reads under `TC_READ_ROOTS`, and outputs under `TC_OUTPUT_ROOT`. In the protocol suite, 134 real commands pass and 11 attacks are rejected (case 13). The suite has 21 cases according to `.github/workflows/transcode.yml`; `transcode/README.md` still gives the earlier count of 14, and the workflow is the newer of the two.
 - **Database secret.** Set `JELLYMESH_DB_PASSWORD` from a Kubernetes Secret instead of writing the password into `database.xml`, which appears in config backups.
-- **Unauthenticated stream endpoints in stock Jellyfin.** `/Videos/{id}/stream` and `/Audio/{id}/stream` answered range requests without a token in the failover lab (Measured). From code reading, `VideosController` has no `[Authorize]` attribute and there is no global authorization filter. An authenticated Range retry is Not measured. The example Traefik route does not restrict these paths; restricting them is up to the operator. Source: `docs/engineering/direct-play-failover.md`.
-- **Logging.** Measured in the lab: Traefik access logs recorded the `api_key` query parameter in cleartext for two services (`docs/engineering/bughunt.md`). Mitigation: restrict access to those logs, or move the services to header authentication ([SECURITY.md](../SECURITY.md)).
+- **Unauthenticated stream endpoints in stock Jellyfin.** I watched `/Videos/{id}/stream` and `/Audio/{id}/stream` answer range requests without a token in the failover lab. Reading the code, `VideosController` has no `[Authorize]` attribute and there is no global authorization filter. I have not tried an authenticated Range retry. The example Traefik route does not restrict these paths; restricting them is up to you.
+- **Logging.** In the lab, Traefik access logs recorded the `api_key` query parameter in cleartext for two services. Either restrict access to those logs or move those services to header authentication.
 
 See [SECURITY.md](../SECURITY.md) for reporting and further notes.
 
@@ -276,20 +272,4 @@ See [SECURITY.md](../SECURITY.md) for reporting and further notes.
 | Power-of-two choices | Picking the better of two randomly chosen candidates instead of scanning all of them |
 | LiteFS | A replicated SQLite filesystem layer; named in the roadmap as an example only |
 
-Dolby Vision terms (fMP4, dvvC, RPU, MEL/FEL, EL/BL) are defined in [Dolby Vision conversion](dolby-vision.md). PTS, keyframe, kill timer, HA, OTel, EWMA, power-of-two choices, and LiteFS serve other pages in this set, including the [roadmap](ROADMAP.md).
-
-## Related docs
-
-- [Project README](../README.md)
-- [Documentation index](README.md)
-- [Configuration reference](configuration.md)
-- [Dolby Vision conversion](dolby-vision.md)
-- [Operations](operations.md)
-- [Results](RESULTS.md)
-- [Roadmap](ROADMAP.md)
-- [Direct-play failover report](engineering/direct-play-failover.md)
-- [Bughunt report](engineering/bughunt.md)
-- [transcode/README.md](../transcode/README.md)
-- [galera/README.md](../galera/README.md)
-- [jellyfin-perf/README.md](../jellyfin-perf/README.md)
-- [Security policy](../SECURITY.md)
+Dolby Vision terms (fMP4, dvvC, RPU, MEL/FEL, EL/BL) are defined in [Dolby Vision conversion](dolby-vision.md).

@@ -1,8 +1,6 @@
 # JellyMesh Leader plugin
 
-The leader plugin makes Jellyfin scheduled tasks and the library watcher run on one replica at a time. It elects that replica with a Kubernetes Lease (an object with a holder and an expiry; see the [glossary](../docs/architecture.md#glossary)).
-
-**Status:** Implemented. Election and task forwarding have no tests and no measured failover time; the behavior below is From code reading.
+The leader plugin makes Jellyfin scheduled tasks and the library watcher run on one replica at a time. It elects that replica with a Kubernetes Lease (an object with a holder and an expiry; see the [glossary](../docs/architecture.md#glossary)). There are no tests for the election or the task forwarding yet, and I haven't measured how long a failover takes, so what follows is what the code does, not what I've watched it do.
 
 ## What it does
 
@@ -39,16 +37,16 @@ Build with the .NET 10 SDK from the repository root:
 dotnet build -c Release leader/JellyMesh.Leader.csproj
 ```
 
-The plugin assembly is `leader/bin/Release/net10.0/JellyMesh.Leader.dll` (build run on 2026-09-30: 0 warnings, 0 errors). The JellyMesh image carries it under `/opt/jellymesh/plugins`, and `image/install-plugins.sh` copies it into Jellyfin's plugin directory (see [image](../image/README.md)).
+That builds clean and puts the plugin assembly in `leader/bin/Release/net10.0/JellyMesh.Leader.dll`. The JellyMesh image carries it under `/opt/jellymesh/plugins`, and `image/install-plugins.sh` copies it into Jellyfin's plugin directory (see [image](../image/README.md)).
 
 ## Configure
 
 The plugin has no configuration page. Two environment variables set its behavior; the full table is in [configuration](../docs/configuration.md).
 
-| Variable | Default | Source |
-| --- | --- | --- |
-| `JELLYMESH_LEASE` | `jellyfin-tasks` | `LeaseLeaderService.cs` |
-| `JELLYMESH_LEASE_SECONDS` | `15` | `LeaseLeaderService.cs` |
+| Variable | Default |
+| --- | --- |
+| `JELLYMESH_LEASE` | `jellyfin-tasks` |
+| `JELLYMESH_LEASE_SECONDS` | `15` |
 
 The plugin creates the Lease if it does not exist. A concurrent takeover fails with HTTP 409 because the update carries `resourceVersion`. The plugin talks to the Kubernetes API over HTTPS with the service account token and cluster CA, with a 5 s timeout.
 
@@ -56,7 +54,7 @@ The plugin creates the Lease if it does not exist. A concurrent takeover fails w
 
 Install the plugin folder on every replica. In the JellyMesh image, `image/install-plugins.sh` does this from an initContainer (see [image](../image/README.md)). The log line `JellyMesh Leader: <identity> is now LEADER` or `follower` shows the role.
 
-The election loop ticks every max(1, `JELLYMESH_LEASE_SECONDS` / 5) seconds, which is 3 s at the default. If the leader stops without a graceful shutdown, a follower takes over after the lease expires plus up to one tick: about 18 s at the default (From code reading, not measured). On graceful stop the leader clears `holderIdentity` and handover is immediate.
+The election loop ticks every max(1, `JELLYMESH_LEASE_SECONDS` / 5) seconds, which is 3 s at the default. If the leader stops without a graceful shutdown, a follower takes over after the lease expires plus up to one tick, so about 18 s at the default by my reading of the code; I haven't timed it. On graceful stop the leader clears `holderIdentity` and handover is immediate.
 
 ## Test
 
@@ -69,12 +67,6 @@ The directory has no tests. Check the role through the log line described in [Ru
 - The follower cancels its own run of the task. What a client progress display shows for that run is not documented.
 - The leader steps down on any API error or failed renew.
 - A named database lock (`GET_LOCK`) cannot elect a leader, because Galera does not replicate named locks.
-
-## Related docs
-
-- [Operations](../docs/operations.md): where the leader plugin fits in a deployment.
-- [Configuration reference](../docs/configuration.md): environment variables.
-- [Architecture](../docs/architecture.md): scheduled tasks and the glossary.
 
 ## License
 

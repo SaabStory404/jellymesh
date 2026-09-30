@@ -1,14 +1,10 @@
 # Results
 
-This page collects the measurements the repository holds: concurrent-load benchmarks, per-call latency, SQL statement counts, response parity, migration timing, failure drills, and transcode-pool numbers. Each table names its source file, its test bed, and its caveats.
+Everything this repository has actually measured: concurrent-load benchmarks, per-call latency, SQL statement counts, response parity, migration timing, failure drills, and transcode-pool numbers.
 
-**Status:** Lab-verified, with one production-library census and one maintainer production report. Most numbers come from a single-workstation lab or the `tc-lab` cluster. The exceptions are the Dolby Vision library census and the real-title conversion proof, which ran against the production library and the production `jellyfin-qsv` ffmpeg on 2026-09-27, and the on-device Dolby Vision report, which is the maintainer's statement (2026-09-29) and not a measurement.
-
-Sections that hold numbers carry their own **Status** line. Tables whose rows all share one status rely on that line; tables that mix statuses have a Status column.
+Almost all of it is lab work. Unless a section says otherwise, the numbers come from one workstation — 12 cores, 62 GB of memory, every node a podman container on one bridge network — or from the `tc-lab` k3s namespace on cluster GPU nodes. Two of them are not: the Dolby Vision library census and the real-title conversion proof ran against my production library and the production `jellyfin-qsv` ffmpeg on 2026-09-27. And one of them is not a measurement at all — that DV 7 -> 8.1 plays on my SHIELD is something I watched happen on 2026-09-29, not something I instrumented.
 
 ## Terms used on this page
-
-Terms marked with a link are also in the [glossary](architecture.md#glossary). Dolby Vision terms are defined in [dolby-vision.md](dolby-vision.md).
 
 | Term | Meaning |
 |---|---|
@@ -38,34 +34,32 @@ Terms marked with a link are also in the [glossary](architecture.md#glossary). D
 
 ### Test bed
 
-| Item | Value | Source |
-|---|---|---|
-| Host | One workstation, 12 cores, 62 GB memory; CPU model and storage were not recorded | `../jellyfin-perf/README.md` |
-| Topology | Every node is a podman container on one bridge network on that host | `../jellyfin-perf/README.md` |
-| Jellyfin | 12.1, base image `ghcr.io/hotio/jellyfin:release-12.1` | `engineering/galera-provider.md` (`JG_IMG` default) |
-| Library | Real library: 19,259 items; 308,330 rows in 31 tables | `../jellyfin-perf/README.md` (items); `operations.md` (rows, tables) |
-| Database | 3-node PXC 8.4 running the Galera provider | `engineering/galera-provider.md` |
-| Load shape | 9 users, 20% playback-progress writes in the shared-mode runs; 30 runs per call in the per-call runs; 30 s per cell in the load runs: Not documented outside the load driver, which is not in this repository | `../jellyfin-perf/README.md` |
-| Dates | Per-call and migration runs: 2026-09-26. The concurrent-load run date is not recorded | `../jellyfin-perf/README.md`, `engineering/galera-provider.md` |
+| Item | Value |
+|---|---|
+| Host | One workstation, 12 cores, 62 GB memory; CPU model and storage were not recorded |
+| Topology | Every node is a podman container on one bridge network on that host |
+| Jellyfin | 12.1, base image `ghcr.io/hotio/jellyfin:release-12.1` |
+| Library | Real library: 19,259 items; 308,330 rows in 31 tables |
+| Database | 3-node PXC 8.4 running the Galera provider |
+| Load shape | 9 users, 20% playback-progress writes in the shared-mode runs; 30 runs per call in the per-call runs; 30 s per cell in the load runs: Not documented outside the load driver, which is not in this repository |
+| Dates | Per-call and migration runs: 2026-09-26. The concurrent-load run date is not recorded |
 
-"Stock" is unmodified Jellyfin 12.1. "Patched" is Jellyfin 12.1 with the [`jellyfin-perf`](../jellyfin-perf/README.md) query and write-retry patch. "Galera" is the JellyMesh Galera provider (Pomelo plus a patch, DateTime stored as BIGINT ticks) on the 3-node PXC cluster.
+"Stock" is unmodified Jellyfin 12.1. "Patched" is Jellyfin 12.1 with the [`jellyfin-perf`](../jellyfin-perf/README.md) query and write-retry patch. "Galera" is the [JellyMesh Galera provider](../galera/README.md) (Pomelo plus a patch, DateTime stored as BIGINT ticks) on the 3-node PXC cluster.
 
 ### What the numbers do not show
 
-- **Two-host deployments.** All nodes share the same 12 cores, so a two-Jellyfin cell competes with itself and with the database for CPU. The two-Jellyfin cells understate a real two-host deployment (`../jellyfin-perf/README.md`).
+- **Two-host deployments.** All nodes share the same 12 cores, so a two-Jellyfin cell competes with itself and with the database for CPU. Those cells understate what a real two-host deployment would do.
 - **Cache state.** Cache state was not controlled. Each per-call figure is the p50 of 30 runs.
-- **Other clients and libraries.** One library and one synthetic client mix were used.
-- **Load driver.** The concurrent-load and per-call drivers are not in this repository, so those tables cannot be regenerated from it (see [Reproducing these results](#reproducing-these-results)).
+- **Other clients and libraries.** One library, one synthetic client mix.
+- **Load driver.** The concurrent-load and per-call drivers are not in this repository, so those tables can't be regenerated from it (see [Reproducing these results](#reproducing-these-results)).
 
-Where two sources disagree, both figures are given with their method.
+Where two sources disagree, I give both figures with their methods.
 
 ## Concurrent load
 
-**Status:** Lab-verified. Single workstation, n=1 per cell.
+Clients loop over the home screen, grids, search, detail, and people calls, weighted like a session. The 20% writes are playback-progress reports, each client on its own 5 items. Data was reset to the pristine library before each run with `../galera/lab/reset_data.py`. Latencies are in milliseconds, and every cell is a single run.
 
-**Method.** Clients loop over the home screen, grids, search, detail, and people calls, weighted like a session. The 20% writes are playback-progress reports, each client on its own 5 items. Data was reset to the pristine library before each run with `../galera/lab/reset_data.py`. Latencies are in milliseconds. The load driver, `spikes/jellymesh/load.py`, is not in this repository.
-
-**Source.** The prior revision of this page (`git show HEAD:docs/RESULTS.md`) is the only file that holds these cells. `../jellyfin-perf/README.md` repeats a few of them. Rows for stock Galera and stock SQLite exist only for the client counts shown.
+The load driver is `spikes/jellymesh/load.py`, and the only place these cells survive is the previous revision of this page: `git show HEAD:docs/RESULTS.md`. `../jellyfin-perf/README.md` repeats a few of them. Rows for stock Galera and stock SQLite exist only for the client counts shown.
 
 | Configuration | Clients | req/s | Home p50/p95 | Grid p50/p95 | Detail p50/p95 | People p50/p95 | Write p50/p95 | Errors |
 |---|---|---|---|---|---|---|---|---|
@@ -89,20 +83,18 @@ The multi-writer configuration is [defined in architecture.md](architecture.md#s
 
 - **At one client, SQLite is faster.** It runs in-process with no network hop: 44.8 req/s for patched SQLite against 27.6 req/s for patched Galera.
 - **At 8 clients, patched SQLite leads.** Patched SQLite reaches 112.2 req/s, against 104.2 for patched Galera with one Jellyfin and 96.5 with two.
-- **At 32 clients, patched Galera leads.** It reaches 115.4 (one Jellyfin) and 120.2 (two), against 93.6 for patched SQLite. Stock and patched SQLite are both lower at 32 clients than at 8 in these runs (75.3 to 55.4 stock, 112.2 to 93.6 patched); only three client counts (1, 8, 32) were run, so where the peak sits is not resolved.
+- **At 32 clients, patched Galera leads.** It reaches 115.4 (one Jellyfin) and 120.2 (two), against 93.6 for patched SQLite. Stock and patched SQLite are both lower at 32 clients than at 8 in these runs (75.3 to 55.4 stock, 112.2 to 93.6 patched); I only ran three client counts (1, 8, 32), so where the peak sits is still open.
 - **Patched Galera at 8 and 32 clients.** With one Jellyfin it moves from 104.2 to 115.4 req/s. With two Jellyfins it moves from 96.5 to 120.2 req/s.
-- **Stock Galera is the slowest cell under load.** It reaches 54.0 and 49.0 req/s at 8 and 32 clients. Its people p50 was 1243 and 2532 ms, against 105 and 282 ms patched. The patch removes the N+1 (103 statements to 4, see [Per-call latency and statement counts](#per-call-latency-and-statement-counts)) and a slow query plan (see [Provider-only latencies](#provider-only-latencies-history)); this table does not split the two effects.
-- **Resume was the cliff.** A DatePlayed sort-key fix changed how MySQL plans the Resume query. Before it, MySQL made 166,800 lookups for 400 candidates, and Resume took 0.4 to 2.6 s with a few hundred in-progress items; after it, 0.14 s (`../jellyfin-perf/README.md`). The previous revision of this page also recorded 9.8 req/s for patched Galera at one client before the fix, against 27.6 after. The per-call table below shows Resume at 33.4 ms p50 on patched Galera. No source states the in-progress item count for the 0.14 s figure or for the per-call row, so the two are not reconciled.
+- **Stock Galera is the slowest cell under load.** It reaches 54.0 and 49.0 req/s at 8 and 32 clients. Its people p50 was 1243 and 2532 ms, against 105 and 282 ms patched. The patch removes both the N+1 (103 statements to 4, see [Per-call latency and statement counts](#per-call-latency-and-statement-counts)) and a slow query plan (see [Provider-only latencies](#provider-only-latencies-history)); this table can't split the two effects.
+- **Resume was the cliff.** A DatePlayed sort-key fix changed how MySQL plans the Resume query. Before it, MySQL made 166,800 lookups for 400 candidates, and Resume took 0.4 to 2.6 s with a few hundred in-progress items; after it, 0.14 s. The previous revision of this page also recorded 9.8 req/s for patched Galera at one client before the fix, against 27.6 after. The per-call table below shows Resume at 33.4 ms p50 on patched Galera. Nothing records the in-progress item count behind the 0.14 s figure or behind the per-call row, so the two don't reconcile.
 
 ## One store versus a Redis response-cache tier
 
-**Status:** Lab-verified for the shared-database rows; the Redis row is a legacy lab result that cannot be reproduced from this repository.
+Two patched Jellyfins need to agree on user data. Which design gives the best throughput without a second store?
 
-**Question.** Two patched Jellyfins need to agree on user data. Which design gives the best throughput without a second store?
+I set the constraint on 2026-09-26: exactly one data store, with no application-level copying, syncing, or routing of state. The Redis tier violates it, so the design rules it out. Its plugin is a legacy lab plugin that is not in this repository, which also means the Redis row here is a legacy result I can't reproduce.
 
-**Design constraint.** The comparison was run against a constraint set by the maintainer on 2026-09-26: exactly one data store, with no application-level copying, syncing, or routing of state. The Redis tier violates it, so it is excluded by the design. Its plugin is a legacy lab plugin that is not in this repository.
-
-**Method.** 2 patched Jellyfins, 9 users, 20% writes, multi-user mode of the load driver (`load.py --multiuser`, not in this repository). Cross-node staleness is "write on A, first poll on B" (`mesh/mesh_drill.py coherence`, not in this repository). Latencies in ms. Sources: the prior revision of this page and `../jellyfin-perf/README.md`. Each row is a single run.
+2 patched Jellyfins, 9 users, 20% writes, multi-user mode of the load driver (`load.py --multiuser`). Cross-node staleness is "write on A, first poll on B" (`mesh/mesh_drill.py coherence`). Latencies in ms, and each row is a single run.
 
 | Configuration | Stores | Cross-node user data | 8 clients req/s | 32 clients req/s | Home p95 @32 | Write p95 @32 |
 |---|---|---|---|---|---|---|
@@ -112,26 +104,24 @@ The multi-writer configuration is [defined in architecture.md](architecture.md#s
 | Galera, `JELLYFIN_SHARED_DB` | 1 | first poll (about 40 ms) | 90.7 | 112.0 | 655 | 242 |
 | Plain MySQL 8.4, `JELLYFIN_SHARED_DB` | 1 | first poll (about 36 ms) | 89.1 | 109.3 | 670 | 248 |
 
-The 32-client result for the two-Jellyfin Galera cell in [Concurrent load](#concurrent-load) is 120.2 req/s; the `JELLYFIN_SHARED_DB` Galera row here is 112.0. The sources do not record why. The runs are separate, and this table used the load driver's multi-user mode.
+The 32-client result for the two-Jellyfin Galera cell in [Concurrent load](#concurrent-load) is 120.2 req/s; the `JELLYFIN_SHARED_DB` Galera row here is 112.0. Nothing records why. The runs are separate, and this table used the load driver's multi-user mode.
 
-The shared-database mode (`JELLYFIN_SHARED_DB=1`) is Implemented and described in [../jellyfin-perf/README.md](../jellyfin-perf/README.md).
+Shared-database mode (`JELLYFIN_SHARED_DB=1`) is described in [../jellyfin-perf/README.md](../jellyfin-perf/README.md).
 
 ### Coherence
 
-- With `JELLYFIN_SHARED_DB=1` on two Jellyfins over the 3-node cluster, a write on node A was visible on node B at the first poll in 8 of 8 trials, about 40 ms including the poll itself (`../jellyfin-perf/README.md`).
+- With `JELLYFIN_SHARED_DB=1` on two Jellyfins over the 3-node cluster, a write on node A was visible on node B at the first poll in 8 of 8 trials, about 40 ms including the poll itself.
 - With default per-node caches, node B was still stale after 65 s.
-- Removing the 5 s item cache in shared mode cut throughput at 32 clients from 112.0 to 35.6 req/s in the table above. `../jellyfin-perf/README.md` states the same effect as 105 to 36 req/s; the 104.7 req/s incoherent row is the nearest to 105, and the source does not say which row it means.
+- Removing the 5 s item cache in shared mode cut throughput at 32 clients from 112.0 to 35.6 req/s in the table above. `../jellyfin-perf/README.md` states the same effect as 105 to 36 req/s; the 104.7 req/s incoherent row is the nearest to 105, and the source doesn't say which row it means.
 
 ### Caveats
 
-- The prior revision of this page recorded that all one-store rows returned API responses matching stock SQLite under `../galera/tools/parity_ab.py`, with 0 errors. The current sources list the three pairs in [Parity](#parity).
-- Galera versus plain MySQL: the two are within 3% in this single run (90.7 against 89.1 req/s at 8 clients, 112.0 against 109.3 at 32; n=1). Galera survived a node kill with 0 failed requests (see [Database node loss](#database-node-loss)). A single MySQL server has no failover.
+- An earlier revision of this page recorded that every one-store row returned API responses matching stock SQLite under `../galera/tools/parity_ab.py`, with 0 errors. The pairs I can still point at are the three in [Parity](#parity).
+- Galera against plain MySQL: the two are within 3% in this single run (90.7 against 89.1 req/s at 8 clients, 112.0 against 109.3 at 32). Galera survived a node kill with 0 failed requests (see [Database node loss](#database-node-loss)); a single MySQL server has no failover.
 
 ## Per-call latency and statement counts
 
-**Status:** Lab-verified. Single workstation.
-
-**Method.** p50 in milliseconds over 30 runs, real library, one host, measured 2026-09-26. Jellyfin talked to one node of the 3-node PXC cluster over the podman network. Source: `../jellyfin-perf/README.md`.
+p50 in milliseconds over 30 runs against the real library, measured 2026-09-26. Jellyfin talked to one node of the 3-node PXC cluster over the podman network.
 
 | Call | SQLite stock | SQLite patched | Galera stock | Galera patched |
 |---|---|---|---|---|
@@ -151,7 +141,7 @@ On Galera the largest changes are people (544.4 to 50.7 ms), the Audio grid (345
 
 ### SQL statements per call
 
-**Method.** `../galera/tools/stmt_counts.py` reads `performance_schema` digests on one Galera node, stock versus patched Jellyfin. The script adds a `spikes/jellymesh` path that is not in this repository to `sys.path` but imports nothing from it, so it runs as shipped. Source: `../jellyfin-perf/README.md`, measured 2026-09-26.
+`../galera/tools/stmt_counts.py` reads `performance_schema` digests on one Galera node, stock against patched Jellyfin; measured 2026-09-26. The script adds a `spikes/jellymesh` path that is not in this repository to `sys.path`, but it imports nothing from it, so it runs as shipped.
 
 | Call | Stock | Patched |
 |---|---|---|
@@ -162,24 +152,24 @@ On Galera the largest changes are people (544.4 to 50.7 ms), the Audio grid (345
 
 ### A second set of counts
 
-The N+1 design note, [engineering/jellyfin-n1-hotspots.md](engineering/jellyfin-n1-hotspots.md), lists counts from a different method. The two sets differ, and the repository does not record why.
+The N+1 design note, [engineering/jellyfin-n1-hotspots.md](engineering/jellyfin-n1-hotspots.md), lists counts from a different method. The two sets differ, and nothing in the repository records why.
 
 | Source | Method as named by the source | Date given by the source | `/Persons` | Movie detail |
 |---|---|---|---|---|
 | `../jellyfin-perf/README.md` | `performance_schema` digests on Galera (`stmt_counts.py`) | 2026-09-26 (results section) | 103 to 4 | 48 to 29 |
 | `engineering/jellyfin-n1-hotspots.md` | `pg_stat_statements`, "on the real-library lab" | Only the code-reading research is dated (2026-09-26) | 101 to 3 | about 90 to about 17 |
 
-`../jellyfin-perf/README.md` calls its `performance_schema` counts the newer ones. In the note, the "before" counts are marked measured; the "after" counts appear as "now to after" in a design table, and this page reads them as design targets. The note also lists `/UserViews` at about 14 statements, with a design target of 4 to 6.
+`../jellyfin-perf/README.md` calls its `performance_schema` counts the newer ones. In the note, the "before" counts are marked measured, while the "after" counts appear as "now to after" in a design table, so I read those as design targets. The note also lists `/UserViews` at about 14 statements, with a design target of 4 to 6.
 
 ### Limits of the patch
 
-- NextUp (3 statements, 8 ms) and UserViews extras and chapters (24 ms) were left unchanged because they were not worth the added patch surface on this library (`../jellyfin-perf/README.md`).
+NextUp (3 statements, 8 ms) and the UserViews extras and chapters (24 ms) were left alone. The gain on this library was not worth the extra patch surface.
 
 ## Provider-only latencies (history)
 
-**Status:** Lab-verified, superseded. These numbers predate the `jellyfin-perf` patch. They compare SQLite against the Galera provider (Pomelo plus patch) alone, with stock Jellyfin query shapes, and show where the provider stopped being the bottleneck. For current numbers use the previous section.
+These predate the `jellyfin-perf` patch and are superseded by the section above; use that one for current numbers. They compare SQLite against the Galera provider (Pomelo plus patch) on its own, with stock Jellyfin query shapes, and they show where the provider stopped being the bottleneck.
 
-**Method.** p50 ms over 30 runs, 3-node cluster, real library. Source: `engineering/galera-provider.md`. The SQLite column came from `spikes/jellymesh/README.md`, which is not in this repository, so it cannot be verified here.
+p50 ms over 30 runs, 3-node cluster, real library. The SQLite column came from `spikes/jellymesh/README.md`, so I can't verify it here.
 
 | Call | SQLite | Galera (Pomelo + patch) | Remaining bottleneck at that time |
 |---|---|---|---|
@@ -190,15 +180,13 @@ The N+1 design note, [engineering/jellyfin-n1-hotspots.md](engineering/jellyfin-
 | detail: series episodes | n/a | 12 | n/a |
 | people: 100 | 58 | 590 | lower-name dedupe `NOT EXISTS` ran as a per-row range scan, plus 100 N+1 person reads |
 
-Server time dominated the slow calls. With `../galera/tools/digest_profile.sh`, the Movies grid spent 603 of 630 ms inside MySQL, so network round trips were not the cause. That 630 ms figure predates the IN-subquery rewrite and differs from the 568 ms in the table; the source does not explain the difference. The remaining outliers were Jellyfin query shapes that MySQL plans badly, addressed in the patch rather than in the provider.
+Server time dominated the slow calls. Under `../galera/tools/digest_profile.sh` the Movies grid spent 603 of 630 ms inside MySQL, so network round trips were not the cause. That 630 ms figure predates the IN-subquery rewrite and differs from the 568 ms in the table; nothing explains the difference. The remaining outliers were Jellyfin query shapes that MySQL plans badly, which is why they were addressed in the patch rather than in the provider.
 
-The `NOT EXISTS` range scan is 339 ms in `engineering/galera-provider.md` and 438 ms in `../jellyfin-perf/README.md`. Neither source says why they differ. The hash antijoin plan is 33 ms (`engineering/galera-provider.md`). Two smaller notes from the same sources: `tmp_table_size=256M` removed two on-disk temporary tables on the Audio grid (about 60 ms), and each `/health` probe opened 1.00 new unpooled connection before the provider's health-probe change.
+The `NOT EXISTS` range scan is 339 ms in `engineering/galera-provider.md` and 438 ms in `../jellyfin-perf/README.md`, and neither says why they differ. The hash antijoin plan is 33 ms. Two smaller notes from the same runs: `tmp_table_size=256M` removed two on-disk temporary tables on the Audio grid (about 60 ms), and each `/health` probe opened 1.00 new unpooled connection before the provider's health-probe change.
 
 ## Parity
 
-**Status:** Lab-verified. Sample of calls, not exhaustive.
-
-**Method.** `../galera/tools/parity_ab.py <url-a> <url-b>` compares whole JSON responses from two Jellyfin nodes on the same data: same item ids in the same order, same totals, same DTO fields, for the benchmark call set plus larger pages. Fourteen calls were compared, including every person (8,677), 2,000 tracks, and 330 movies with People.
+`../galera/tools/parity_ab.py <url-a> <url-b>` compares whole JSON responses from two Jellyfin nodes on the same data: same item ids in the same order, same totals, same DTO fields, for the benchmark call set plus larger pages. Fourteen calls were compared, including every person (8,677), 2,000 tracks, and 330 movies with People. That's a sample, not an exhaustive proof for every endpoint.
 
 | Pair compared | Calls | Result |
 |---|---|---|
@@ -206,18 +194,16 @@ The `NOT EXISTS` range scan is 339 ms in `engineering/galera-provider.md` and 43
 | Galera stock against Galera patched | 14 | Matched |
 | SQLite stock against Galera stock | 14 | Matched |
 
-**Scope.**
+Two things the comparison doesn't cover:
 
-- The script skips three fields that vary per node or per request: `PlayAccess`, `ServerId`, and `Etag` (`VOLATILE` in `../galera/tools/parity_ab.py`).
-- Resume and NextUp were empty on the parity library, so they are not covered.
-- The comparison is a 14-call sample, not an exhaustive proof for every endpoint.
-- Earlier, DateTime values stored as MySQL `datetime(6)` changed image tags after a migration, because Jellyfin hashes `DateModified.Ticks` into image tags. Storing DateTime as BIGINT ticks fixed that; the same script found it (`engineering/galera-provider.md`).
+- It skips three fields that vary per node or per request: `PlayAccess`, `ServerId`, and `Etag` (they are listed as `VOLATILE` in `../galera/tools/parity_ab.py`).
+- Resume and NextUp were empty on the parity library.
+
+It does catch real problems. Earlier, DateTime values stored as MySQL `datetime(6)` changed image tags after a migration, because Jellyfin hashes `DateModified.Ticks` into image tags. Storing DateTime as BIGINT ticks fixed that, and this same script is what found it.
 
 ## Migration timing
 
-**Status:** Lab-verified. Single workstation, 2026-09-26.
-
-**Method.** `jellyfin-dbmigrate copy` then `verify` on the real library (19,259 items, 308,330 rows, 31 tables). Source: `engineering/galera-provider.md`; the row and table counts are repeated in [operations.md](operations.md#migration-timing).
+`jellyfin-dbmigrate copy` then `verify` on the real library (19,259 items, 308,330 rows, 31 tables), measured 2026-09-26. The row and table counts are repeated in [operations.md](operations.md#migration-timing).
 
 | Step | Time | Verify |
 |---|---|---|
@@ -225,15 +211,13 @@ The `NOT EXISTS` range scan is 339 ms in `engineering/galera-provider.md` and 43
 | SQLite to Galera, 3-node cluster | 46.2 s | identical; node 3 has every row |
 | Galera to new SQLite | 28.2 s | round trip identical to the original |
 
-The 38.8 s figure was taken with the Oracle provider, which the repository no longer uses. It is kept as history. Commands are in [operations.md](operations.md#migrate-sqlite-to-galera-and-back).
+The 38.8 s figure was taken with the Oracle provider, which the repository no longer uses; it's kept as history. Commands are in [operations.md](operations.md#migrate-sqlite-to-galera-and-back).
 
 ## Failure drills
 
 ### Database node loss
 
-**Status:** Lab-verified. September 2026; the source gives no day. Single workstation.
-
-**Method.** `../galera/lab/galera_drill.py`, 3-node cluster. Source: `engineering/galera-provider.md`.
+`../galera/lab/galera_drill.py` against the 3-node cluster, some time in September 2026 — the log doesn't give a day.
 
 | Drill | Result |
 |---|---|
@@ -245,15 +229,13 @@ The 38.8 s figure was taken with the Oracle provider, which the repository no lo
 | Same, both Jellyfins on the same Galera node | 200 of 200 succeeded, 0 conflicts |
 | Same 200 writes with the user-data save retry (fresh context, jittered backoff, 6 attempts) | 200 of 200 succeeded on multi-writer Galera and on SQLite |
 
-Before the retry patch, stock Jellyfin on plain MySQL also failed 2 to 7 of 200 concurrent first progress reports for one item with HTTP 500, from a check-then-insert race (`../jellyfin-perf/README.md`).
+Before the retry patch, stock Jellyfin on plain MySQL also failed 2 to 7 of 200 concurrent first progress reports for one item with HTTP 500, from a check-then-insert race.
 
-`engineering/galera-provider.md` recommends single-writer as the conservative choice for a stock Jellyfin build. The retry patch changes that for user-data writes: the two-Jellyfin multi-writer rows in [Concurrent load](#concurrent-load) and the 200-of-200 result above were measured with the patch.
+`engineering/galera-provider.md` recommends single-writer as the conservative choice for a stock Jellyfin build. The retry patch changes that for user-data writes: the two-Jellyfin multi-writer rows in [Concurrent load](#concurrent-load) and the 200-of-200 result above were measured with the patch in place.
 
 ### Authentication across nodes
 
-**Status:** Lab-verified. The run count and date were not recorded; `../jellyfin-perf/README.md` groups it with the shared-mode runs (2 Jellyfins on a 3-node Galera cluster, measured 2026-09-26 for that section).
-
-**Method.** `../galera/lab/auth_drill.py <login-node-url> <other-url> ...` creates a throwaway user, logs in on the first node, uses the token on the others, logs out, and checks the token is refused everywhere. Whether the drill ran with `JELLYFIN_SHARED_DB=1` is inferred from the shared-mode grouping; the script does not set it.
+`../galera/lab/auth_drill.py <login-node-url> <other-url> ...` creates a throwaway user, logs in on the first node, uses the token on the others, logs out, and checks the token is refused everywhere. Neither the run count nor the date was recorded; `../jellyfin-perf/README.md` groups it with the shared-mode runs (2 Jellyfins on a 3-node Galera cluster, measured 2026-09-26 for that section). Whether it ran with `JELLYFIN_SHARED_DB=1` is an inference from that grouping — the script doesn't set it.
 
 | Check | Result |
 |---|---|
@@ -263,11 +245,9 @@ Before the retry patch, stock Jellyfin on plain MySQL also failed 2 to 7 of 200 
 
 ### Direct play across a replica kill
 
-**Status:** Lab-verified. Measured 2026-09-29, GitHub issue #13. Single run per case.
+Measured 2026-09-29 for GitHub issue #13, one run per case: a 2-replica StatefulSet behind a Traefik failover service in the lab, with a 26,976,301-byte static FLAC fetched by `curl` through the real ingress path. The write-up is [engineering/direct-play-failover.md](engineering/direct-play-failover.md).
 
-**Method.** A 2-replica StatefulSet behind a Traefik failover service in the lab. A 26,976,301-byte static FLAC was fetched with `curl` through the real ingress path. Source: [engineering/direct-play-failover.md](engineering/direct-play-failover.md).
-
-Direct play works across a failover only through a client retry, because a direct-play response is a static file on shared storage: any replica can serve any byte range, so a resume needs no session affinity. Traefik cannot re-home a response that has already started.
+Direct play works across a failover only through a client retry, because a direct-play response is a static file on shared storage: any replica can serve any byte range, so a resume needs no session affinity. Traefik can't re-home a response that has already started.
 
 | Case | Result |
 |---|---|
@@ -276,27 +256,25 @@ Direct play works across a failover only through a client retry, because a direc
 | Viewer-visible gap on the retry path | About 5 to 6 s in a single run: about 5.1 s until the client detected the reset, about 0.35 s until the retry was issued |
 | Graceful pod delete | Kestrel drained for about 21 s after the pod was told to stop. One usable trial: a 20 to 25 s download finished inside the drain window |
 
-Caveats from the same source:
+Four caveats go with that table:
 
-- The detection time is a `curl` over HTTP/2 figure. Other clients may detect a dead connection faster or slower; that was not measured.
-- One usable graceful-delete trial does not show that graceful restarts are safe for a full-length stream. The source expects a long stream to be cut when the grace period ends; that expectation was not measured.
-- An authenticated Range retry was not measured. `/Videos/{id}/stream` and `/Audio/{id}/stream` answered range requests without a token; the source attributes this to stock Jellyfin behavior, from code reading.
-- `kubectl get pods` RESTARTS did not increase for the in-container kill, because s6 respawns the process without restarting the container.
+- The detection time is a `curl` over HTTP/2 figure. Other clients may detect a dead connection faster or slower; I haven't measured them.
+- One usable graceful-delete trial doesn't show that graceful restarts are safe for a full-length stream. I expect a long stream to be cut when the grace period ends, but I haven't measured it.
+- An authenticated Range retry was not measured. `/Videos/{id}/stream` and `/Audio/{id}/stream` answered range requests without a token; reading the code, that looks like stock Jellyfin behavior.
+- `kubectl get pods` RESTARTS didn't increase for the in-container kill, because s6 respawns the process without restarting the container.
 
-**Client behavior (not measured).** The client matrix in the source is inherited from public issue trackers and is inconclusive. Only Moonfin documents a reconnect path, and that documentation covers Live TV. For the Android TV app the source could not confirm behavior on a real backend death. For Swiftfin and Infuse it found no explicit reconnect-with-range documentation, and the web client was not researched.
+I haven't measured how clients behave. The client matrix in the write-up is inherited from public issue trackers and is inconclusive: only Moonfin documents a reconnect path, and that documentation covers Live TV. For the Android TV app I couldn't confirm behavior on a real backend death, for Swiftfin and Infuse I found no explicit reconnect-with-range documentation, and I didn't look at the web client at all.
 
-**HLS transcode failover.** Two results apply, and they differ by configuration.
+HLS transcode failover splits two ways by configuration.
 
-- Without the shared transcode directory, or for local (non-pool) ffmpeg jobs, a failover restarts ffmpeg on the surviving replica (`../transcode/docs/SHARED-TRANSCODE.md`, "Not covered"). The [ROADMAP](ROADMAP.md#sticky-server-failover) records a Safari remux measured on 2026-09-27: it restarted on the fallback and again on the primary three minutes later, so one failover cost two restarts, and the viewer reported audio drifting out of sync. Making a failed-over session stay put is [Planned](ROADMAP.md#sticky-server-failover).
+- Without the shared transcode directory, or for local (non-pool) ffmpeg jobs, a failover restarts ffmpeg on the surviving replica; `../transcode/docs/SHARED-TRANSCODE.md` files that under "Not covered". The [ROADMAP](ROADMAP.md#sticky-server-failover) records a Safari remux measured on 2026-09-27: it restarted on the fallback and again on the primary three minutes later, so one failover cost two restarts, and the viewer reported audio drifting out of sync. Keeping a failed-over session on one replica is still to do.
 - With `JELLYMESH_SHARED_TRANSCODE_DIR=1` and the pool, drills A to C below showed no new ffmpeg.
 
 The operations procedure is in [operations.md](operations.md#traefik-activepassive-failover).
 
 ### Shared transcode directory across replicas
 
-**Status:** Lab-verified, opt-in (`JELLYMESH_SHARED_TRANSCODE_DIR=1`). Measured 2026-09-28.
-
-**Method.** 3 concurrent HLS sessions per drill (1080p H.264 to 720p, 3 s segments, 12 s player buffer) through the Traefik failover route, with 2 Jellyfin replicas (`jm-jf-0` primary, `jm-jf-1` fallback), one NVENC agent (card model not recorded), plaintext, lab only. Client: `../transcode/spike/shared_dir_drill.py`. Source: `../transcode/docs/SHARED-TRANSCODE.md`. "Slow" means a segment request over 3 s, not counting each session's cold first segment, which took 3.7 to 4.8 s.
+Opt-in with `JELLYMESH_SHARED_TRANSCODE_DIR=1`, measured in the lab on 2026-09-28. Each drill ran 3 concurrent HLS sessions (1080p H.264 to 720p, 3 s segments, 12 s player buffer) through the Traefik failover route, with 2 Jellyfin replicas (`jm-jf-0` primary, `jm-jf-1` fallback) and one NVENC agent whose card model I didn't record, over plaintext. The client is `../transcode/spike/shared_dir_drill.py` and the write-up is `../transcode/docs/SHARED-TRANSCODE.md`. "Slow" means a segment request over 3 s, not counting each session's cold first segment, which took 3.7 to 4.8 s.
 
 | Drill | Failed segments | Slow segments | Slowest in failover window | New ffmpeg for the sessions |
 |---|---|---|---|---|
@@ -304,19 +282,17 @@ The operations procedure is in [operations.md](operations.md#traefik-activepassi
 | B: `kill -9` the serving Jellyfin process at +45 s | 0 of 162 | 0 | 1.33 s | none |
 | C: restart the other replica while session 0 is paused 150 s, with progress pings sent only to that replica | 0 of 223 | 0 | 0.43 s | none |
 
-"Failed" is this page's reading of a segment request that did not succeed; the source defines only "slow".
+I'm reading "failed" as a segment request that didn't succeed; the source only defines "slow".
 
 Drill C found that before a code change the paused session's job was killed 60 s after the pause by the owner's timer. The change is in `../jellyfin-perf/bughunt/16-shared-transcode-dir.patch` (it touches `PlaystateController`). After the viewers stopped, each detached job ended 60 s later. Before the job was throttled to about 60 s of video ahead of its viewer (the jm7 draft), each orphan wrote 287 to 315 segments.
 
 ## Transcode pool results
 
-The pool is the Rust GPU transcode pool described in [../transcode/README.md](../transcode/README.md). Full method and tables are in [engineering/transcode-calibration.md](engineering/transcode-calibration.md) and [engineering/transcode-plan.md](engineering/transcode-plan.md).
-
-**Status:** Lab-verified, except where a row says otherwise.
+The pool is the Rust GPU transcode pool described in [../transcode/README.md](../transcode/README.md). Full method and tables are in [engineering/transcode-calibration.md](engineering/transcode-calibration.md) and [engineering/transcode-plan.md](engineering/transcode-plan.md). All of it is lab work except where a row says otherwise.
 
 ### Bitrate delivery (calibration)
 
-**Method.** Calibration runs in the `tc-lab` k3s namespace on cluster GPU nodes: one node with an Intel Arc A380 (QSV) and one node with a Tesla P4 (NVENC). Each run covers 3 titles, 2 codecs, and 3 rate-control rungs (3, 8, and 15 Mbps caps), comparing delivered bitrate to the requested cap. Sources: `engineering/transcode-calibration.md`, run P0 (2026-09-26/27), run P5 (2026-09-27), and the pool-r1 check (2026-09-28).
+Calibration runs in the `tc-lab` k3s namespace on cluster GPU nodes: one node with an Intel Arc A380 (QSV) and one node with a Tesla P4 (NVENC). Each run covers 3 titles, 2 codecs, and 3 rate-control rungs (3, 8, and 15 Mbps caps), comparing delivered bitrate to the requested cap. The runs are P0 (2026-09-26/27), P5 (2026-09-27), and the pool-r1 check (2026-09-28).
 
 | Card and setting | Delivered bitrate as a share of the cap | Over the cap? | Run |
 |---|---|---|---|
@@ -327,18 +303,18 @@ The pool is the Rust GPU transcode pool described in [../transcode/README.md](..
 | P4, legacy mapping (`-cq`) | Mean 54% (hevc) and 85% (h264), range 19 to 102% | Yes, up to 102% | P0 |
 | P4, legacy mapping | h264 96 to 100%, hevc 35 to 47% at the 8M cap | No, in these runs | P5 |
 
-The two Arc legacy ranges come from different runs and do not conflict. The P0 figures average over all caps and titles, with the 4 to 60% range spanning them. The P5 figures cover only the 8M cap.
+The two Arc legacy ranges come from different runs and don't conflict. The P0 figures average over all caps and titles, with the 4 to 60% range spanning them; the P5 figures cover only the 8M cap.
 
 Two further results affect how to read the table:
 
 - **NVENC overshoot.** NVENC delivers 7 to 9% above its `-b:v`, so the shipped setting targets 90% of the cap. In the pool-r1 check (2026-09-28, both cards, 2160p-class sources to 1080p, 20 s), a 4M cap gave Arc 94.1 to 96.1% and P4 93.5 to 98.4%. A 60M cap gave Arc 93.0 to 95.7% and P4 81.1 to 82.6%; no run was over the cap.
-- **Arc driver crash.** `h264_qsv` with `-look_ahead_depth` crashes with SIGSEGV on the Arc driver in every combination tried, so the renderer does not emit it for `h264_qsv`.
+- **Arc driver crash.** `h264_qsv` with `-look_ahead_depth` crashes with SIGSEGV on the Arc driver in every combination tried, so the renderer doesn't emit it for `h264_qsv`.
 
 ### Quality (VMAF)
 
-VMAF scores exist for only part of the runs, so read them with that in mind. In the P0 run, 48 of 164 encodes have VMAF scores. The 3 and 15 Mbps candidate rungs were not scored in P0. The P5 run then scored the Sample B and Sample C cross-card table, the Sample A Arc rows, and the equal-bitrate comparison. P5 has no P4 Sample A rows for the shipped configuration (the source left the library mid-run), so the shipped-configuration Sample A cross-card comparison is open. The nearest proxy is the AQ variant (Arc minus P4 of +0.33 to +1.26); AQ is not in the shipped configuration.
+VMAF scores exist for only part of the runs, so read them with that in mind. In the P0 run, 48 of 164 encodes have VMAF scores, and the 3 and 15 Mbps candidate rungs were not scored at all. The P5 run then scored the Sample B and Sample C cross-card table, the Sample A Arc rows, and the equal-bitrate comparison. P5 has no P4 Sample A rows for the shipped configuration, because the source left the library mid-run, so the shipped-configuration Sample A cross-card comparison is still open. The nearest proxy is the AQ variant (Arc minus P4 of +0.33 to +1.26), and AQ is not in the shipped configuration.
 
-Sign convention: a gap is Arc VMAF minus P4 VMAF, so a negative gap means the P4 scored higher. Samples are named A (1080p SDR), B (1620p SDR), and C (4K HDR).
+A gap is Arc VMAF minus P4 VMAF, so a negative gap means the P4 scored higher. Samples are named A (1080p SDR), B (1620p SDR), and C (4K HDR).
 
 | Comparison | Result | Run |
 |---|---|---|
@@ -349,13 +325,13 @@ Sign convention: a gap is Arc VMAF minus P4 VMAF, so a negative gap means the P4
 | P4 h264 at 8M, calibrated versus legacy `-cq` at equal bitrate | About 0.5 VMAF lower (Sample B: 89.71 against 90.19) | P5 |
 | Arc and P4 h264 at 8M versus x264 `-preset slow` | About 3.2 VMAF lower | P0 |
 
-The CPU worker runs at 0.18 to 0.59 times realtime for one job at `-preset slow` (P0), so it serves as a fallback and not as a playback tier.
+The CPU worker runs at 0.18 to 0.59 times realtime for one job at `-preset slow` (P0), so it's a fallback, not a playback tier.
 
 ### Startup latency
 
-**Method.** 18 sessions on 2026-09-26 (23:33 to 23:36 CDT): 6 per title, sequential, h264 at 8 Mbps and 1080p, through the lab Jellyfin, all on the Arc. Warm cache. Each session used a fresh `PlaySessionId` and a slightly different bitrate to force a real transcode. Source: `engineering/transcode-calibration.md`.
+18 sessions on 2026-09-26 (23:33 to 23:36 CDT): 6 per title, sequential, h264 at 8 Mbps and 1080p, through the lab Jellyfin, all on the Arc, warm cache. Each session used a fresh `PlaySessionId` and a slightly different bitrate to force a real transcode.
 
-This table is the baseline with Jellyfin's `-probesize 1G` and warm NFS. With n=6 per title, the second column is the maximum of 6, not a p95.
+This is the baseline with Jellyfin's `-probesize 1G` and warm NFS. With only 6 runs per title, the second column is the maximum of 6, not a p95.
 
 | First segment, request to last byte (seconds) | p50 | Max of 6 |
 |---|---|---|
@@ -365,51 +341,49 @@ This table is the baseline with Jellyfin's `-probesize 1G` and warm NFS. With n=
 
 - Jellyfin pre-ffmpeg work, shim scheduling, and agent admission together take about 0.15 s (p50 0.151 to 0.164); the agent's spawn is 1 ms. The control plane is not the dominant latency.
 - On the Arc worker (3 runs per title, warm NFS), the ffmpeg input probe with `-analyzeduration 200M -probesize 1G` took 0.235, 0.019, and 0.449 s for Samples A, B, and C.
-- **Probe clamp.** The agent limits ffmpeg's `-probesize` and `-analyzeduration` with `TC_PROBE_CLAMP` (default `50M,5M`: probesize 50 MB and analyzeduration 5,000,000 microseconds; it lowers Jellyfin's values and never raises them; `0` turns it off, per `transcode/crates/agent/src/config.rs`). `engineering/transcode-plan.md` records that the 1G probe cost 8 to 12 s over the tower's 1 GbE link, that the clamp kept the mapped streams unchanged on all 3 titles, and that the first segment then took 0.78 to 0.88 s (2026-09-27). That is a separate run from the table above, and the source gives no per-title breakdown.
-- Not measured: cold-cache startup, P4 startup, and CPU-worker startup. The startup target (p50 below 1.5 s, p95 below 3 s) cannot be called met until a cold-cache run is done.
+- **Probe clamp.** The agent limits ffmpeg's `-probesize` and `-analyzeduration` with `TC_PROBE_CLAMP` (default `50M,5M`: probesize 50 MB and analyzeduration 5,000,000 microseconds; it lowers Jellyfin's values and never raises them; `0` turns it off, per `transcode/crates/agent/src/config.rs`). `engineering/transcode-plan.md` records that the 1G probe cost 8 to 12 s over the tower's 1 GbE link, that the clamp kept the mapped streams unchanged on all 3 titles, and that the first segment then took 0.78 to 0.88 s (2026-09-27). That's a separate run from the table above, and there is no per-title breakdown for it.
+- Cold-cache startup, P4 startup, and CPU-worker startup are all unmeasured. Until a cold-cache run is done I can't call the startup target (p50 below 1.5 s, p95 below 3 s) met.
 
 ### Performance measurements
 
-| Measurement | Value | Context | Source |
-|---|---|---|---|
-| Shim overhead | 0.33 ms, against 71 ms for the Python prototype (the original spike in `transcode/spike/`) | Lab, n not stated | `engineering/transcode-plan.md` |
-| Static binary size | Agent 3.1 MB, shim 2.1 MB | musl static build | `engineering/transcode-plan.md` |
-| GPU-resident scale and tone map | Arc 4K HDR 268 fps against 29 fps; P4 98 against 51 fps. The lower figure in each pair is the non-GPU-resident path | Spike, not the native pool | `engineering/transcode-plan.md` |
-| Native drill, graceful pod delete mid-4K-HDR | Agent drained in 0.9 s, Jellyfin resumed at segment 22, 0 failed requests, lowest buffer 1.3 s | Lab, 2026-09-27 | `engineering/transcode-plan.md` |
-| Native pool serving a GPU-less Jellyfin | 0 failed requests, first segment 1.09 s | Lab, 2026-09-27 | `engineering/transcode-plan.md` |
+| Measurement | Value | Context |
+|---|---|---|
+| Shim overhead | 0.33 ms, against 71 ms for the Python prototype (the original spike in `transcode/spike/`) | Lab, n not stated |
+| Static binary size | Agent 3.1 MB, shim 2.1 MB | musl static build |
+| GPU-resident scale and tone map | Arc 4K HDR 268 fps against 29 fps; P4 98 against 51 fps. The lower figure in each pair is the non-GPU-resident path | Spike, not the native pool |
+| Native drill, graceful pod delete mid-4K-HDR | Agent drained in 0.9 s, Jellyfin resumed at segment 22, 0 failed requests, lowest buffer 1.3 s | Lab, 2026-09-27 |
+| Native pool serving a GPU-less Jellyfin | 0 failed requests, first segment 1.09 s | Lab, 2026-09-27 |
 
 ### Robustness checks
 
 The protocol suite (`transcode/spike/proto_test.sh`) has 21 numbered cases per `.github/workflows/transcode.yml`. Cases 17, 20, and 21 have lettered steps (17a and 17b, 20a to 20d, 21a to 21h), so the suite runs 32 steps in all. `../transcode/README.md` states the same count. `engineering/transcode-plan.md` records "14/14" in its P1 checklist, which is the older figure.
 
-| Measurement | Value | Context | Source |
-|---|---|---|---|
-| Command allowlist | 134 real commands pass, 11 attacks rejected | Protocol suite case 13 | `engineering/transcode-plan.md` |
-| Fuzzing | 4 targets (`validate`, `render`, `filters`, `trickplay`), 10 min each with 4 parallel workers: 0 crashes, timeouts, or out-of-memory kills. Total executions 13.1M, 2.5M, 3.0M, 7.9M | Lab; the plan lists the counts in the same order as the targets and does not label each count | `engineering/transcode-plan.md` |
+| Measurement | Value | Context |
+|---|---|---|
+| Command allowlist | 134 real commands pass, 11 attacks rejected | Protocol suite case 13 |
+| Fuzzing | 4 targets (`validate`, `render`, `filters`, `trickplay`), 10 min each with 4 parallel workers: 0 crashes, timeouts, or out-of-memory kills. Total executions 13.1M, 2.5M, 3.0M, 7.9M | Lab; the plan lists the counts in the same order as the targets and does not label each count |
 
 ### Dolby Vision 7 -> 8.1 conversion measurements
 
-**Status:** Production, opt-in and off by default, for playback on an Android TV app (maintainer report, 2026-09-29, tested repeatedly). Dolby Digital Plus passthrough of the EAC3 track from the SHIELD to an AV receiver works (maintainer report, 2026-09-30). The numbers below are not on-device measurements; see [dolby-vision.md](dolby-vision.md) for the feature.
+DV 7 -> 8.1 is opt-in and off by default, and it's the one piece of this I'd call production. It has been playing as Dolby Vision on my Android TV since 2026-09-29 and I've tested it repeatedly, and since 2026-09-30 the EAC3 track passes through from the SHIELD to an AV receiver as Dolby Digital Plus. That's me watching it work, not a measurement. The feature itself is described in [dolby-vision.md](dolby-vision.md); what follows are the lab and library numbers behind it.
 
-On-device playback: reported by the maintainer on 2026-09-29; no measurement.
+| Measurement | Value | Context |
+|---|---|---|
+| Real in-band DV7 FEL title, 30 s window | 729 of 729 RPUs rewritten, 2,459 EL NALs dropped; init-segment DOVI record profile 8, compatibility id 1 (plain remux: profile 7) | Prod `jellyfin-qsv` ffmpeg 8.1.2, one title, 2026-09-27 |
+| Conversion time for that window | 1.772 s against 1.217 s for a plain remux (about 17 times realtime) | Page-cache warm; the plain remux ran first; cold-NFS cost not measured |
+| Library census | 336 video files, 165 with a DOVI record, 122 profile 7 (76 FEL, 46 MEL), 43 profile 8; 0 of 122 carry the RPU only in a Matroska Block Addition | Production library, prod `jellyfin-qsv`, 2026-09-27 |
+| FEL enhancement-layer residual | Mean residual between 0.07% and 1.03% of the 10-bit range on 4 FEL titles. Highlight-to-full ratio (highlight-masked mean residual divided by full-frame mean residual): 1.618, 0.563, 0.885, 1.393 | Proxy, not a VMAF comparison |
+| DV-removed fallback on the same title | `remove_dovi` leaves 336 small NAL 63 units (about 10 bytes each); A/V start identical to a plain remux | Prod `jellyfin-qsv` ffmpeg, one title |
 
-| Measurement | Value | Context | Status | Source |
-|---|---|---|---|---|
-| Real in-band DV7 FEL title, 30 s window | 729 of 729 RPUs rewritten, 2,459 EL NALs dropped; init-segment DOVI record profile 8, compatibility id 1 (plain remux: profile 7) | Prod `jellyfin-qsv` ffmpeg 8.1.2, one title, 2026-09-27 | Lab-verified | `engineering/transcode-plan.md` |
-| Conversion time for that window | 1.772 s against 1.217 s for a plain remux (about 17 times realtime) | Page-cache warm; the plain remux ran first; cold-NFS cost not measured | Lab-verified | `engineering/transcode-plan.md` |
-| Library census | 336 video files, 165 with a DOVI record, 122 profile 7 (76 FEL, 46 MEL), 43 profile 8; 0 of 122 carry the RPU only in a Matroska Block Addition | Production library, prod `jellyfin-qsv`, 2026-09-27 | Lab-verified (production library) | `engineering/transcode-plan.md` |
-| FEL enhancement-layer residual | Mean residual between 0.07% and 1.03% of the 10-bit range on 4 FEL titles. Highlight-to-full ratio (highlight-masked mean residual divided by full-frame mean residual): 1.618, 0.563, 0.885, 1.393 | Proxy, not a VMAF comparison | Lab-verified | `engineering/gh15-fel-visibility.md` |
-| DV-removed fallback on the same title | `remove_dovi` leaves 336 small NAL 63 units (about 10 bytes each); A/V start identical to a plain remux | Prod `jellyfin-qsv` ffmpeg, one title | Lab-verified | `engineering/transcode-plan.md` |
+The method behind the FEL residual row is written up in `engineering/gh15-fel-visibility.md`.
 
-Gaps in the record:
+Three gaps in the record:
 
-- From code reading: a converting job reads the source about twice, because the pipeline runs two ffmpeg invocations (`transcode/crates/agent/src/dv81.rs`, `engineering/transcode-plan.md`). The cost of the second read on cold NFS is not measured.
-- The `fallback_no_rpu` gate has not been exercised on a real title, because the library has none.
-- The `hvcE` RPU reader is tracked in GitHub issue #4 ([Planned](ROADMAP.md)).
+- A converting job reads the source about twice, because the pipeline runs two ffmpeg invocations (`transcode/crates/agent/src/dv81.rs`). That is from reading the code; what the second read costs on cold NFS is unmeasured.
+- The `fallback_no_rpu` gate has never been exercised on a real title, because my library has none.
+- The `hvcE` RPU reader is tracked in GitHub issue #4 and is still [planned](ROADMAP.md).
 
 ## Reproducing these results
-
-The tables in this section list the scripts present in this repository, the results each one reproduces, and how to run it. Usage lines come from each script's header or from `engineering/galera-provider.md`.
 
 | Script | Reproduces | Usage |
 |---|---|---|
@@ -427,21 +401,7 @@ The tables in this section list the scripts present in this repository, the resu
 
 Not reproducible from this repository:
 
-- **Concurrent load, per-call latency, and coherence.** The drivers are `spikes/jellymesh/load.py`, `spikes/jellymesh/bench.py`, and `mesh/mesh_drill.py`. They are not in the repository.
-- **Transcode calibration, startup latency, and the Dolby Vision census and proof.** No script in the repository reproduces them. The raw calibration rows are in `transcode/calibration/` (`2026-09-26-p0.csv`, `2026-09-27-p5.csv`, `2026-09-28-pool-r1.csv`).
+- **Concurrent load, per-call latency, and coherence.** The drivers are `spikes/jellymesh/load.py`, `spikes/jellymesh/bench.py`, and `mesh/mesh_drill.py`, and none of them is in the repository.
+- **Transcode calibration, startup latency, and the Dolby Vision census and proof.** No script here reproduces them. The raw calibration rows are in `transcode/calibration/` (`2026-09-26-p0.csv`, `2026-09-27-p5.csv`, `2026-09-28-pool-r1.csv`).
 
 Fuzzing is reproducible: [CONTRIBUTING.md](../CONTRIBUTING.md#building-and-testing-the-rust-workspace) gives the local command for the CI `fuzz-smoke` job. The remaining gaps are listed under [open documentation gaps](../CONTRIBUTING.md#open-documentation-gaps).
-
-## Related docs
-
-- [README.md](README.md): documentation index and glossary pointer
-- [architecture.md](architecture.md): how the parts fit, and the glossary
-- [dolby-vision.md](dolby-vision.md): the Dolby Vision 7 -> 8.1 feature
-- [operations.md](operations.md): migration, failover route, and transcode pool procedures
-- [ROADMAP.md](ROADMAP.md): planned work
-- [../jellyfin-perf/README.md](../jellyfin-perf/README.md): the patch and shared-database mode
-- [../galera/README.md](../galera/README.md): the provider, migration tool, and lab
-- [../transcode/README.md](../transcode/README.md): the transcode pool
-- [engineering/transcode-calibration.md](engineering/transcode-calibration.md): calibration method and tables
-- [engineering/transcode-plan.md](engineering/transcode-plan.md): pool plan, census, and conversion proof
-- [engineering/direct-play-failover.md](engineering/direct-play-failover.md): the direct play failover test

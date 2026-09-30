@@ -2,7 +2,7 @@
 
 This page holds the measurements, lab scripts, and change history for the Galera database provider. The operator path (build, configure, migrate) is in [galera/README.md](../../galera/README.md).
 
-**Status:** Lab-verified. All numbers come from a single workstation with every node in a podman container, on a real library of 19,259 items, 308,330 rows, and 31 tables. Results were measured 2026-09-26 unless a row says otherwise.
+Everything here is lab work: every number came from a single workstation with every node in a podman container, on a real library of 19,259 items, 308,330 rows, and 31 tables, measured 2026-09-26 unless a row says otherwise.
 
 ## Migration timings
 
@@ -17,7 +17,7 @@ Method: `jellyfin-dbmigrate copy` then `verify`, n=1 per row, single workstation
 
 ## Latency versus SQLite
 
-Method: Jellyfin 12.1 on the 3-node cluster, p50 in ms over 30 runs, results measured 2026-09-26. The numbers were produced with `spikes/jellymesh/bench.py`, and the SQLite column comes from `spikes/jellymesh/README.md`. Neither path is in this repository, so these numbers are Not measured from repo scripts and cannot be reproduced from the repo alone. They predate the `jellyfin-perf` patch; [RESULTS.md](../RESULTS.md#per-call-latency-and-statement-counts), Per-call latency has current numbers.
+Method: Jellyfin 12.1 on the 3-node cluster, p50 in ms over 30 runs, results measured 2026-09-26. The numbers were produced with `spikes/jellymesh/bench.py`, and the SQLite column comes from `spikes/jellymesh/README.md`. Neither path is in this repository, so these numbers cannot be reproduced from the repo alone. They predate the `jellyfin-perf` patch; [RESULTS.md](../RESULTS.md#per-call-latency-and-statement-counts), Per-call latency has current numbers.
 
 | Call | SQLite (ms) | Galera, Pomelo + patch (ms) | What was left at the time |
 |---|---|---|---|
@@ -156,12 +156,3 @@ This table records problems met while building the provider and how each was fix
 | PXC `pxc_strict_mode=ENFORCING` | Rejects `GET_LOCK`, used by EF Core's migration lock | The lab runs `PERMISSIVE`; migrations run from one node |
 | `JellyfinDbContext` calls the provider's `OnModelCreating` before its own configuration | Model rules had no effect | The rules run as a model-finalizing convention |
 | One new unpooled `master` connection per `/health` probe (1.00 new connection per probe, lab) | Each probe opened a connection | `GaleraDatabaseCreator` runs `CanConnect` on the pooled connection |
-
-## Related docs
-
-- [Galera provider README](../../galera/README.md)
-- [Results](../RESULTS.md)
-- [Jellyfin N+1 hotspots](jellyfin-n1-hotspots.md)
-- [jellyfin-perf](../../jellyfin-perf/README.md)
-- [Architecture and glossary](../architecture.md)
-- [Contributing](../../CONTRIBUTING.md)

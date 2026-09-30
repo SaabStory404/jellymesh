@@ -1,8 +1,8 @@
 # Jellyfin 12.1 query-per-row (N+1) hotspots and fixes
 
-Source: code reading of tag v12.1 by a research subagent (2026-09-26); statement counts marked
-MEASURED come from pg_stat_statements on the real-library lab, the rest are code-derived.
-Paths relative to the jellyfin repo.
+A subagent read tag v12.1 for me on 2026-09-26 and this is what came out of it. Statement
+counts marked MEASURED come from pg_stat_statements on the real-library lab; the rest I took
+from the code. Paths are relative to the jellyfin repo.
 
 Already batched upstream in 12.1: `DtoService.GetBaseItemDtos` (Emby.Server.Implementations/Dto/
 DtoService.cs:171-270) batches UserData, resume data, child/played counts, artists, PersonInfo rows

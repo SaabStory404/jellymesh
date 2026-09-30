@@ -1,4 +1,4 @@
-> Status: investigation report for issue #15. The scripts and per-title result files it names (`residual.sh`, `find_bright.sh`, `analyze.sh`, `*.json`) live in `tools/gh15-fel-visibility/`.
+> What I found investigating issue #15, 2026-09-28 to 2026-09-29. The scripts and per-title result files named below (`residual.sh`, `find_bright.sh`, `analyze.sh`, `*.json`) live in `tools/gh15-fel-visibility/`.
 
 # Issue #15: DV7 FEL enhancement-layer visibility on bright content
 

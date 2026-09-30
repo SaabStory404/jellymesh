@@ -1,18 +1,10 @@
 # jellyfin-perf
 
-A patch overlay for Jellyfin 12.1 that fixes N+1 (one query per row) and slow query shapes on MySQL and Galera (a multi-primary MySQL cluster), and adds an opt-in shared-database mode. It also carries the bughunt series (patches 00-19): individual fixes found in a targeted review of Jellyfin 12.1 ([engineering/bughunt.md](../docs/engineering/bughunt.md)). Terms are defined in the [glossary](../docs/architecture.md#glossary).
+A patch overlay for Jellyfin 12.1 that fixes N+1 (one query per row) and slow query shapes on MySQL and [Galera](../docs/architecture.md#glossary) (a multi-primary MySQL cluster), and adds an opt-in shared-database mode. It also carries the bughunt series (patches 00-19): individual fixes found in a targeted review of Jellyfin 12.1 ([engineering/bughunt.md](../docs/engineering/bughunt.md)).
 
-## Status
+`jellyfin-12.1-perf.patch` and the bughunt series both apply by default (`BUGHUNT=1`). Three things in here are opt-in and stay off until you set a flag: shared-database mode (`JELLYFIN_SHARED_DB=1`), the shared transcode directory (patches 03 and 16, `JELLYMESH_SHARED_TRANSCODE_DIR=1`), and Dolby Vision 7 -> 8.1 (patches 13, 17, 18, 19, `JELLYMESH_DOVI_P7_TO_81=1`). Shared-database mode and patch 16 have been through the lab; see [Results](#results).
 
-| Part | Status |
-|---|---|
-| `jellyfin-12.1-perf.patch` (query shapes, retries, transcode fixes) | Implemented |
-| Shared-database mode, `JELLYFIN_SHARED_DB=1` | Implemented, opt-in, off by default. Lab-verified (see [Results](#results)) |
-| Bughunt series 00-19 | Implemented; applied by default (`BUGHUNT=1`) |
-| Dolby Vision 7 -> 8.1 patches (13, 17, 18, 19) | Production (2026-09-29), opt-in, off by default [^prod] |
-| Shared transcode directory (03, 16) | Implemented, opt-in, off by default. Lab-verified (16) |
-
-[^prod]: Production is reported by the maintainer: DV 7 -> 8.1 is deployed and plays as Dolby Vision on an Android TV (SHIELD), tested repeatedly. [engineering/bughunt.md](../docs/engineering/bughunt.md) still marks 13 and 18 as MIXED evidence. The EAC3 track from patch 19 passes through from the SHIELD to an AV receiver as Dolby Digital Plus (maintainer report, 2026-09-30).
+Dolby Vision 7 -> 8.1 is the one piece I run in production: since 2026-09-29 it's been deployed and playing as Dolby Vision on an Android TV (SHIELD), tested repeatedly, and since 2026-09-30 the EAC3 track from patch 19 passes through from the SHIELD to an AV receiver as Dolby Digital Plus. That's me watching it work rather than a measurement, and [engineering/bughunt.md](../docs/engineering/bughunt.md) still marks patches 13 and 18 as MIXED evidence.
 
 ## What it does
 
@@ -20,19 +12,19 @@ A patch overlay for Jellyfin 12.1 that fixes N+1 (one query per row) and slow qu
 
 ### Changes in `jellyfin-12.1-perf.patch`
 
-Test bed for figures sourced to docs/RESULTS.md: single workstation, 3-node PXC, 19,259-item library, 2026-09-26.
+Rows that link to [docs/RESULTS.md](../docs/RESULTS.md) were measured there — single workstation, 3-node PXC, 19,259-item library, 2026-09-26 — and the rest are fixes I found reading the code and haven't measured on their own.
 
-| Change | Where | Problem and measured result | Source |
-|---|---|---|---|
-| Persons for a page load in one query (`ILibraryManager.GetPersons`), with a per-name fallback if the batch throws | `LibraryManager.GetPeopleItems`, `DtoService.AttachPeople` | `GetPerson(name)` did a full item load per row. On Galera, `/Persons?Limit=100` took 103 statements stock and 4 patched; movie detail 48 and 29 | [RESULTS.md](../docs/RESULTS.md#per-call-latency-and-statement-counts), Per-call latency (performance_schema) |
-| Person dedupe by `GroupBy(lower(Name)).Min(Id)` instead of a correlated `NOT EXISTS` | `PeopleRepository.GetPeople` | MySQL ran the `NOT EXISTS` as a range scan per row: 339 ms against 33 ms for the hash antijoin plan | [RESULTS.md](../docs/RESULTS.md#provider-only-latencies-history), Provider-only latencies |
-| `HasLyrics` for a page of tracks in one query (`IMediaStreamRepository.GetItemIdsWithStreamType`) | `DtoService` | Removes one full stream load per Audio item. On Galera, the 200-track grid took 207 statements stock and 8 patched | [RESULTS.md](../docs/RESULTS.md#per-call-latency-and-statement-counts), Per-call latency |
-| Dedupe by id sub-select instead of `DISTINCT` over whole rows | `BaseItemRepository.ApplyGroupingFilter` | `DISTINCT` hashed the multi-KB `Data` JSON of every row into temp tables. Not measured separately | From code reading |
-| "Date played" sort key (`DatePlayed`): alternate versions come from the `PrimaryVersionId` index (MAX over a per-alternate lookup), combined with the item's own value by `CASE`, instead of MAX over a correlated `UNION ALL` | `OrderMapper` | MySQL drove the alternate side from every UserData row of the user per sorted row (166,800 lookups for 400 rows, per the patch comment). Resume took 0.4-2.6 s with a few hundred in-progress items and 0.14 s after the fix | Patch comment; [RESULTS.md](../docs/RESULTS.md#concurrent-load), Concurrent load |
-| Early-exit wedge fix: unregister a transcode whose ffmpeg exited non-zero before its first segment | `TranscodeManager` | Without it, a retry of that play session waits for a segment that never appears. Found by the transcode-pool work | From code reading |
-| Transcode marker created race-safely | `BaseApplicationPaths` | Two transcodes right after a wipe raced on `.jellyfin-transcode` (`FileShare.None`) and one returned HTTP 500 | From code reading |
-| With `JELLYFIN_SHARED_DB=1`, the startup wipe of the transcode directory only deletes files older than 6 h | `TranscodeManager.DeleteEncodedMediaCache` | Several replicas share one transcode directory; a restart must not delete another replica's live segments | From code reading |
-| User-data save retried on a write conflict (6 attempts, fresh context, jittered backoff) | `UserDataManager.SaveUserData` | Check-then-insert is atomic only where writes serialize (SQLite). On MySQL, 7 of 200 concurrent first progress reports returned HTTP 500 (patch comment). On multi-writer Galera, 69 of 200 concurrent writes to one row returned HTTP 500 (35%) before the retry | Patch comment; [RESULTS.md](../docs/RESULTS.md#failure-drills), Failure drills |
+| Change | Where | Problem and measured result |
+|---|---|---|
+| Persons for a page load in one query (`ILibraryManager.GetPersons`), with a per-name fallback if the batch throws | `LibraryManager.GetPeopleItems`, `DtoService.AttachPeople` | `GetPerson(name)` did a full item load per row. On Galera, `/Persons?Limit=100` took 103 statements stock and 4 patched; movie detail 48 and 29 ([per-call latency and statement counts](../docs/RESULTS.md#per-call-latency-and-statement-counts)) |
+| Person dedupe by `GroupBy(lower(Name)).Min(Id)` instead of a correlated `NOT EXISTS` | `PeopleRepository.GetPeople` | MySQL ran the `NOT EXISTS` as a range scan per row: 339 ms against 33 ms for the hash antijoin plan ([provider-only latencies](../docs/RESULTS.md#provider-only-latencies-history)) |
+| `HasLyrics` for a page of tracks in one query (`IMediaStreamRepository.GetItemIdsWithStreamType`) | `DtoService` | Removes one full stream load per Audio item. On Galera, the 200-track grid took 207 statements stock and 8 patched ([per-call latency and statement counts](../docs/RESULTS.md#per-call-latency-and-statement-counts)) |
+| Dedupe by id sub-select instead of `DISTINCT` over whole rows | `BaseItemRepository.ApplyGroupingFilter` | `DISTINCT` hashed the multi-KB `Data` JSON of every row into temp tables. Not measured separately |
+| "Date played" sort key (`DatePlayed`): alternate versions come from the `PrimaryVersionId` index (MAX over a per-alternate lookup), combined with the item's own value by `CASE`, instead of MAX over a correlated `UNION ALL` | `OrderMapper` | MySQL drove the alternate side from every UserData row of the user per sorted row (166,800 lookups for 400 rows, per the patch comment). Resume took 0.4-2.6 s with a few hundred in-progress items and 0.14 s after the fix ([concurrent load](../docs/RESULTS.md#concurrent-load)) |
+| Early-exit wedge fix: unregister a transcode whose ffmpeg exited non-zero before its first segment | `TranscodeManager` | Without it, a retry of that play session waits for a segment that never appears. Found by the transcode-pool work |
+| Transcode marker created race-safely | `BaseApplicationPaths` | Two transcodes right after a wipe raced on `.jellyfin-transcode` (`FileShare.None`) and one returned HTTP 500 |
+| With `JELLYFIN_SHARED_DB=1`, the startup wipe of the transcode directory only deletes files older than 6 h | `TranscodeManager.DeleteEncodedMediaCache` | Several replicas share one transcode directory; a restart must not delete another replica's live segments |
+| User-data save retried on a write conflict (6 attempts, fresh context, jittered backoff) | `UserDataManager.SaveUserData` | Check-then-insert is atomic only where writes serialize (SQLite). On MySQL, 7 of 200 concurrent first progress reports returned HTTP 500 (patch comment). On multi-writer Galera, 69 of 200 concurrent writes to one row returned HTTP 500 (35%) before the retry ([failure drills](../docs/RESULTS.md#failure-drills)) |
 
 Not patched: NextUp (3 statements, 8 ms) and UserViews extras and chapters (24 ms). The gain on the test library does not justify the added patch surface.
 
@@ -43,7 +35,7 @@ Set `JELLYFIN_SHARED_DB=1` on every node that shares one database (Galera, MySQL
 | Behavior with `JELLYFIN_SHARED_DB=1` | Detail |
 |---|---|
 | User data | Read from the database on every call. It bypasses the per-node LRU and the user-data rows embedded in cached items. Measured cross-node coherence: see [Results](#results) |
-| Item cache | Entries live 5 s (`SharedCacheTtlMs = 5000` in the patch), so metadata changed by another node's scan shows within 5 s at most. The cache holds folders and views. Without it, throughput at 32 clients fell from 112.0 to 35.6 req/s ([RESULTS.md](../docs/RESULTS.md#one-store-versus-a-redis-response-cache-tier), One store versus a Redis tier); the patch comment cites 105 -> 36 req/s |
+| Item cache | Entries live 5 s (`SharedCacheTtlMs = 5000` in the patch), so metadata changed by another node's scan shows within 5 s at most. The cache holds folders and views. Without it, throughput at 32 clients fell from 112.0 to 35.6 req/s ([one store versus a Redis tier](../docs/RESULTS.md#one-store-versus-a-redis-response-cache-tier)); the patch comment cites 105 -> 36 req/s |
 | Item invalidation (patch 15) | A poll on every node reads `JellyMeshItemInvalidation` and evicts changed items before the 5 s expiry. The table is created with `CREATE TABLE IF NOT EXISTS` on first use |
 | Login sessions | Devices are looked up in the database instead of the startup snapshot |
 
@@ -53,36 +45,36 @@ Per node: live sessions ("now playing", remote control), client capabilities, an
 
 `bughunt/NN-*.patch` apply on top of `jellyfin-12.1-perf.patch`, in numeric order. Patches with a flag in the Opt-in column are off unless the flag is set; the others apply unconditionally. Patch 14 wraps the user-data change notification in `UserDataChangeNotifier` so a database failure during the send is logged ("Error sending user data change notifications") instead of crashing the process; it is tested in `UserDataChangeNotifierTests` and shipped in `image/Containerfile.jm7`.
 
-> **Warning:** set `JELLYMESH_DOVI_P7_TO_81=1` only where the transcode pool is in the ffmpeg path. Without the shim, stock ffmpeg copies raw profile 7 while the playlist advertises 8.1 (source: patch 13 analysis in [engineering/bughunt.md](../docs/engineering/bughunt.md), known issue 5).
+Set `JELLYMESH_DOVI_P7_TO_81=1` only where the transcode pool is in the ffmpeg path. Without the shim, stock ffmpeg copies raw profile 7 while the playlist advertises 8.1, which is known issue 5 in the patch 13 analysis in [engineering/bughunt.md](../docs/engineering/bughunt.md).
 
-| # | Topic | Opt-in flag | Status |
-|---|---|---|---|
-| 00 | Build fix: test project compiles again | none | Implemented |
-| 01 | Kill timer: deferred delete skips when a replacement job is already registered on the same output | none | Implemented |
-| 02 | Kill timer: paused HLS/DASH jobs get a 180 s grace instead of 60 s | none | Implemented |
-| 03 | Shared transcode directory: wait on a fresh shared-dir segment before starting a local ffmpeg (K2 incident fix) | `JELLYMESH_SHARED_TRANSCODE_DIR=1` | Implemented, opt-in, off by default |
-| 04 | Segment-wait loops exit on client or proxy abort | none | Implemented |
-| 05 | HLS remux: `-noaccurate_seek` for the transcoded audio track (A/V drift fix) | none | Implemented |
-| 06 | Subtitle selection prefers a same-language text track over a tied PGS/VobSub track | none | Implemented |
-| 07 | `PlaybackProgress` writes use a bounded write path | none | Implemented |
-| 08 | MediaSources and MediaStreams batching for a page of items: 3N -> 3 statements | none | Implemented |
-| 09 | A positionless Stop no longer assumes `Played=true` without a local session record | none | Implemented |
-| 10 | Display-preferences first write retries instead of returning HTTP 500 | none | Implemented |
-| 11 | Trickplay deletion disposes its `DbContext` promptly | none | Implemented |
-| 12 | `serviceworker.js` served with `Cache-Control: no-cache`; throttled warning on a stale web client | none | Implemented |
-| 13 | Dolby Vision 7 -> 8.1 decision half | `JELLYMESH_DOVI_P7_TO_81=1` | Production (2026-09-29), opt-in, off by default |
-| 14 | `UserDataChangeNotifier` survives a database failover | none | Implemented |
-| 15 | Shared item-cache invalidation via `JellyMeshItemInvalidation` | `JELLYFIN_SHARED_DB=1`; opt out with `JELLYFIN_SHARED_INVALIDATION=0` | Implemented, opt-in, off by default |
-| 16 | Shared transcode directory plus session keepalive, lease-scoped cleanup, seek takeover. For HLS jobs with the flag on, Jellyfin sets `JELLYMESH_KEEPALIVE` in the ffmpeg process environment | `JELLYMESH_SHARED_TRANSCODE_DIR=1` | Implemented, opt-in, off by default. Lab-verified |
-| 17 | Dolby Vision 7 -> 8.1: fMP4 HLS so the init segment's `dvvC` marks Dolby Vision | `JELLYMESH_DOVI_P7_TO_81=1` | Production (2026-09-29), opt-in, off by default |
-| 18 | Dolby Vision 7 -> 8.1: non-negative fMP4 timestamps, 128-character audio codec list, TrueHD/MLP dropped from candidates | `JELLYMESH_DOVI_P7_TO_81=1` | Production (2026-09-29), opt-in, off by default |
-| 19 | Dolby Vision 7 -> 8.1: EncoderValidator detects `eac3`; TrueHD/MLP with 6 or more channels encodes to EAC3 5.1 at 640 kb/s when the client lists `eac3`, otherwise AAC | `JELLYMESH_DOVI_P7_TO_81=1` | Production (2026-09-29), opt-in, off by default |
+| # | Topic | Opt-in flag |
+|---|---|---|
+| 00 | Build fix: test project compiles again | none |
+| 01 | Kill timer: deferred delete skips when a replacement job is already registered on the same output | none |
+| 02 | Kill timer: paused HLS/DASH jobs get a 180 s grace instead of 60 s | none |
+| 03 | Shared transcode directory: wait on a fresh shared-dir segment before starting a local ffmpeg (K2 incident fix) | `JELLYMESH_SHARED_TRANSCODE_DIR=1` |
+| 04 | Segment-wait loops exit on client or proxy abort | none |
+| 05 | HLS remux: `-noaccurate_seek` for the transcoded audio track (A/V drift fix) | none |
+| 06 | Subtitle selection prefers a same-language text track over a tied PGS/VobSub track | none |
+| 07 | `PlaybackProgress` writes use a bounded write path | none |
+| 08 | MediaSources and MediaStreams batching for a page of items: 3N -> 3 statements | none |
+| 09 | A positionless Stop no longer assumes `Played=true` without a local session record | none |
+| 10 | Display-preferences first write retries instead of returning HTTP 500 | none |
+| 11 | Trickplay deletion disposes its `DbContext` promptly | none |
+| 12 | `serviceworker.js` served with `Cache-Control: no-cache`; throttled warning on a stale web client | none |
+| 13 | Dolby Vision 7 -> 8.1 decision half | `JELLYMESH_DOVI_P7_TO_81=1` |
+| 14 | `UserDataChangeNotifier` survives a database failover | none |
+| 15 | Shared item-cache invalidation via `JellyMeshItemInvalidation` | `JELLYFIN_SHARED_DB=1`; opt out with `JELLYFIN_SHARED_INVALIDATION=0` |
+| 16 | Shared transcode directory plus session keepalive, lease-scoped cleanup, seek takeover. For HLS jobs with the flag on, Jellyfin sets `JELLYMESH_KEEPALIVE` in the ffmpeg process environment | `JELLYMESH_SHARED_TRANSCODE_DIR=1` |
+| 17 | Dolby Vision 7 -> 8.1: fMP4 HLS so the init segment's `dvvC` marks Dolby Vision | `JELLYMESH_DOVI_P7_TO_81=1` |
+| 18 | Dolby Vision 7 -> 8.1: non-negative fMP4 timestamps, 128-character audio codec list, TrueHD/MLP dropped from candidates | `JELLYMESH_DOVI_P7_TO_81=1` |
+| 19 | Dolby Vision 7 -> 8.1: EncoderValidator detects `eac3`; TrueHD/MLP with 6 or more channels encodes to EAC3 5.1 at 640 kb/s when the client lists `eac3`, otherwise AAC | `JELLYMESH_DOVI_P7_TO_81=1` |
 
 Patch 13 decides and marks the job; the conversion itself runs in the transcode pool. See [Dolby Vision 7 -> 8.1](../docs/dolby-vision.md) for how to enable and verify it.
 
 #### Interface changes for plugin authors
 
-The perf patch and the bughunt series add members to plugin-facing interfaces. A plugin that implements one of these interfaces fails to compile or load against the patched assemblies; a plugin that only calls them keeps binding. The table is built from the patches. The series also changes the value of the public constant `AudioCodecListValidationRegexStr` (patch 18).
+The perf patch and the bughunt series add members to plugin-facing interfaces. A plugin that implements one of these interfaces fails to compile or load against the patched assemblies; a plugin that only calls them keeps binding. The series also changes the value of the public constant `AudioCodecListValidationRegexStr` (patch 18).
 
 | Patch | Interface | Change |
 |---|---|---|
@@ -174,7 +166,7 @@ Response parity between two builds is checked with `galera/tools/parity_ab.py <u
 
 ### Results
 
-All numbers below: single workstation (12 cores, 62 GB), every node in a podman container on one bridge network, the real library (19,259 items), 30 runs per call, p50 only (no spread reported here), warm cache. Measured 2026-09-26. Method and caveats: [docs/RESULTS.md](../docs/RESULTS.md).
+Everything below came off one workstation (12 cores, 62 GB) with every node in a podman container on one bridge network, against the real library (19,259 items), 30 runs per call, p50 only (no spread reported here), warm cache, measured 2026-09-26. Method and caveats are in [docs/RESULTS.md](../docs/RESULTS.md).
 
 Per-call p50 latency in ms ("Galera" is the JellyMesh Galera provider on a 3-node PXC cluster, Jellyfin talking to one node):
 
@@ -205,7 +197,7 @@ The hotspot write-up in [engineering/jellyfin-n1-hotspots.md](../docs/engineerin
 
 #### Parity
 
-`galera/tools/parity_ab.py` compares whole JSON responses. Scope and caveats are in [docs/RESULTS.md](../docs/RESULTS.md#parity), Parity.
+`galera/tools/parity_ab.py` compares whole JSON responses. Scope and caveats are in [docs/RESULTS.md](../docs/RESULTS.md#parity).
 
 | Comparison | Scope | Result |
 |---|---|---|
@@ -217,38 +209,26 @@ This is a sample of calls, not an exhaustive guarantee. Resume and NextUp were e
 
 #### Shared mode: coherence and load
 
-Method: 2 Jellyfins on a 3-node Galera cluster, 9 users, 20% writes, 30 s per cell ([RESULTS.md](../docs/RESULTS.md#one-store-versus-a-redis-response-cache-tier), One store versus a Redis tier; the load driver is not in this repository). Both Jellyfins share one host's 12 cores, so the cells understate a real two-host deployment.
+2 Jellyfins on a 3-node Galera cluster, 9 users, 20% writes, 30 s per cell; the full tables are under [one store versus a Redis tier](../docs/RESULTS.md#one-store-versus-a-redis-response-cache-tier) and the auth drill under [failure drills](../docs/RESULTS.md#failure-drills). The load driver is not in this repository. Both Jellyfins share one host's 12 cores, so these cells understate a real two-host deployment.
 
-| Measurement | Result | Clients | Source |
-|---|---|---|---|
-| Write on node A visible on node B, `JELLYFIN_SHARED_DB=1` | First poll, 8 of 8 trials, about 40 ms including the poll. The test did not record its poll interval; the code default is 250 ms (`JELLYFIN_SHARED_INVALIDATION_POLL_MS`, patch 15) | n/a | [RESULTS.md](../docs/RESULTS.md#one-store-versus-a-redis-response-cache-tier), One store versus a Redis tier |
-| Same, default per-node caches | Still stale after 65 s | n/a | same |
-| Throughput, `JELLYFIN_SHARED_DB=1` on Galera | 90.7 / 112.0 req/s | 8 / 32 | same |
-| Throughput, default per-node caches (incoherent) | 81.2 / 104.7 req/s | 8 / 32 | same |
-| Throughput, `JELLYFIN_SHARED_DB=1` with the item cache removed | 27.5 / 35.6 req/s | 8 / 32 | same |
-| Throughput, Redis response-cache tier | 75.8 / 53.3 req/s | 8 / 32 | same |
-| Auth drill (`galera/lab/auth_drill.py`) | Token issued on node B accepted on node C 150 ms later; refused on both right after logout on B; a stock node answers 401 to a token issued elsewhere | n/a | [RESULTS.md](../docs/RESULTS.md#failure-drills), Failure drills |
+| Measurement | Result | Clients |
+|---|---|---|
+| Write on node A visible on node B, `JELLYFIN_SHARED_DB=1` | First poll, 8 of 8 trials, about 40 ms including the poll. The test did not record its poll interval; the code default is 250 ms (`JELLYFIN_SHARED_INVALIDATION_POLL_MS`, patch 15) | n/a |
+| Same, default per-node caches | Still stale after 65 s | n/a |
+| Throughput, `JELLYFIN_SHARED_DB=1` on Galera | 90.7 / 112.0 req/s | 8 / 32 |
+| Throughput, default per-node caches (incoherent) | 81.2 / 104.7 req/s | 8 / 32 |
+| Throughput, `JELLYFIN_SHARED_DB=1` with the item cache removed | 27.5 / 35.6 req/s | 8 / 32 |
+| Throughput, Redis response-cache tier | 75.8 / 53.3 req/s | 8 / 32 |
+| Auth drill (`galera/lab/auth_drill.py`) | Token issued on node B accepted on node C 150 ms later; refused on both right after logout on B; a stock node answers 401 to a token issued elsewhere | n/a |
 
 ## Limitations
 
 - The patch targets Jellyfin tag `v12.1` only; a new Jellyfin release needs a rebase of the patch and the series.
 - Per-node state stays per node (see [Shared-database mode](#shared-database-mode)). Client-to-node affinity is only partly addressed by patch 16.
-- At 1 client SQLite is faster than Galera (44.8 vs 27.6 req/s, patched; [RESULTS.md](../docs/RESULTS.md#concurrent-load), Concurrent load); the shared cluster is faster under load.
+- At 1 client SQLite is faster than Galera (44.8 vs 27.6 req/s, patched; [concurrent load](../docs/RESULTS.md#concurrent-load)); the shared cluster is faster under load.
 - The perf patch and patches 07 and 08 change plugin-facing interfaces (see [Interface changes for plugin authors](#interface-changes-for-plugin-authors)).
-- Dolby Vision conversion needs the transcode pool in the ffmpeg path.
+- Dolby Vision conversion needs the [transcode pool](../transcode/README.md) in the ffmpeg path.
 - Statement counts for patch 08 (3N -> 3) come from unit tests; a live-lab count is listed as a follow-up in the engineering log.
-
-## Related docs
-
-- [Bug hunt engineering log](../docs/engineering/bughunt.md)
-- [Hotspot analysis](../docs/engineering/jellyfin-n1-hotspots.md)
-- [Results](../docs/RESULTS.md)
-- [Configuration reference](../docs/configuration.md)
-- [Operations](../docs/operations.md)
-- [Dolby Vision 7 -> 8.1](../docs/dolby-vision.md)
-- [Architecture](../docs/architecture.md)
-- [Galera provider](../galera/README.md)
-- [Transcode pool](../transcode/README.md)
 
 ## License
 
