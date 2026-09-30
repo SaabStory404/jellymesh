@@ -28,7 +28,7 @@ A qualifier such as "opt-in, off by default" or "partly implemented" can follow 
 | Shared transcode directory (`JELLYMESH_SHARED_TRANSCODE_DIR=1`) | Implemented, opt-in, off by default, Lab-verified | [transcode/docs/SHARED-TRANSCODE.md](../transcode/docs/SHARED-TRANSCODE.md); lab proof of 3 sessions across pod delete and `kill -9` (lab, one drill) in [RESULTS.md](RESULTS.md). |
 | Transcode pool core (`tcpool-shim`, `tcpool-agent`, `tcpool-sync`, `tcpool-ir`, `tcpool-proto`) | Implemented, Lab-verified | [transcode/README.md](../transcode/README.md); CI in `.github/workflows/transcode.yml`. |
 | Dolby Vision 7 to 8.1 live conversion | Production (2026-09-29), Implemented, opt-in, off by default | Maintainer report, 2026-09-29: deployed in production and plays as Dolby Vision on the Android TV app on an NVIDIA SHIELD, tested repeatedly. See [dolby-vision.md](dolby-vision.md). |
-| TrueHD to EAC3 5.1 for the Android TV app | Implemented, Lab-verified (2026-09-29); Production as part of the Dolby Vision path (2026-09-29) | Patches 18 and 19 in [engineering/bughunt.md](engineering/bughunt.md). The maintainer report covers the Dolby Vision path playing on the TV; row 19 there records it as working on the TV. AVR DD+ passthrough: Not measured on-device; tracked on issue #14. |
+| TrueHD to EAC3 5.1 for the Android TV app | Implemented, Lab-verified (2026-09-29); Production as part of the Dolby Vision path (2026-09-29) | Patches 18 and 19 in [engineering/bughunt.md](engineering/bughunt.md). The maintainer report covers the Dolby Vision path playing on the TV; row 19 there records it as working on the TV. Dolby Digital Plus passthrough from the SHIELD to the AV receiver works (maintainer report, 2026-09-30). |
 | Traefik active/passive failover | Lab-verified | Direct-play drill (curl, n=1) in [engineering/direct-play-failover.md](engineering/direct-play-failover.md); route description in [operations.md](operations.md#traefik-activepassive-failover). No Traefik or Kubernetes manifests for the route are in this repository. |
 | Transcode pool plugin and sync `/status` (read-only dashboard) | Implemented | `transcode/plugin/Api/TcPoolController.cs` (`GET /TcPool/Status`) and `transcode/crates/sync/src/status.rs`. The plan still lists both as unchecked; see the [transcode plan](engineering/transcode-plan.md). |
 | Server-side Dolby Vision FEL reconstruction | Not prioritized (open question) | Residual-energy measurement on 4 titles in [engineering/gh15-fel-visibility.md](engineering/gh15-fel-visibility.md): mixed results (2 of 4 up, 2 of 4 flat or down), the requested vs-nlq and VMAF/PSNR measurement not run, issue #15 left open. See [Known gaps](#known-gaps-and-limitations). |
@@ -66,7 +66,7 @@ Each item states why it exists, what it changes, and what "done" means. No item 
 
 **Status:** Planned.
 
-**Why.** Diagnosing a stalled or restarted playback currently means correlating Traefik, Jellyfin, ffmpeg, and GPU logs by hand. Stock Jellyfin writes text logs and can expose a generic ASP.NET `/metrics` endpoint. The ffmpeg per-job logs hold speed, fps, and pauses, but they sit on disk uncorrelated with the rest. Not documented yet: a source file that records the 2026-09-27 investigations behind this item.
+**Why.** Diagnosing a stalled or restarted playback currently means correlating Traefik, Jellyfin, ffmpeg, and GPU logs by hand. Stock Jellyfin writes text logs and can expose a generic ASP.NET `/metrics` endpoint. The ffmpeg per-job logs hold speed, fps, and pauses, but they sit on disk uncorrelated with the rest. The 2026-09-27 investigations behind this item are not recorded in this repository.
 
 OpenTelemetry (OTel, see the [glossary](architecture.md#glossary)) auto-instrumentation gives request latency, errors, and database query traces, and it can feed the existing Coroot, VictoriaMetrics, and VictoriaLogs stack. It has no notion of a playback, so the value here is domain telemetry.
 
@@ -90,7 +90,7 @@ Each session closes with a scorecard: time to first frame, stall time, restarts,
 
 **Why.** The high-availability ([HA](architecture.md#glossary)) route is a Traefik failover service with a primary and a fallback. The transcode plan states that it sends a failed-over viewer back to the primary as soon as the primary is healthy again, so one failover costs two ffmpeg restarts.
 
-Measured on 2026-09-27 (n=1; [transcode plan](engineering/transcode-plan.md), sticky-failover item): a Safari [remux](architecture.md#glossary) (video copy, DTS to AAC) restarted at 49:12 on the fallback and again at 52:48 on the primary, and the viewer reported audio drifting out of sync. The plan calls that route "prod's Traefik failover route"; the maintainer's production route configuration is Not documented yet (see [operations.md](operations.md#traefik-activepassive-failover)). A possible contributing factor is that a remux restart resumes video on a source [keyframe](architecture.md#glossary) and audio at the exact second; the plan notes "remux restarts can drift A/V", and it is not established for that report.
+Measured on 2026-09-27 (n=1; [transcode plan](engineering/transcode-plan.md), sticky-failover item): a Safari [remux](architecture.md#glossary) (video copy, DTS to AAC) restarted at 49:12 on the fallback and again at 52:48 on the primary, and the viewer reported audio drifting out of sync. The plan calls that route "prod's Traefik failover route"; an example of that route is in [deploy/examples/traefik-failover.yaml](../deploy/examples/traefik-failover.yaml). A possible contributing factor is that a remux restart resumes video on a source [keyframe](architecture.md#glossary) and audio at the exact second; the plan notes "remux restarts can drift A/V", and it is not established for that report.
 
 **What.** New sessions prefer the primary. A session that failed over stays where it is until it ends, using a sticky cookie on the route. Prototype and drill in the lab first, including an audio and video start-[PTS](architecture.md#glossary) check after every forced restart.
 
@@ -168,7 +168,7 @@ These items are open for help. Read [../CONTRIBUTING.md](../CONTRIBUTING.md) for
 | `hvcE` RPU reader | M | Start from issue #4 and `transcode/crates/agent/src/dv81.rs`. |
 | Sticky server failover | M | Prototype the cookie on the route in a lab and include the A/V start-PTS check. |
 | Known gaps | M | Ping affinity and the PIN file are code changes in the Jellyfin patch series (`jellyfin-perf/bughunt/`). |
-| Documentation | S | Items marked "Not documented yet" in [../CONTRIBUTING.md](../CONTRIBUTING.md). |
+| Documentation | S | The [open documentation gaps](../CONTRIBUTING.md#open-documentation-gaps) in CONTRIBUTING.md. |
 
 ## Related docs
 

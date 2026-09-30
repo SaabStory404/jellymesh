@@ -1,0 +1,36 @@
+# Example: RBAC for the JellyMesh Leader plugin.
+#
+# leader/LeaseLeaderService.cs: the pod's ServiceAccount needs get/create/update/patch on
+# leases (coordination.k8s.io) in its own namespace. The Lease name defaults to
+# "jellyfin-tasks" (JELLYMESH_LEASE). Namespace and ServiceAccount name are placeholders:
+# set serviceAccountName on the Jellyfin StatefulSet to match.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jellymesh-jellyfin
+  namespace: jellymesh
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jellymesh-leader
+  namespace: jellymesh
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jellymesh-leader
+  namespace: jellymesh
+subjects:
+  - kind: ServiceAccount
+    name: jellymesh-jellyfin
+    namespace: jellymesh
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: jellymesh-leader

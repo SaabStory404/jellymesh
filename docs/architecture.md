@@ -2,7 +2,7 @@
 
 JellyMesh runs several Jellyfin 12.1 servers against one shared MySQL-compatible database, so any server can answer any request. This page explains how the parts fit together, why each part exists, and what happens when a node, a database member, or a GPU worker fails.
 
-**Status:** Implemented. Only Dolby Vision 7 -> 8.1 conversion is Production (reported by the maintainer, 2026-09-29): the TV plays Dolby Vision through the Android TV app. Dolby Digital Plus passthrough to an AV receiver is not separately stated. Per-component labels are in the [component map](#component-map).
+**Status:** Implemented. Only Dolby Vision 7 -> 8.1 conversion is Production (reported by the maintainer, 2026-09-29): the TV plays Dolby Vision through the Android TV app, and the EAC3 audio passes through to an AV receiver as Dolby Digital Plus (maintainer report, 2026-09-30). Per-component labels are in the [component map](#component-map).
 
 Terms such as [Galera](#glossary) link to the [glossary](#glossary) at first use.
 
@@ -30,7 +30,7 @@ The design does not remove all per-node state. [Shared state](#shared-state) lis
 | Leader plugin | `leader` | Runs each Jellyfin scheduled task once cluster-wide using a Kubernetes [Lease](#glossary) | Implemented |
 | Transcode pool | `transcode` | Rust workspace with crates `ir`, `proto`, `agent`, `shim`, `sync`, plus a C# `plugin` dashboard | Implemented. Dolby Vision path: Production, 2026-09-29. Shared transcode directory: Lab-verified, off by default |
 | Container image | `image` | Layered Containerfiles (`Containerfile.jm5` to `.jm8.4`) that ship the patched Jellyfin, plugins, shim, and `jellyfin-dbmigrate` | Implemented |
-| Traefik failover route | not in repo | [TraefikService](#glossary) in failover mode in front of two replicas; documented only from lab evidence | Lab-verified. Manifests are not in the repository |
+| Traefik failover route | [`deploy/examples/traefik-failover.yaml`](../deploy/examples/traefik-failover.yaml) | [TraefikService](#glossary) in failover mode in front of two replicas; documented only from lab evidence | Lab-verified. Example manifest ships in `deploy/examples/` |
 
 The Traefik route is described from measurements in [the direct-play failover report](engineering/direct-play-failover.md). The names in that report (`jm-failover`, `jm-fast-dial`) come from prose; no manifest exists in this repository.
 
@@ -56,7 +56,7 @@ flowchart LR
     SY -.-> P
 ```
 
-Each replica runs the shim in place of ffmpeg and the leader plugin in-process. Each shim resolves the headless Kubernetes Service itself and can use any agent, so a draining or dead agent leaves DNS. The fallback route is not in this repository; it is described only from lab measurements.
+Each replica runs the shim in place of ffmpeg and the leader plugin in-process. Each shim resolves the headless Kubernetes Service itself and can use any agent, so a draining or dead agent leaves DNS. An example fallback route is in [deploy/examples/traefik-failover.yaml](../deploy/examples/traefik-failover.yaml); [operations.md](operations.md#traefik-activepassive-failover) describes the lab drill behind it.
 
 ## Shared state
 
@@ -127,7 +127,7 @@ The original recommendation in `galera/README.md` is single-writer operation: ev
 | Multi-writer, stock Jellyfin | 200 concurrent writes to one UserData row from different nodes gave 69 HTTP 500 responses (35%, `Deadlock found`); the same test on one node gave none | `galera/README.md`; lab drill |
 | Multi-writer, patched Jellyfin | 200 of 200 writes succeeded; 120.2 req/s at 32 clients with 0 errors | `jellyfin-perf/README.md`, `docs/RESULTS.md`; single workstation, lab |
 
-`UserDataManager.SaveUserData` retries with a fresh context and jittered backoff, 6 attempts, so multi-writer depends on the patched build. Retrying every Jellyfin transaction is not possible in the provider, because the EF Core retrying execution strategy rejects Jellyfin's `BeginTransaction`. Which mode the maintainer's cluster runs: Not documented yet.
+`UserDataManager.SaveUserData` retries with a fresh context and jittered backoff, 6 attempts, so multi-writer depends on the patched build. Retrying every Jellyfin transaction is not possible in the provider, because the EF Core retrying execution strategy rejects Jellyfin's `BeginTransaction`. The mode the maintainer's cluster runs is deployment-specific and not recorded here.
 
 ## Scheduled tasks
 
@@ -160,7 +160,7 @@ Stock Jellyfin runs ffmpeg as a child process on the node that serves the viewer
 | `tcpool-sync` | Intersects worker outputs and sets Jellyfin's HEVC/AV1 offers to the lowest common denominator across workers (AV1 is not offered while the Tesla P4 is in the pool); serves `/metrics` and `/status` |
 | `tcpool-ir` | Shared library that parses, validates, and renders ffmpeg command lines |
 
-Discovery uses the headless Service `tcpool-agents` (port 9901 over gRPC with [mTLS](#glossary)). Each DNS record is one worker; `TC_WORKERS_DNS` on the shim points at it, and `TC_WORKERS` adds a static fallback. `publishNotReadyAddresses` is deliberately unset so a draining agent drops out of DNS. Port 9902 serves plaintext gRPC health for kubelet probes. `transcode/README.md` also lists 9903 (agent metrics) and 9904 (sync metrics), while `transcode/deploy/CONTRACT.md` marks metrics as reserved; the contract is stale on this point and tracked as a doc TODO. The [shim](#glossary) is inert when neither `TC_WORKERS_DNS` nor `TC_WORKERS` is set.
+Discovery uses the headless Service `tcpool-agents` (port 9901 over gRPC with [mTLS](#glossary)). Each DNS record is one worker; `TC_WORKERS_DNS` on the shim points at it, and `TC_WORKERS` adds a static fallback. `publishNotReadyAddresses` is deliberately unset so a draining agent drops out of DNS. Port 9902 serves plaintext gRPC health for kubelet probes. The agent serves `/metrics` on 9903 and `tcpool-sync` serves `/metrics` and `/status` on 9904 when `TC_METRICS_PORT` is set. The [shim](#glossary) is inert when neither `TC_WORKERS_DNS` nor `TC_WORKERS` is set.
 
 Capacity is counted in weighted capacity units, set with `TC_CAPACITY`; the agent refuses new jobs when full. Other `TC_*` variables are in the [configuration reference](configuration.md).
 
@@ -178,7 +178,7 @@ Other coordination mechanisms:
 - **Seek affinity.** A session is pinned to its first worker through `<md5>.worker` (`TC_AFFINITY`, on by default; `TC_AFFINITY_TTL_SECS`, default 6 h).
 - **Shared transcode directory.** With `JELLYMESH_SHARED_TRANSCODE_DIR=1` (patches 03 and 16), replicas share one transcode directory. Jellyfin passes `JELLYMESH_KEEPALIVE` to the shim; the agent detaches a job when its shim dies (`TC_DETACH`), heartbeats the lease, and lets a replica take over after a seek, waiting up to 8 s. Status: Implemented, off by default, Lab-verified. Lab proof (three drills, 3 sessions each, through the Traefik failover route in the lab cluster): pod delete of the serving replica, 0 failed of 162 segments; `kill -9` of the serving Jellyfin, 0 of 162; restart of the other replica, 0 of 223. Source: `transcode/docs/SHARED-TRANSCODE.md`. Two Jellyfins must not share one `TranscodingTempPath` root, and replicas need distinct `HOSTNAME`.
 
-Dolby Vision 7 -> 8.1 conversion also runs in the agent; see [Dolby Vision conversion](dolby-vision.md). It is Production (maintainer report, 2026-09-29): the TV plays Dolby Vision. DD+ passthrough to an AV receiver is not separately stated.
+Dolby Vision 7 -> 8.1 conversion also runs in the agent; see [Dolby Vision conversion](dolby-vision.md). It is Production (maintainer report, 2026-09-29): the TV plays Dolby Vision. Dolby Digital Plus passthrough to an AV receiver works (maintainer report, 2026-09-30).
 
 ### Worker failure semantics
 
@@ -234,8 +234,8 @@ Not measured:
 - **Transport.** Shim-to-agent traffic uses gRPC over mTLS with a dedicated pool CA created by cert-manager (`transcode/deploy/k8s/10-tls.yaml`). Client certificates are required, and `TC_TLS_REQUIRED=1` turns missing certificates into a hard exit with code 2. The agent drains itself when its certificate files change.
 - **Command allowlist.** Agents accept only ffmpeg commands whose inputs sit under `TC_INPUT_ROOTS`, reads under `TC_READ_ROOTS`, and outputs under `TC_OUTPUT_ROOT`. In the protocol suite, 134 real commands pass and 11 attacks are rejected (case 13; sources `docs/RESULTS.md` and `docs/engineering/transcode-plan.md`). The suite has 21 cases per `.github/workflows/transcode.yml`; `transcode/README.md` says the earlier count was 14, and the workflow is the newer source.
 - **Database secret.** Set `JELLYMESH_DB_PASSWORD` from a Kubernetes Secret instead of writing the password into `database.xml`, which appears in config backups.
-- **Unauthenticated stream endpoints in stock Jellyfin.** `/Videos/{id}/stream` and `/Audio/{id}/stream` answered range requests without a token in the failover lab (Measured). From code reading, `VideosController` has no `[Authorize]` attribute and there is no global authorization filter. An authenticated Range retry is Not measured. Mitigation: Not documented yet. Source: `docs/engineering/direct-play-failover.md`.
-- **Logging.** Measured in the lab: Traefik access logs recorded the `api_key` query parameter in cleartext for two services (`docs/engineering/bughunt.md`). Mitigation: Not documented yet.
+- **Unauthenticated stream endpoints in stock Jellyfin.** `/Videos/{id}/stream` and `/Audio/{id}/stream` answered range requests without a token in the failover lab (Measured). From code reading, `VideosController` has no `[Authorize]` attribute and there is no global authorization filter. An authenticated Range retry is Not measured. The example Traefik route does not restrict these paths; restricting them is up to the operator. Source: `docs/engineering/direct-play-failover.md`.
+- **Logging.** Measured in the lab: Traefik access logs recorded the `api_key` query parameter in cleartext for two services (`docs/engineering/bughunt.md`). Mitigation: restrict access to those logs, or move the services to header authentication ([SECURITY.md](../SECURITY.md)).
 
 See [SECURITY.md](../SECURITY.md) for reporting and further notes.
 
@@ -255,6 +255,9 @@ See [SECURITY.md](../SECURITY.md) for reporting and further notes.
 | Remux | Repackaging streams into a new container without re-encoding video |
 | Range retry | A client reissues a request with `Range: bytes=N-` after a disconnect to resume |
 | HLS | HTTP Live Streaming: video served as a playlist of short segment files |
+| Trickplay | Jellyfin's seek-preview thumbnails, extracted from the video by ffmpeg; the pool runs these jobs in its `batch` class |
+| Seek affinity | The shim sends a seek (same output prefix, new `-start_number`) to the worker already serving that stream, instead of the least-loaded one |
+| Headless Service | A Kubernetes Service with `clusterIP: None`; its DNS name returns one record per ready pod, which the shim treats as one worker each |
 | PDB | PodDisruptionBudget: a Kubernetes limit on how many pods of a class a voluntary eviction may remove at once |
 | RWX | ReadWriteMany: a Kubernetes volume access mode that lets pods on several nodes mount one volume |
 | initContainer | A pod container that runs to completion before the main containers start |

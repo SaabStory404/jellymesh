@@ -2,7 +2,7 @@
 
 The `image/` directory holds the Containerfiles that build the JellyMesh Jellyfin image, `ghcr.io/saabstory404/jellymesh-jellyfin`, as a chain of tags on top of hotio's Jellyfin 12.1. Each tag adds patches, the Galera provider, or the transcode pool shim.
 
-**Status:** Implemented. No workflow builds this image; you build it with podman. Which tag the maintainer's cluster runs is Not documented yet.
+**Status:** Implemented. No workflow builds this image; you build it with podman. The tag the maintainer's cluster runs is deployment-specific and not recorded here.
 
 ## What it does
 
@@ -70,7 +70,7 @@ podman build -f image/Containerfile.jm8.4 \
 | `Containerfile.jm5` | The static musl binaries only. The header uses `transcode/target/x86_64-unknown-linux-musl/release` as the context. |
 | `Containerfile` (jm3-era base) | Cannot be built from the repo; see Limitations. |
 
-The exact staging layout beyond these lists is Not documented yet (see the doc TODO list in [CONTRIBUTING](../CONTRIBUTING.md#doc-todo-list)).
+The staging directory is assembled per deployment and not shipped here; the lists above and each Containerfile's header comment state what it must hold.
 
 ### Pool images
 

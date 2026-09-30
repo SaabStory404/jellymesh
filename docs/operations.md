@@ -2,7 +2,7 @@
 
 This guide shows how to deploy and run JellyMesh on Kubernetes (k3s) or podman. It covers images, database, migration, the leader plugin, failover, the transcode pool, upgrades, and monitoring.
 
-**Status:** Implemented. Dolby Vision 7 -> 8.1 is deployed in production and plays as Dolby Vision on the Android TV app (user-reported by the maintainer, 2026-09-29). AV receiver passthrough of Dolby Digital Plus was not stated; it is tracked on jellymesh issue #14 and in [bughunt](engineering/bughunt.md) (patch 19 row).
+**Status:** Implemented. Dolby Vision 7 -> 8.1 is deployed in production and plays as Dolby Vision on the Android TV app (user-reported by the maintainer, 2026-09-29). Dolby Digital Plus passthrough of the EAC3 track from the SHIELD to an AV receiver works (maintainer report, 2026-09-30; patch 19 row in [bughunt](engineering/bughunt.md)).
 
 Terms such as Galera, Lease, QSV, NVENC, mTLS, and fMP4 are defined in the [glossary](architecture.md#glossary).
 
@@ -31,9 +31,9 @@ You provide the following. This guide gives the parameters that the code and the
 
 **Status:** Implemented. No workflow builds the Jellyfin image; you build it with podman.
 
-The image is `ghcr.io/saabstory404/jellymesh-jellyfin`. The newest tag in the repo is `12.1-jm8.4`, and it is the tag the Dolby Vision docs refer to. Which tag production runs is Not documented yet.
+The image is `ghcr.io/saabstory404/jellymesh-jellyfin`. The newest tag in the repo is `12.1-jm8.4`, and it is the tag the Dolby Vision docs refer to. The tag production runs is deployment-specific and not recorded here.
 
-The tag lineage, the per-Containerfile build context, and the image internals are in [image](../image/README.md). The context is not in the repo, so the exact staging layout is Not documented yet (see the doc TODO list in [CONTRIBUTING](../CONTRIBUTING.md#doc-todo-list)). The newest tags need less than the older ones:
+The tag lineage, the per-Containerfile build context, and the image internals are in [image](../image/README.md). The staging context is assembled per deployment and not shipped here; the header comment of each Containerfile lists what it expects. The newest tags need less than the older ones:
 
 | Containerfile | Context holds |
 | --- | --- |
@@ -177,9 +177,9 @@ The leader plugin makes scheduled tasks run once across all replicas by electing
 
 ## Traefik active/passive failover
 
-**Status:** Lab-verified shape. The route is not in the repo, and the maintainer's production configuration is Not documented yet. The measurements below are single lab runs (n=1) from [the direct-play failover log](engineering/direct-play-failover.md) unless a row names another source.
+**Status:** Lab-verified shape. An example route with the lab values is in [deploy/examples/traefik-failover.yaml](../deploy/examples/traefik-failover.yaml); adjust namespace, host and TLS for your cluster. The measurements below are single lab runs (n=1) from [the direct-play failover log](engineering/direct-play-failover.md) unless a row names another source.
 
-The lab route uses these values, all from the header of that log. The route file itself is Not documented yet (see the doc TODO list in [CONTRIBUTING](../CONTRIBUTING.md#doc-todo-list)). The names `jm-jf-0` and `jm-jf-1` are example names from the lab.
+The lab route uses these values, all from the header of that log. The names `jm-jf-0` and `jm-jf-1` are example names from the lab.
 
 | Setting | Lab value |
 | --- | --- |
@@ -215,7 +215,7 @@ Intro Skipper, Playback Reporting, and Kodi Sync Queue do not work on the fallba
 
 ## Transcode pool
 
-**Status:** Implemented. Dolby Vision 7 -> 8.1 is in production (user-reported, 2026-09-29); other deployment details of the maintainer's cluster are Not documented yet.
+**Status:** Implemented. Dolby Vision 7 -> 8.1 is in production (user-reported, 2026-09-29); other deployment details of the maintainer's cluster are deployment-specific and not recorded here.
 
 The pool replaces Jellyfin's ffmpeg with a shim that sends HLS transcodes to per-GPU agents over gRPC with mTLS. Component detail is in [transcode](../transcode/README.md).
 
@@ -323,7 +323,7 @@ Limits, all from `SHARED-TRANSCODE.md`:
 
 ### Known gaps
 
-The shim's "refuse a major ffmpeg mismatch" check is not implemented, so the agent image's base digest pin is the only guard between the agent's ffmpeg and Jellyfin's (`transcode/deploy/Containerfile.agent`). Two files that the manifests refer to, `deploy/k8s/README.md` and `k8s/jellyfin-patch.md`, are not in the repo. Both are on the doc TODO list in [CONTRIBUTING](../CONTRIBUTING.md#doc-todo-list).
+The shim's "refuse a major ffmpeg mismatch" check is not implemented, so the agent image's base digest pin is the only guard between the agent's ffmpeg and Jellyfin's (`transcode/deploy/Containerfile.agent`). The manifests refer to `deploy/k8s/README.md` and `k8s/jellyfin-patch.md` for the Jellyfin-side configuration; that configuration is deployment-specific and not shipped here, and `transcode/deploy/CONTRACT.md` states what the Jellyfin pod must provide.
 
 ## Enable Dolby Vision conversion
 
@@ -366,7 +366,7 @@ Agents and `tcpool-sync` serve Prometheus text when `TC_METRICS_PORT` is set. Th
 | Agent | `TC_METRICS_PORT` | 9903 | `transcode/deploy/k8s/20-agents.yaml` |
 | `tcpool-sync` | `TC_METRICS_PORT` | 9904 (expected) | Service `tcpool-sync-metrics` in `30-service.yaml`, `60-servicemonitor.yaml`, and the comments in `alerts.yaml` |
 
-No manifest sets `TC_METRICS_PORT` for sync. Sync runs as a sidecar of the Jellyfin pod, outside `transcode/deploy/k8s/`, so 9904 is the port the Service, ServiceMonitor, and alerts expect. The Jellyfin-side sidecar configuration is Not documented yet, because `k8s/jellyfin-patch.md` is missing. Sync also serves a `/status` JSON view on the same port.
+No manifest sets `TC_METRICS_PORT` for sync. Sync runs as a sidecar of the Jellyfin pod, outside `transcode/deploy/k8s/`, so 9904 is the port the Service, ServiceMonitor, and alerts expect. The Jellyfin-side sidecar configuration is deployment-specific and not shipped here. To match `30-service.yaml`, the sync container needs `TC_METRICS_PORT=9904`, a container port named `sync-metrics`, and the pod label `app.kubernetes.io/component: tcpool-sync`. Sync also serves a `/status` JSON view on the same port.
 
 ### Agent metrics
 
@@ -431,4 +431,4 @@ The rules are in `transcode/deploy/alerts.yaml`. Conditions and durations are co
 - [Galera component](../galera/README.md): provider, migration tool, lab, and drills.
 - [Perf and bughunt patches](../jellyfin-perf/README.md): the patch series.
 - [Transcode pool](../transcode/README.md): shim, agent, and sync.
-- [Contributing](../CONTRIBUTING.md): build steps and the doc TODO list.
+- [Contributing](../CONTRIBUTING.md): build steps and the open documentation gaps.

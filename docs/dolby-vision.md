@@ -4,17 +4,18 @@ JellyMesh converts Dolby Vision profile 7 (dual-layer) sources to single-layer p
 
 **Status:** Production (maintainer report, 2026-09-29), opt-in, off by default.
 
-**Evidence.** The maintainer reported on 2026-09-29 that the feature is deployed in production and plays as Dolby Vision on the Android TV app on an NVIDIA SHIELD, tested repeatedly. The repository holds no measurement of that on-device result. It holds only the lab runs in [Measurements](#measurements). AV receiver passthrough of Dolby Digital Plus: Not measured.
+**Evidence.** The maintainer reported on 2026-09-29 that the feature is deployed in production and plays as Dolby Vision on the Android TV app on an NVIDIA SHIELD, tested repeatedly. On 2026-09-30 the maintainer reported that the EAC3 5.1 (Dolby Digital Plus) track from the TrueHD to EAC3 transcode passes through from the SHIELD to the AV receiver. Both on-device results are maintainer reports; the repository's own measurements are the lab runs in [Measurements](#measurements).
 
 | Part | Status |
 |---|---|
 | Decision in Jellyfin (bughunt patches 13, 17, 18, 19) | Production, opt-in, off by default |
 | Conversion in the transcode pool agent (`dv81.rs`, `dv81_ts.rs`, `dv81_plan.rs`, `job.rs`) | Production, opt-in, off by default |
 | Playback as Dolby Vision on the SHIELD Android TV app | Production (maintainer report, 2026-09-29) |
+| Dolby Digital Plus (EAC3 5.1) passthrough from the SHIELD to an AV receiver | Production (maintainer report, 2026-09-30) |
 | Sources whose RPU sits only in a Matroska Block Addition (`hvcE`) | Planned: GitHub issue #4, see [ROADMAP.md](ROADMAP.md) |
 | Direct play of profile 7 files | Not converted, by design (HLS only) |
-| DTS and DTS-HD audio in fMP4 | Not measured; see the [doc TODO list](../CONTRIBUTING.md#doc-todo-list) |
-| Clients other than the Android TV app | Not measured; see the [doc TODO list](../CONTRIBUTING.md#doc-todo-list) |
+| DTS and DTS-HD audio in fMP4 | Not measured: no DTS or DTS-HD title has been played through a converting job |
+| Clients other than the Android TV app | Not measured: the Android TV app is the only client played against the conversion |
 
 ## Background
 
@@ -64,7 +65,7 @@ The Android TV app (jellyfin-androidtv v0.19.10, media3 1.8.0) cannot demux True
 |---|---|
 | TrueHD or MLP, 6 or more channels | EAC3 5.1 when the client lists `eac3` and ffmpeg has the `eac3` encoder; otherwise upstream's pick (AAC 5.1 for the Android TV list). Bitrate is capped by the request's `AudioBitrate` (640 kb/s in the lab run) |
 | AC3 or EAC3 | Copied, no re-encode |
-| DTS or DTS-HD | Left in the client's list as-is; Not measured |
+| DTS or DTS-HD | Left in the client's list as-is; playback not measured |
 
 Patch 18 removes `truehd` and `mlp` from the codec list and moves `eac3` to the front when the client offers it; if removal empties the list, it falls back to `aac`. Patch 19 fixes a defect where the EAC3 preference had no effect: `eac3` was missing from the `EncoderValidator` encoder list. The addition is detection only, and `CanEncodeToAudioCodec("eac3")` stays false, so other callers are unchanged. The patch 19 rule also requires a converting job and `(Channels ?? 6) >= 6`. Patch 18 also widens `audioCodec` list validation from 40 to 128 characters on seven `DynamicHlsController` parameters. Media3's EAC3-in-fMP4 support is From code reading (media3 1.8.0 source).
 
@@ -140,7 +141,13 @@ Unset `JELLYMESH_DOVI_P7_TO_81` and restart Jellyfin. With the flag off, behavio
 
 1. Play a profile 7 title from a client that meets step 6 above.
 2. Read the metric. The agent exposes `tcpool_dv81_total{outcome="converted"}` and the three fallback outcomes on its metrics port (`TC_METRICS_PORT`, see [configuration.md](configuration.md)). A session that converts increments `converted`.
-3. Fetch the session's `init.mp4` and run `ffprobe` on it. In the lab runs it shows `dv_profile=8`, `bl_signal_compatibility_id=1`, and `el_present_flag=0`; a plain remux of the same source shows profile 7, EL present, compatibility id 6 (field names from [engineering/transcode-plan.md](engineering/transcode-plan.md) and the `descriptor_bytes` test in `dv81_ts.rs`). The exact `ffprobe` invocation is Not documented yet; see the [doc TODO list](../CONTRIBUTING.md#doc-todo-list).
+3. Fetch the session's `init.mp4` and run `ffprobe` on it. This is the same call the end-to-end test `transcode/crates/agent/src/dv81_it.rs` makes on its converted output:
+
+   ```bash
+   ffprobe -hide_banner init.mp4
+   ```
+
+   A converted stream prints a `DOVI configuration record` with `profile: 8`, `el flag: 0`, and `compatibility id: 1` (the strings the test asserts). A plain remux of the same source shows profile 7, EL present, compatibility id 6 (`descriptor_bytes` test in `dv81_ts.rs`). With a TrueHD source and a client that lists `eac3`, the audio stream is `eac3` with an `ec-3` sample entry, 6 channels (patch 19 lab run in [engineering/bughunt.md](engineering/bughunt.md)).
 4. Read the session's `master.m3u8`. It lists `SUPPLEMENTAL-CODECS="dvh1.08.<level>/db1p"`. A converting job with EAC3 audio also lists `ec-3` in `CODECS` (lab example: `CODECS="hvc1.2.4.L153.B0,ec-3"`, `SUPPLEMENTAL-CODECS="dvh1.08.06/db1p"`, from [engineering/bughunt.md](engineering/bughunt.md)).
 
 ## Measurements

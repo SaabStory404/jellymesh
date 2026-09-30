@@ -40,7 +40,8 @@ From code reading, the `Containerfile.jm8.2`, `jm8.3`, and `jm8.4` files each bu
 
 ### Changed
 
-- Dolby Vision 7 -> 8.1 conversion is Production (2026-09-29, reported by the maintainer): it plays as Dolby Vision in the Android TV app on an NVIDIA SHIELD, tested repeatedly. The deployed image tag is not recorded in the repository. AVR Dolby Digital Plus passthrough was not separately stated and is tracked on issue #14. See [docs/dolby-vision.md](docs/dolby-vision.md).
+- Dolby Vision 7 -> 8.1 conversion is Production (2026-09-29, reported by the maintainer): it plays as Dolby Vision in the Android TV app on an NVIDIA SHIELD, tested repeatedly. The deployed image tag is deployment-specific and not recorded here. See [docs/dolby-vision.md](docs/dolby-vision.md).
+- Dolby Digital Plus passthrough is Production (2026-09-30, reported by the maintainer): the EAC3 5.1 track from the TrueHD to EAC3 transcode (patches 18 and 19) passes through from the SHIELD to the AV receiver.
 
 ### Documentation
 

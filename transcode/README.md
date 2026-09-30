@@ -5,7 +5,7 @@
 
 A shared pool of mixed GPUs that runs Jellyfin transcodes for several servers. A shim stands in for Jellyfin's ffmpeg, and one agent per GPU does the work. Terms such as shim, agent, QSV, NVENC and mTLS are defined in the [glossary](../docs/architecture.md#glossary).
 
-**Status:** Implemented. Production for Dolby Vision 7 to 8.1 only (opt-in; reported by the maintainer, 2026-09-29). Rollout state of the rest of the pool: Not documented yet (see the doc TODOs in [CONTRIBUTING.md](../CONTRIBUTING.md)).
+**Status:** Implemented. Production for Dolby Vision 7 to 8.1 only (opt-in; reported by the maintainer, 2026-09-29). The rollout of the rest of the pool is deployment-specific and not recorded here.
 
 Licensing: the Rust workspace is MIT per `Cargo.toml`, and there is no MIT license file in `transcode/`. The repository as a whole is GPL-2.0 ([LICENSE](../LICENSE)).
 
@@ -69,7 +69,7 @@ A direct-play stream is one long-lived HTTP connection and needs client Range re
 
 ### Dolby Vision 7 to 8.1
 
-The agent converts Dolby Vision profile 7 dual-layer sources to profile 8.1 on the fly, in `crates/agent/src/dv81.rs`. The conversion is opt-in (`JELLYMESH_DOVI_P7_TO_81=1` on Jellyfin) and off by default. Status: Production, opt-in (reported by the maintainer, 2026-09-29). AVR passthrough of the audio was not separately stated and is not claimed here.
+The agent converts Dolby Vision profile 7 dual-layer sources to profile 8.1 on the fly, in `crates/agent/src/dv81.rs`. The conversion is opt-in (`JELLYMESH_DOVI_P7_TO_81=1` on Jellyfin) and off by default. Status: Production, opt-in (reported by the maintainer, 2026-09-29). The EAC3 5.1 audio of a converting job passes through from the SHIELD to an AV receiver as Dolby Digital Plus (maintainer report, 2026-09-30).
 
 - Jellyfin marks a converting job with `-metadata:s:v:0 JELLYMESH_DOVI_P7_TO_81=1`; the pool also accepts `TC_DV81=1` as an alias ([docs/dolby-vision.md](../docs/dolby-vision.md)).
 - The agent converts only video-copy playback jobs with in-band RPU, `-copyts` and a single `-i` ([docs/dolby-vision.md](../docs/dolby-vision.md)).
@@ -159,7 +159,7 @@ The manifests are in [deploy/k8s/](deploy/k8s), ordered by numeric prefix:
 | `50-rbac.yaml` | Two ServiceAccounts. |
 | `60-servicemonitor.yaml` | Optional: its header comment says it needs Prometheus-operator CRDs and fails without them. |
 
-Alert rules are in [deploy/alerts.yaml](deploy/alerts.yaml). The note in `CONTRACT.md` that the manifests are "not applied" is dated 2026-09-27; its current status is Not documented yet.
+Alert rules are in [deploy/alerts.yaml](deploy/alerts.yaml). The note in `CONTRACT.md` that the manifests are "not applied" is dated 2026-09-27; the Dolby Vision path has run in production since 2026-09-29 (maintainer report).
 
 ## Test
 
@@ -170,7 +170,7 @@ B=target/x86_64-unknown-linux-musl/release
 AGENT=$B/tcpool-agent SHIM=$B/tcpool-shim bash spike/proto_test.sh
 ```
 
-The workflow comment in `transcode.yml` says the suite has 21 cases: "1-16, 17a, 17b, 18, 19, 20 (20 itself run in four steps, 20a-20d), 21a-21h shared dir" (From code reading). The listed labels add up to more than 21, and the count is not reconciled here; the assertions in `spike/proto_test.sh` are the ground truth.
+The suite has 21 numbered cases, 1 to 21. Cases 17, 20, and 21 run in sub-steps (17a-17c; 20 plus 20a-20e; 21a-21h), so `spike/proto_test.sh` prints 35 `==` section headers. The workflow comment in `transcode.yml` lists an older subset of those labels; the assertions in `spike/proto_test.sh` and the workflow's `grep` checks are the ground truth.
 
 | Workflow | Trigger | What it does |
 |---|---|---|
@@ -205,7 +205,7 @@ Goldens (`corpus/goldens/`) are `spike-translate.json` and `render-calibrated.js
 | ffmpeg major-version mismatch refusal | Not implemented; `deploy/CONTRACT.md` says so. | n/a | Planned ([docs/ROADMAP.md](../docs/ROADMAP.md)) | [deploy/CONTRACT.md](deploy/CONTRACT.md) |
 | Other planned items | Online cost model, quality-aware placement, hedged start, probe cache, plugin drain controls; freeze, partition and node-drain drills. | n/a | Planned ([docs/ROADMAP.md](../docs/ROADMAP.md)) | [transcode-plan](../docs/engineering/transcode-plan.md) |
 
-Stale statements in `deploy/CONTRACT.md` are tracked as doc TODOs in [CONTRIBUTING.md](../CONTRIBUTING.md).
+[deploy/CONTRACT.md](deploy/CONTRACT.md) is the deployment contract between the pool and the Jellyfin pod.
 
 ## Related docs
 

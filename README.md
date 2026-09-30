@@ -12,7 +12,7 @@ Run several Jellyfin 12.1 servers on one shared MySQL/Galera database, with a GP
 
 - You run Jellyfin and want more than one server behind one address, sharing one database.
 - The shared database is MySQL 8.4 or Percona XtraDB Cluster; the Leader plugin and the Traefik failover route assume Kubernetes (k3s in the maintainer's setup).
-- The transcode pool needs GPU nodes (Intel QSV or NVIDIA NVENC) or CPU workers. The Traefik failover manifests are not in this repository.
+- The transcode pool needs GPU nodes (Intel QSV or NVIDIA NVENC) or CPU workers. An example Traefik failover route is in [deploy/examples/traefik-failover.yaml](deploy/examples/traefik-failover.yaml); [docs/operations.md](docs/operations.md#traefik-activepassive-failover) explains it.
 
 ## Why
 
@@ -52,7 +52,7 @@ JellyMesh converts dual-layer Dolby Vision profile 7 sources to single-layer pro
 
 The Jellyfin patches decide when to convert. The transcode agent rewrites the in-band RPU (per-frame Dolby Vision metadata) to profile 8.1 and drops the enhancement layer. The HLS job uses fMP4 segments, so the init segment carries a `dvvC` box, which is the signal the app uses to show Dolby Vision.
 
-TrueHD or MLP audio with 6 or more channels is encoded to EAC3 5.1 at 640 kb/s when the client lists `eac3`, otherwise to AAC. Dolby Digital Plus passthrough to an AVR was not separately stated.
+TrueHD or MLP audio with 6 or more channels is encoded to EAC3 5.1 at 640 kb/s when the client lists `eac3`, otherwise to AAC. The EAC3 track passes through from the SHIELD to an AV receiver as Dolby Digital Plus (maintainer report, 2026-09-30).
 
 Limits:
 
@@ -87,7 +87,7 @@ flowchart LR
 
 Solid lines are the primary path; dotted lines are the fallback route or opt-in paths. The scratch directory is shared across replicas only with `JELLYMESH_SHARED_TRANSCODE_DIR=1`; the NFS scratch itself is an agent-side PVC (`15-scratch.yaml` in [docs/operations.md](docs/operations.md)).
 
-Each replica runs the Galera provider, the jellyfin-perf patches, the Leader plugin, and `tcpool-shim`. The shim is inert until `TC_WORKERS_DNS` or `TC_WORKERS` is set. Which replica uses QSV and which uses NVENC is deployment-specific and not in this repo. More detail: [docs/architecture.md](docs/architecture.md).
+Each replica runs the Galera provider, the jellyfin-perf patches, the Leader plugin, and `tcpool-shim`. The shim is inert until `TC_WORKERS_DNS` or `TC_WORKERS` is set. Which replica uses QSV and which uses NVENC is deployment-specific and not shipped here. More detail: [docs/architecture.md](docs/architecture.md).
 
 ## Measured results
 
@@ -106,7 +106,7 @@ The library is a real 19,259-item library ([docs/RESULTS.md](docs/RESULTS.md#tes
 
 ## Quickstart
 
-Prerequisites: podman. The lab runs every node as a podman container; how much RAM three database nodes need is Not documented yet.
+Prerequisites: podman. The lab runs every node as a podman container and sets no memory limits; the memory the three database nodes need was not measured.
 
 Pull the image. This runs nothing by itself; deployment is covered in [docs/operations.md](docs/operations.md).
 

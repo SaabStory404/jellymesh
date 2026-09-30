@@ -8,9 +8,9 @@ This page lists every environment variable, port, file setting, and Kubernetes o
 
 Variable tables use the columns Variable, Applies to, Default, Effect, Source file; the database, ports, Kubernetes, and alert tables have their own headers. A default of "unset" means the feature is off or a built-in fallback applies. Status labels appear only where a setting is opt-in: "Implemented, opt-in, off by default" means the code is in the repo and nothing changes until you set the variable.
 
-Source paths are relative to the repository root, except in the `tcpool-agent`, `tcpool-shim`, and `tcpool-sync` sections, where a bare `config.rs` or `crates/...` path is relative to `transcode/` (`config.rs` means `transcode/crates/agent/src/config.rs`). "Not documented yet" marks a fact the sources do not state; see the [doc TODO list](../CONTRIBUTING.md#doc-todo-list). Only the variables read through `env_bool` follow the `0`/`false`/`no`/`off` rule; other variables state their own rule.
+Source paths are relative to the repository root, except in the `tcpool-agent`, `tcpool-shim`, and `tcpool-sync` sections, where a bare `config.rs` or `crates/...` path is relative to `transcode/` (`config.rs` means `transcode/crates/agent/src/config.rs`). Only the variables read through `env_bool` follow the `0`/`false`/`no`/`off` rule; other variables state their own rule.
 
-Terms used here, including Galera, Pomelo, Lease, QSV, NVENC, mTLS, fMP4, dvvC, and RPU, are defined in the [glossary](architecture.md#glossary). Glossary entries for HLS, trickplay, seek affinity, and headless Service are Not documented yet.
+Terms used here, including Galera, Pomelo, Lease, QSV, NVENC, mTLS, HLS, trickplay, seek affinity, headless Service, fMP4, dvvC, and RPU, are defined in the [glossary](architecture.md#glossary).
 
 ## Jellyfin server settings
 
@@ -37,7 +37,7 @@ When the shim is installed but the pool is unreachable, the shim applies a Dolby
 
 ## database.xml settings for the Galera provider
 
-Jellyfin loads the provider from a plugin folder named `JellyMesh Galera_1.0.0.0`. Point Jellyfin at it with `database.xml`; the file's location is Not documented yet (see the [doc TODO list](../CONTRIBUTING.md#doc-todo-list)). The plugin folder is created by `image/install-plugins.sh`. The example below is the lab file written by `galera/lab/jf-galera.sh`.
+Jellyfin loads the provider from a plugin folder named `JellyMesh Galera_1.0.0.0`. Point Jellyfin at it with `database.xml` in the root of the Jellyfin config directory (`/config/database.xml` in the lab containers, which mount the node's config directory at `/config`). The plugin folder is created by `image/install-plugins.sh`. The example below is the lab file written by `galera/lab/jf-galera.sh`.
 
 > **Warning:** These are lab values. Do not use `Pwd=jellyfin` or `SslMode=Disabled` in production; set `JELLYMESH_DB_PASSWORD` and choose a real `SslMode`.
 
@@ -57,7 +57,7 @@ Jellyfin loads the provider from a plugin folder named `JellyMesh Galera_1.0.0.0
 | Setting | Value | Notes | Source file |
 | --- | --- | --- | --- |
 | `DatabaseType` | `PLUGIN_PROVIDER` | Tells Jellyfin to load a database provider from a plugin. | `galera/lab/jf-galera.sh` |
-| `LockingBehavior` | `NoLock` | Value used in the lab file. Not documented yet whether other values are supported. | `galera/lab/jf-galera.sh` |
+| `LockingBehavior` | `NoLock` | Jellyfin's own setting; the provider does not read it. `NoLock` is the value the lab runs. | `galera/lab/jf-galera.sh` |
 | `PluginName` | `JellyMesh Galera` | Plugin name as written in the lab file. | `galera/lab/jf-galera.sh` |
 | `PluginAssembly` | `Jellyfin.Database.Providers.Galera.dll` | Provider assembly. | `galera/lab/jf-galera.sh` |
 | `ConnectionString` | MySqlConnector syntax | Required. `Server=` takes a comma-separated node list; `LoadBalance=FailOver` tries nodes in listed order, so give every Jellyfin the same order. The lab file uses `SslMode=Disabled` and `AllowPublicKeyRetrieval=true`; pick your own `SslMode` for production. | `galera/lab/jf-galera.sh`, `galera/README.md` |
@@ -66,7 +66,7 @@ From code reading of `galera/Jellyfin.Database.Providers.Galera/GaleraDatabasePr
 
 - The provider registers under the key `Jellyfin-Galera` (`[JellyfinDatabaseProviderKey("Jellyfin-Galera")]`).
 - A missing connection string throws `InvalidOperationException` with the text `database.xml must set CustomProviderOptions/ConnectionString for Jellyfin-Galera`.
-- The provider fixes the server version at MySQL 8.4.0 and does not auto-detect it, so startup opens no extra connection. Operator impact beyond that is Not documented yet.
+- The provider fixes the server version at MySQL 8.4.0 (`GaleraDatabaseProvider.cs`) and does not auto-detect it, so startup opens no extra connection. Run a MySQL 8.4 server or PXC 8.4, as the lab does (`percona/percona-xtradb-cluster:8.4`).
 - Startup logs the connection string with the password replaced by `*****`. Masking also covers a quoted password that contains `;`.
 - `JELLYMESH_DB_PASSWORD` is applied before masking.
 
@@ -105,16 +105,16 @@ One `tcpool-agent` runs per GPU (or CPU) worker. It reads the variables below at
 | `TC_PORT` | agent | 9901 | gRPC listen port. | `config.rs` |
 | `TC_HEALTH_PORT` | agent | 9902 when TLS is on, otherwise no extra port | Plaintext gRPC health port for kubelet probes. The manifests set 9902. | `crates/agent/src/main.rs` |
 | `TC_METRICS_PORT` | agent | unset (no metrics server) | Port for Prometheus `/metrics`. Same variable name as in `tcpool-sync`, separate process. The manifests set 9903. | `config.rs`, `crates/agent/src/main.rs` |
-| `TC_PATHMAP` | agent | empty | Comma-separated `from=to` path rewrites (`from` is rewritten to `to`). Example values: Not documented yet. | `config.rs` |
+| `TC_PATHMAP` | agent | empty | Comma-separated `from=to` path rewrites. Each `from` substring is replaced with `to` in every argument, in list order (`map_path` in `crates/ir/src/lib.rs`). The shipped manifests leave it unset because the agents mount media at the same path as Jellyfin (`deploy/CONTRACT.md`). | `config.rs` |
 | `TC_CAPACITY` | agent | 0 | Admission ceiling in weighted units. When set above 0, it wins over `TC_MAX_JOBS` and the weight variables below apply. | `config.rs` |
 | `TC_MAX_JOBS` | agent | 0 | Flat job count, weight 1 per job. Used only when `TC_CAPACITY` is not above 0. With neither set, capacity is 1000 units (effectively unbounded). | `config.rs` |
 | `TC_WEIGHT_1440` | agent | 2.0 | Weight of a 1440p job. Ignored (weight 1.0) unless `TC_CAPACITY` is above 0. | `config.rs` |
 | `TC_WEIGHT_4K` | agent | 3.0 | Weight of a 4K job. Same condition. | `config.rs` |
 | `TC_WEIGHT_COPY` | agent | 0.25 | Weight of a video-copy job. Same condition. | `config.rs` |
-| `TC_OUTPUTS` | agent | unset (no restriction) | Comma-separated list restricting which outputs the agent advertises. Accepted values: Not documented yet. | `config.rs` |
+| `TC_OUTPUTS` | agent | unset (no restriction) | Comma-separated list restricting which outputs the agent advertises. Tokens: `h264`, `hevc`, `hevc10`, `av1`, `av1-10` (`OUTPUTS` in `crates/agent/src/probe.rs`). The agent advertises only outputs that pass its startup probe and appear in the list. | `config.rs`, `crates/agent/src/probe.rs` |
 | `TC_HW_FILTERS` | agent | on | Any value other than `0` keeps GPU-resident filters on; `0` disables them. | `config.rs` |
 | `TC_RC` | agent | `calibrated` | Rate control: `calibrated` or `legacy`. | `config.rs` |
-| `TC_PROBE_CLAMP` | agent | `50M,5M` | `probesize,analyzeduration` clamp in ffmpeg size syntax (for example `50M`); the unit of the second value is Not documented yet. A value without a comma, such as `0`, or with unparsable sizes turns the clamp off. | `config.rs` |
+| `TC_PROBE_CLAMP` | agent | `50M,5M` | `probesize,analyzeduration` clamp in ffmpeg size syntax (for example `50M`): bytes for the first value, microseconds for the second, so the default caps analysis at 5 s (`clamp_probe` in `crates/ir/src/lib.rs`). The clamp only lowers Jellyfin's values and is skipped for commands with `-filter_complex`. A value without a comma, such as `0`, or with unparsable sizes turns the clamp off. | `config.rs` |
 | `TC_FENCE_AFTER` | agent | 3 s | Time after which an agent that lost its shim stops ffmpeg. | `config.rs` |
 | `TC_STALL_AFTER` | agent | 20 s | Playback job is treated as stalled after this long without progress. | `config.rs` |
 | `TC_FIRST_PROGRESS_GRACE` | agent | 45 s | Grace period before the first progress report. | `config.rs` |
@@ -228,7 +228,7 @@ When the Jellyfin decision patch gates a job, it adds the argv pair `-metadata:s
 
 Apply the files in numeric order.
 
-**Status:** Implemented. Whether the pool as a whole runs in production is not documented yet; only Dolby Vision 7 -> 8.1 is reported as Production (maintainer report, 2026-09-29).
+**Status:** Implemented. Dolby Vision 7 -> 8.1, which runs in the agent, is Production (maintainer report, 2026-09-29); the rollout of the rest of the pool is deployment-specific and not recorded here.
 
 | File | Object | Key values | Source file |
 | --- | --- | --- | --- |
@@ -253,7 +253,7 @@ The Jellyfin StatefulSet, Traefik failover route, and Lease RBAC manifest are no
 
 ## Metrics and alerts
 
-Agent metrics (`transcode/crates/agent/src/metrics.rs`): `tcpool_capacity_units`, `tcpool_units_used`, `tcpool_jobs_active`, `tcpool_batch_jobs_active`, `tcpool_batch_units_used`, `tcpool_batch_headroom_units`, `tcpool_jobs_total{outcome}`, `tcpool_job_seconds`, `tcpool_job_speed`, `tcpool_probe_output`, `tcpool_gpu_tonemap`, `tcpool_draining`, `tcpool_orphans_paused`, `tcpool_dv81_total{outcome}`, `tcpool_build_info`. The `outcome` label of `tcpool_jobs_total` takes `accepted`, `busy`, `refused_policy`, `exit_ok`, `exit_error`, `fenced`, `stalled`, `drained`, `gpu_filter_fallback`, `busy_headroom`, `preempted`, `batch_accepted`, `detached`, `taken_over`, or `orphan_expired` (`metrics.rs`). Types, other labels, and descriptions for each metric are Not documented yet. The `outcome` label of `tcpool_dv81_total` takes `converted`, `fallback_no_rpu`, `fallback_not_p7`, or `fallback_error`.
+Agent metrics (`transcode/crates/agent/src/metrics.rs`): `tcpool_capacity_units`, `tcpool_units_used`, `tcpool_jobs_active`, `tcpool_batch_jobs_active`, `tcpool_batch_units_used`, `tcpool_batch_headroom_units`, `tcpool_jobs_total{outcome}`, `tcpool_job_seconds`, `tcpool_job_speed`, `tcpool_probe_output`, `tcpool_gpu_tonemap`, `tcpool_draining`, `tcpool_orphans_paused`, `tcpool_dv81_total{outcome}`, `tcpool_build_info`. The `outcome` label of `tcpool_jobs_total` takes `accepted`, `busy`, `refused_policy`, `exit_ok`, `exit_error`, `fenced`, `stalled`, `drained`, `gpu_filter_fallback`, `busy_headroom`, `preempted`, `batch_accepted`, `detached`, `taken_over`, or `orphan_expired` (`metrics.rs`). Each metric's type is written as a `# TYPE` line in the `/metrics` output (`metrics.rs`); the doc comments in `metrics.rs` describe each metric and its labels. The `outcome` label of `tcpool_dv81_total` takes `converted`, `fallback_no_rpu`, `fallback_not_p7`, or `fallback_error`.
 
 Sync metrics (`transcode/crates/sync/src/metrics.rs`): `tcpool_pool_worker_live`, `tcpool_pool_workers_configured`, `tcpool_pool_workers_live`, `tcpool_pool_capacity_units`, `tcpool_pool_common_output`, `tcpool_pool_survivable`, `tcpool_jellyfin_offer`, `tcpool_jellyfin_offer_intent`, `tcpool_sync_last_success_timestamp_seconds`.
 

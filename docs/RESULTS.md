@@ -40,7 +40,7 @@ Terms marked with a link are also in the [glossary](architecture.md#glossary). D
 
 | Item | Value | Source |
 |---|---|---|
-| Host | One workstation, 12 cores, 62 GB memory; CPU model and storage: Not documented yet | `../jellyfin-perf/README.md` |
+| Host | One workstation, 12 cores, 62 GB memory; CPU model and storage were not recorded | `../jellyfin-perf/README.md` |
 | Topology | Every node is a podman container on one bridge network on that host | `../jellyfin-perf/README.md` |
 | Jellyfin | 12.1, base image `ghcr.io/hotio/jellyfin:release-12.1` | `engineering/galera-provider.md` (`JG_IMG` default) |
 | Library | Real library: 19,259 items; 308,330 rows in 31 tables | `../jellyfin-perf/README.md` (items); `operations.md` (rows, tables) |
@@ -92,7 +92,7 @@ The multi-writer configuration is [defined in architecture.md](architecture.md#s
 - **At 32 clients, patched Galera leads.** It reaches 115.4 (one Jellyfin) and 120.2 (two), against 93.6 for patched SQLite. Stock and patched SQLite are both lower at 32 clients than at 8 in these runs (75.3 to 55.4 stock, 112.2 to 93.6 patched); only three client counts (1, 8, 32) were run, so where the peak sits is not resolved.
 - **Patched Galera at 8 and 32 clients.** With one Jellyfin it moves from 104.2 to 115.4 req/s. With two Jellyfins it moves from 96.5 to 120.2 req/s.
 - **Stock Galera is the slowest cell under load.** It reaches 54.0 and 49.0 req/s at 8 and 32 clients. Its people p50 was 1243 and 2532 ms, against 105 and 282 ms patched. The patch removes the N+1 (103 statements to 4, see [Per-call latency and statement counts](#per-call-latency-and-statement-counts)) and a slow query plan (see [Provider-only latencies](#provider-only-latencies-history)); this table does not split the two effects.
-- **Resume was the cliff.** A DatePlayed sort-key fix changed how MySQL plans the Resume query. Before it, MySQL made 166,800 lookups for 400 candidates, and Resume took 0.4 to 2.6 s with a few hundred in-progress items; after it, 0.14 s (`../jellyfin-perf/README.md`). The previous revision of this page also recorded 9.8 req/s for patched Galera at one client before the fix, against 27.6 after. The per-call table below shows Resume at 33.4 ms p50 on patched Galera. No source states the in-progress item count for the 0.14 s figure or for the per-call row, so the two are not reconciled (doc TODO in [CONTRIBUTING.md](../CONTRIBUTING.md#doc-todo-list)).
+- **Resume was the cliff.** A DatePlayed sort-key fix changed how MySQL plans the Resume query. Before it, MySQL made 166,800 lookups for 400 candidates, and Resume took 0.4 to 2.6 s with a few hundred in-progress items; after it, 0.14 s (`../jellyfin-perf/README.md`). The previous revision of this page also recorded 9.8 req/s for patched Galera at one client before the fix, against 27.6 after. The per-call table below shows Resume at 33.4 ms p50 on patched Galera. No source states the in-progress item count for the 0.14 s figure or for the per-call row, so the two are not reconciled.
 
 ## One store versus a Redis response-cache tier
 
@@ -247,11 +247,11 @@ The 38.8 s figure was taken with the Oracle provider, which the repository no lo
 
 Before the retry patch, stock Jellyfin on plain MySQL also failed 2 to 7 of 200 concurrent first progress reports for one item with HTTP 500, from a check-then-insert race (`../jellyfin-perf/README.md`).
 
-`engineering/galera-provider.md` recommends single-writer as the conservative choice for a stock Jellyfin build. The retry patch changes that for user-data writes: the two-Jellyfin multi-writer rows in [Concurrent load](#concurrent-load) and the 200-of-200 result above were measured with the patch. Whether the README's wording needs an update is tracked in the [doc TODO list](../CONTRIBUTING.md#doc-todo-list).
+`engineering/galera-provider.md` recommends single-writer as the conservative choice for a stock Jellyfin build. The retry patch changes that for user-data writes: the two-Jellyfin multi-writer rows in [Concurrent load](#concurrent-load) and the 200-of-200 result above were measured with the patch.
 
 ### Authentication across nodes
 
-**Status:** Lab-verified. Run count and date: Not documented yet; `../jellyfin-perf/README.md` groups it with the shared-mode runs (2 Jellyfins on a 3-node Galera cluster, measured 2026-09-26 for that section).
+**Status:** Lab-verified. The run count and date were not recorded; `../jellyfin-perf/README.md` groups it with the shared-mode runs (2 Jellyfins on a 3-node Galera cluster, measured 2026-09-26 for that section).
 
 **Method.** `../galera/lab/auth_drill.py <login-node-url> <other-url> ...` creates a throwaway user, logs in on the first node, uses the token on the others, logs out, and checks the token is refused everywhere. Whether the drill ran with `JELLYFIN_SHARED_DB=1` is inferred from the shared-mode grouping; the script does not set it.
 
@@ -296,7 +296,7 @@ The operations procedure is in [operations.md](operations.md#traefik-activepassi
 
 **Status:** Lab-verified, opt-in (`JELLYMESH_SHARED_TRANSCODE_DIR=1`). Measured 2026-09-28.
 
-**Method.** 3 concurrent HLS sessions per drill (1080p H.264 to 720p, 3 s segments, 12 s player buffer) through the Traefik failover route, with 2 Jellyfin replicas (`jm-jf-0` primary, `jm-jf-1` fallback), one NVENC agent (card model: Not documented yet), plaintext, lab only. Client: `../transcode/spike/shared_dir_drill.py`. Source: `../transcode/docs/SHARED-TRANSCODE.md`. "Slow" means a segment request over 3 s, not counting each session's cold first segment, which took 3.7 to 4.8 s.
+**Method.** 3 concurrent HLS sessions per drill (1080p H.264 to 720p, 3 s segments, 12 s player buffer) through the Traefik failover route, with 2 Jellyfin replicas (`jm-jf-0` primary, `jm-jf-1` fallback), one NVENC agent (card model not recorded), plaintext, lab only. Client: `../transcode/spike/shared_dir_drill.py`. Source: `../transcode/docs/SHARED-TRANSCODE.md`. "Slow" means a segment request over 3 s, not counting each session's cold first segment, which took 3.7 to 4.8 s.
 
 | Drill | Failed segments | Slow segments | Slowest in failover window | New ffmpeg for the sessions |
 |---|---|---|---|---|
@@ -389,7 +389,7 @@ The protocol suite (`transcode/spike/proto_test.sh`) has 21 numbered cases per `
 
 ### Dolby Vision 7 -> 8.1 conversion measurements
 
-**Status:** Production, opt-in and off by default, for playback on an Android TV app (maintainer report, 2026-09-29, tested repeatedly). AV receiver Dolby Digital Plus passthrough was not reported. The numbers below are not on-device measurements; see [dolby-vision.md](dolby-vision.md) for the feature.
+**Status:** Production, opt-in and off by default, for playback on an Android TV app (maintainer report, 2026-09-29, tested repeatedly). Dolby Digital Plus passthrough of the EAC3 track from the SHIELD to an AV receiver works (maintainer report, 2026-09-30). The numbers below are not on-device measurements; see [dolby-vision.md](dolby-vision.md) for the feature.
 
 On-device playback: reported by the maintainer on 2026-09-29; no measurement.
 
@@ -428,9 +428,9 @@ The tables in this section list the scripts present in this repository, the resu
 Not reproducible from this repository:
 
 - **Concurrent load, per-call latency, and coherence.** The drivers are `spikes/jellymesh/load.py`, `spikes/jellymesh/bench.py`, and `mesh/mesh_drill.py`. They are not in the repository.
-- **Transcode calibration, startup latency, fuzzing, and the Dolby Vision census and proof.** No script or command is documented for them: Not documented yet. The raw calibration rows are in `transcode/calibration/` (`2026-09-26-p0.csv`, `2026-09-27-p5.csv`, `2026-09-28-pool-r1.csv`).
+- **Transcode calibration, startup latency, and the Dolby Vision census and proof.** No script in the repository reproduces them. The raw calibration rows are in `transcode/calibration/` (`2026-09-26-p0.csv`, `2026-09-27-p5.csv`, `2026-09-28-pool-r1.csv`).
 
-The doc TODO list in [../CONTRIBUTING.md](../CONTRIBUTING.md#doc-todo-list) tracks these gaps.
+Fuzzing is reproducible: [CONTRIBUTING.md](../CONTRIBUTING.md#building-and-testing-the-rust-workspace) gives the local command for the CI `fuzz-smoke` job. The remaining gaps are listed under [open documentation gaps](../CONTRIBUTING.md#open-documentation-gaps).
 
 ## Related docs
 

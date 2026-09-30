@@ -5,13 +5,17 @@ JellyMesh session (PR #155): everything below is settled on this side, so JellyM
 against it without reading the Rust.
 
 Status 2026-09-27: nothing here is applied to the cluster and no image has been pushed. Manifests
-live in `k8s/`, the Jellyfin-side snippets in `k8s/jellyfin-patch.md`.
+live in `k8s/`. The Jellyfin-side snippets (`k8s/jellyfin-patch.md`) are deployment-specific and
+not shipped here; the tables below state what the Jellyfin pod must provide.
+
+Update 2026-09-29: Dolby Vision 7 -> 8.1, which the agent performs, is in production (maintainer
+report); see `docs/dolby-vision.md`.
 
 ## Images
 
 | Image | What it is | Built by |
 |---|---|---|
-| `ghcr.io/saabstory404/tcpool-agent:<git-sha>` | the worker. `FROM ghcr.io/hotio/jellyfin:release-12.1` pinned by digest `sha256:e3a9ba58...`, carrying jellyfin-ffmpeg 8.1.2-Jellyfin. Runs as uid 1000. | `.github/workflows/tcpool-images.yml`, `deploy/Containerfile.agent` |
+| `ghcr.io/saabstory404/tcpool-agent:<git-sha>` | the worker. `FROM ghcr.io/hotio/jellyfin:release-12.1` pinned by digest `sha256:e3a9ba58...`, carrying jellyfin-ffmpeg 8.1.2-Jellyfin. Runs as uid 1000. | `.github/workflows/transcode-images.yml`, `deploy/Containerfile.agent` |
 | `ghcr.io/saabstory404/tcpool-shim:<git-sha>` | artifact only, `FROM scratch`: `/tcpool-shim` and `/tcpool-sync`, static-pie musl. Not runnable. | same workflow, `deploy/Containerfile.shim` |
 
 Tags are the commit sha, never `:latest` — a deploy diff compares manifests, and a mutable tag makes
@@ -29,8 +33,8 @@ a major ffmpeg mismatch" is not implemented — the digest pin is the only guard
 |---|---|---|
 | 9901 | gRPC over **mTLS** — `Hello`, `Run` | the shim, `tcpool-sync` |
 | 9902 | gRPC health, **plaintext** | the kubelet only. The kubelet's gRPC probe cannot speak TLS, so health is served twice; 9902 exposes health and nothing else. |
-| 9903 | `/metrics` — **reserved, not yet served** | nobody. `TC_METRICS_PORT` is set in the manifests and the agent does not read it (plan §2 Observability is open). No ServiceMonitor. |
-| 9904 | `/metrics` for `tcpool-sync` — **reserved** | nobody, same reason. |
+| 9903 | agent `/metrics` (Prometheus text), served when `TC_METRICS_PORT` is set (`crates/agent/src/metrics.rs`); the manifests set 9903 | Prometheus; `k8s/60-servicemonitor.yaml` for a cluster with the Prometheus operator |
+| 9904 | `tcpool-sync` `/metrics` and `/status` on one port, served when `TC_METRICS_PORT` is set on sync (`crates/sync/src/metrics.rs`) | Prometheus, through the `sync-metrics` port in `k8s/30-service.yaml` |
 
 Discovery is the headless Service `tcpool-agents` in namespace `media`, `clusterIP: None`, port 9901.
 The shim resolves its A records on every transcode and treats each as one worker.
@@ -51,7 +55,7 @@ to a worker that is shutting down.
 | `TC_WEIGHT_4K` | Arc `2.3`, P4 `2`, CPU `3` | MEASURED on the cards; the CPU value is an estimate |
 | `TC_FFMPEG` | `/usr/lib/jellyfin-ffmpeg/ffmpeg` | image default |
 | `TC_HEALTH_PORT` | `9902` | |
-| `TC_METRICS_PORT` | `9903` | reserved, see above |
+| `TC_METRICS_PORT` | `9903` | agent metrics, see Ports |
 | `TC_TLS_REQUIRED` | `1` | a hard error if the cert vars are missing, so a prod pod can never fall back to plaintext |
 | `TC_TLS_CERT` / `TC_TLS_KEY` / `TC_TLS_CA` | `/tls/tls.crt`, `/tls/tls.key`, `/tls/ca.crt` | all three or none |
 | `TC_INPUT_ROOTS` | `/data/media` | allowlist: inputs must be under here |
@@ -81,9 +85,8 @@ keeps its own encoding.xml), `JF_API_KEY` (from the `tcpool-sync` Secret, shared
 are not written until every worker has reported once or this many seconds have passed),
 `TC_TRANSCODE_DIR` (`/transcodes/jf` — its own subdirectory), and the same `TC_TLS_*` client set.
 
-**OPEN:** `tcpool-sync` reads `TC_WORKERS`, not `TC_WORKERS_DNS` (`crates/sync/src/main.rs`). Either
-port the DNS discovery to it or give it an explicit `TC_WORKERS`. Not a playback blocker: a stale
-offer set is a quality bug, not a stall.
+`tcpool-sync` discovers workers the same way as the shim (`crates/sync/src/main.rs`): it resolves
+`TC_WORKERS_DNS` first, then merges any `TC_WORKERS` entry for an address DNS did not return.
 
 ## Secrets
 
@@ -92,7 +95,7 @@ offer set is a quality bug, not a stall.
 | `tcpool-ca` | the pool CA (`tls.crt`, `tls.key`, `ca.crt`) | cert-manager, from the `tcpool-ca` Certificate |
 | `tcpool-agent-tls` | agent server identity, SANs `tcpool-agent`, `tcpool-agents`, `tcpool-agents.media.svc.cluster.local`. 90 d, renewed at 30 d | cert-manager |
 | `tcpool-client-tls` | client identity for the shim and sync, `client auth` only. 90 d / 30 d | cert-manager |
-| `tcpool-sync` | key `api-key`: a Jellyfin API key | **out of band.** Not in this repo and must not be |
+| `tcpool-sync` | key `api-key`: a Jellyfin API key | **out of band.** Created by the operator; never committed to the repository |
 
 Its own CA, not the cluster step-ca: a CA that signs nothing else means any certificate it issued
 is by construction a pool identity. Keys are RSA 2048 / PKCS8 with `rotationPolicy: Always`; the
@@ -176,7 +179,7 @@ emit the marker whenever your decision says DV7->8.1, unconditionally. `-metadat
 (the pool's original marker value, from before this patch landed) is still accepted as an alias —
 lab recipes and older builds keep working — but new callers should emit the value above.
 
-**Pool-side behavior (branch `dv81-wire`, not in an image yet).** An agent built from it acts on
+**Pool-side behavior (`crates/agent/src/dv81.rs`; in production since 2026-09-29).** The agent acts on
 the marker for a video-copy (remux) PLAYBACK job: if ffprobe says the source is DV profile 7 and
 the source's video actually carries its RPU in-band (checked on the first bytes of the stream), it
 remuxes with the RPU rewritten to profile 8.1 and the enhancement layer dropped; the HLS init

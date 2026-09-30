@@ -2,20 +2,19 @@
 
 This file explains how to report a vulnerability in JellyMesh and lists the security-relevant behavior of each component as it exists in the repository. Statements in the notes section cite their source file.
 
-**Status:** The reporting channel and the supported-versions policy are Not documented yet (see the [doc TODO list](CONTRIBUTING.md#doc-todo-list)).
+**Status:** Implemented. Report vulnerabilities privately through GitHub private vulnerability reporting.
 
 ## Supported versions
 
-Not documented yet. The repository does not state which image tags or branches receive security fixes. The image is built manually with podman (see [Contributing](CONTRIBUTING.md)).
+The project publishes no supported-versions policy. Fixes are made on `main`; the `jellymesh-jellyfin` image is built manually with podman from it (see [Contributing](CONTRIBUTING.md)).
 
 ## Reporting a vulnerability
 
 Do not open a public issue for a vulnerability.
 
-1. If GitHub private vulnerability reporting is enabled on the repository, use the **Security** tab, then **Report a vulnerability**.
-2. If it is not enabled, contact the maintainer through the profile of the repository owner and ask for a private channel before sending details.
+Report it through GitHub private vulnerability reporting: open the repository's **Security** tab and choose **Report a vulnerability**.
 
-The repository does not state whether private reporting is enabled, and this file deliberately contains no email address. A useful report includes:
+A useful report includes:
 
 - The component and the image tag or commit.
 - The configuration involved (environment variables from [configuration](docs/configuration.md)).
@@ -23,7 +22,7 @@ The repository does not state whether private reporting is enabled, and this fil
 
 ## Response and disclosure
 
-Not documented yet. The project has no stated response time, disclosure window, or advisory process. The doc TODO list tracks this.
+The project publishes no response-time or disclosure-window commitment.
 
 ## Scope
 
@@ -42,7 +41,7 @@ In scope are the components in this repository.
 
 Report problems in upstream Jellyfin, Pomelo, or ffmpeg to those projects. If a JellyMesh patch introduces or exposes the problem, report it here.
 
-The repository does not list attack classes it treats as out of scope. Not documented yet.
+Beyond the lab-only material below, no attack class is excluded from scope.
 
 ## Security model and known observations
 
@@ -57,7 +56,7 @@ Status: Implemented. The agent, shim, and sync are built from `transcode/crates/
 | Transport and client identity | gRPC on port 9901 over mTLS. Agents require a client certificate signed by the pool CA, and clients verify the agent against the same CA. The pool uses its own cert-manager CA, not the cluster CA. That CA signs nothing else, so any certificate it issued is a pool identity. `tcpool-client-tls` is limited to `client auth` and is used by the shim and `tcpool-sync`. | `transcode/crates/proto/src/tls.rs`; [CONTRACT.md](transcode/deploy/CONTRACT.md) |
 | Server name | `TC_TLS_SERVER_NAME` defaults to `tcpool-agent`, a SAN on every agent certificate. The agent SANs are `tcpool-agent`, `tcpool-agents`, and `tcpool-agents.media.svc.cluster.local`. The shim overrides the domain name with it, which lets it dial bare pod IPs. | `tls.rs`; CONTRACT.md |
 | Health port | When TLS is on, the agent also serves gRPC health in plaintext on `TC_HEALTH_PORT` (default 9902; the CONTRACT sets 9902), because the kubelet gRPC probe cannot speak TLS. Port 9902 exposes health and nothing else. | `transcode/crates/agent/src/main.rs`; CONTRACT.md |
-| Metrics ports | 9903 (agent) and 9904 (`tcpool-sync`) are reserved. The CONTRACT says the agent does not read `TC_METRICS_PORT` and nothing serves them. The doc TODO list marks the CONTRACT as stale on metrics, so check the code before relying on it. | CONTRACT.md; [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Metrics ports | The agent serves Prometheus `/metrics` on 9903 and `tcpool-sync` serves `/metrics` and `/status` on 9904, each over plain HTTP and only when `TC_METRICS_PORT` is set. The manifests set 9903 on the agents. | `transcode/crates/agent/src/metrics.rs`; `transcode/crates/sync/src/metrics.rs`; CONTRACT.md |
 | Missing or partial certificates, agent | A partial set of `TC_TLS_CERT`, `TC_TLS_KEY`, `TC_TLS_CA` is always an error. No TLS variables is an error when `TC_TLS_REQUIRED` is set to anything other than `0`. Without TLS variables and without `TC_TLS_REQUIRED`, the agent serves plaintext and logs "WARNING plaintext gRPC (no TC_TLS_*): lab/dev only". The agent calls `exit(2)` on the TLS error paths in `main.rs`. The CONTRACT sets `TC_TLS_REQUIRED=1`. | `tls.rs`; `agent/src/main.rs` |
 | Missing or partial certificates, shim | On TLS misconfiguration the shim logs "tls misconfigured ... running LOCALLY" and runs the transcode on the local CPU. It does not fall back to plaintext and does not fail the session. | `transcode/crates/shim/src/main.rs` |
 | Certificate files | `/tls` is mounted read-only with mode 0440 and needs `fsGroup: 1000` on the pod. Without it the agent (uid 1000) gets EACCES on its private key, exits 2 and CrashLoops, and the shim silently CPU-encodes every session. | CONTRACT.md |
@@ -99,7 +98,7 @@ Status: Lab-verified for the first and third rows; the second row is a deploymen
 
 | Topic | Behavior | Source |
 |---|---|---|
-| Unauthenticated range requests | In the lab, `/Videos/{id}/stream` and `/Audio/{id}/stream` answered range requests without a token; the doc marks this as measured on stock Jellyfin. The cause, from code reading, is that the controller actions carry no `[Authorize]` attribute and the API has no global authorization filter. An authenticated Range retry was not measured. This belongs upstream. The repo does not say whether the Traefik configuration restricts these routes, so operator mitigation is Not documented yet. | [direct-play-failover.md](docs/engineering/direct-play-failover.md) |
+| Unauthenticated range requests | In the lab, `/Videos/{id}/stream` and `/Audio/{id}/stream` answered range requests without a token; the doc marks this as measured on stock Jellyfin. The cause, from code reading, is that the controller actions carry no `[Authorize]` attribute and the API has no global authorization filter. An authenticated Range retry was not measured. This belongs upstream. The example Traefik route in `deploy/examples/` does not restrict these paths; any restriction is up to the operator. | [direct-play-failover.md](docs/engineering/direct-play-failover.md) |
 | `api_key` in Traefik logs | Traefik access logs recorded the `api_key` query parameter in cleartext for two lab services. This is not fixed in the repo. Restrict access to those logs, or move the services to header authentication. | [bughunt.md](docs/engineering/bughunt.md); [troubleshooting](docs/troubleshooting.md) |
 | Session cap per node (`c2`) | `MaxActiveSessions` is checked against a per-process in-memory dictionary, so a user can exceed the cap by splitting sessions across HA replicas. From code reading only; not fixed in the repo. | bughunt.md |
 

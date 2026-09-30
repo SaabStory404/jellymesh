@@ -75,7 +75,7 @@ Every page uses these four labels, in a Status column or line. A plain qualifier
 | Label | Meaning |
 | --- | --- |
 | Implemented | The code is in the repository. |
-| Production | Deployed on the maintainer's cluster, as reported by the maintainer. The Dolby Vision 7 to 8.1 report is dated 2026-09-29. Playback of the EAC3 track through an AV receiver was not separately reported by the maintainer and is tracked in [ROADMAP.md](ROADMAP.md). |
+| Production | Deployed on the maintainer's cluster, as reported by the maintainer. The Dolby Vision 7 to 8.1 report is dated 2026-09-29. Dolby Digital Plus passthrough of the EAC3 track to an AV receiver is reported working on 2026-09-30. |
 | Lab-verified | Measured in a lab only. |
 | Planned | Not implemented. It links to [ROADMAP.md](ROADMAP.md) or an issue. |
 
@@ -94,7 +94,7 @@ Files under `docs/engineering/` are working logs written during development. The
 
 ## Report a documentation problem
 
-Open an issue or a pull request as described in [CONTRIBUTING.md](../CONTRIBUTING.md). Include the page, the statement and the file in the repository that contradicts it. Missing facts are recorded there as documentation TODOs, along with the banner and glossary-linking conventions, and pages say "Not documented yet" rather than guess.
+Open an issue or a pull request as described in [CONTRIBUTING.md](../CONTRIBUTING.md). Include the page, the statement and the file in the repository that contradicts it. Missing facts are listed there under open documentation gaps, along with the banner and glossary-linking conventions; pages state a missing fact in one plain sentence rather than guess.
 
 ## Related docs
 

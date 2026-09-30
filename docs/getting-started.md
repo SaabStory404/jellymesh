@@ -1,6 +1,6 @@
 # Getting started: two Jellyfin servers, one database
 
-This tutorial builds a three-node Galera cluster and two Jellyfin 12.1 servers on one Linux machine, then checks that both servers see the same state. Every script and project file it names exists in this repository; the prepared config directory (Step 5) and the .NET build commands are not documented by the repository (see the [doc TODO list](../CONTRIBUTING.md#doc-todo-list)).
+This tutorial builds a three-node Galera cluster and two Jellyfin 12.1 servers on one Linux machine, then checks that both servers see the same state. Every script and project file it names exists in this repository. The one input you supply yourself is a prepared Jellyfin config directory (see [What you build and what you need](#what-you-build-and-what-you-need)).
 
 **Status:** Implemented, lab-verified. The scripts in `galera/lab/` are lab tooling with hard-coded credentials and run every node as a podman container on one host. The measurements quoted here are small-sample runs on one workstation; see [Results](RESULTS.md) for each figure's method. The Dolby Vision 7 -> 8.1 conversion in the same patch series is Production (reported by the maintainer, 2026-09-29) and is not part of this tutorial; see [dolby-vision.md](dolby-vision.md).
 
@@ -48,9 +48,9 @@ Both Jellyfin servers list the database nodes in the same order, so they use `gl
 | A prepared Jellyfin config directory, exported as `JG_SRC` | `jf-galera.sh` copies it for each node | `galera/lab/jf-galera.sh` |
 | MySQL or PXC 8.4 | The version is fixed in code; only PXC 8.4 was run in the lab | `galera/README.md` |
 
-The lab is not a deployment recipe. For non-lab use, supply the database password through `JELLYMESH_DB_PASSWORD` instead of `database.xml`, use TLS, and keep the password in a Secret; production MySQL or PXC settings (grants, sizing, backup) are Not documented yet (`galera/README.md`). A `GET_LOCK` cannot elect a leader on Galera, which is why the `leader/` plugin uses a Kubernetes Lease. See [operations.md](operations.md).
+The lab is not a deployment recipe. For non-lab use, supply the database password through `JELLYMESH_DB_PASSWORD` instead of `database.xml`, use TLS, and keep the password in a Secret; production MySQL or PXC settings (grants, sizing, backup) are deployment-specific and not shipped here (`galera/README.md`). A `GET_LOCK` cannot elect a leader on Galera, which is why the `leader/` plugin uses a Kubernetes Lease. See [operations.md](operations.md).
 
-The prepared config directory is the one input this repository does not create. `jf-galera.sh` describes it as a config with scheduled tasks emptied and the lab API key `jmlabkey0000000000000000000000001` present, and it defaults to `~/.cache/dbsidecar/s`. How to prepare it is not documented yet.
+The prepared config directory is the one input this repository does not create. `jf-galera.sh` describes it as a config with scheduled tasks emptied and the lab API key `jmlabkey0000000000000000000000001` present, and it defaults to `~/.cache/dbsidecar/s`. Preparing that directory is deployment-specific and not scripted here.
 
 The lab values are fixed in the scripts:
 
@@ -89,7 +89,7 @@ The provider plugin lets Jellyfin store its data in MySQL. Jellyfin loads it thr
 dotnet build -c Release galera/Jellyfin.Database.Providers.Galera
 ```
 
-The repository documents no build command for the .NET projects. The commands in Steps 2 and 5 are plain `dotnet build` invocations derived from the csproj files, and the `bin/Release/net10.0` output directories are the default .NET layout (from code reading, not run for this page). You pass the provider directory to the lab script as `JG_PLUGIN` in Step 6. The provider project targets EF Core 10.0.11, MySqlConnector 2.5.0 and `Jellyfin.Database.Implementations` 12.1.0 (`galera/README.md`).
+The provider build was run on 2026-09-30 with the .NET 10 SDK (0 errors); its output is `galera/Jellyfin.Database.Providers.Galera/bin/Release/net10.0/`. The Step 5 tool build uses the same layout. You pass the provider directory to the lab script as `JG_PLUGIN` in Step 6. The provider project targets EF Core 10.0.11, MySqlConnector 2.5.0 and `Jellyfin.Database.Implementations` 12.1.0 (`galera/README.md`).
 
 A normal build leaves out assemblies the Jellyfin server already loads. Setting `JmDesign=true` keeps them, and the csproj says that is needed only to run `dotnet ef migrations add`. You do not set it for this tutorial.
 
@@ -134,7 +134,7 @@ galera/lab/galera-lab.sh status
 | `rejoin <n>` | Removes node `n` (keeping its data volume) and restarts it as a joiner of a live node |
 | `down` | Removes all `gl-db*` containers and their data volumes |
 
-After the three nodes join, `status` should show a cluster size of 3 and `Synced` for each node. Node `n` publishes MySQL on host port `1330n`, so node 1 is on `13301`. The script's header comment and usage text disagree with this and omit `rejoin`; that is on the [doc TODO list](../CONTRIBUTING.md#doc-todo-list).
+After the three nodes join, `status` should show a cluster size of 3 and `Synced` for each node. Node `n` publishes MySQL on host port `1330n`, so node 1 is on `13301`.
 
 The script generates a lab CA and server certificate in `~/.cache/galera-lab/certs` (override with `GL_CERTS`) and mounts a `jellymesh.cnf` into each node. Two settings in that file matter:
 
@@ -287,7 +287,7 @@ The migration tool works in both directions. Use it on a real server with Jellyf
 | `copy` | `jellyfin-dbmigrate copy --from <db> --to <db>` |
 | `verify` | `jellyfin-dbmigrate verify --from <db> --to <db>` |
 
-A `<db>` is `sqlite:<path>` or `galera:<connection string>`. To back out, copy in the other direction to a new file and move it into place, then delete `database.xml`; Jellyfin defaults to SQLite (`galera/README.md`). Do not use `--probe`; it is unsafe as written (see the doc TODO list in [CONTRIBUTING](../CONTRIBUTING.md)). `verify` compares exact DateTime ticks.
+A `<db>` is `sqlite:<path>` or `galera:<connection string>`. To back out, copy in the other direction to a new file and move it into place, then delete `database.xml`; Jellyfin defaults to SQLite (`galera/README.md`). Do not pass `--probe`: as the last argument it is ignored and a full `copy` runs (`galera/README.md`). `verify` compares exact DateTime ticks.
 
 | Measurement | Result | Source |
 |---|---|---|

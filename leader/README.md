@@ -18,7 +18,7 @@ Outside Kubernetes the plugin does no election: it sets `IsLeader` to true and t
 - On Kubernetes, the pod's service account needs `get`, `create`, `update`, and `patch` on `leases` in the pod's own namespace.
 - Replica hostnames must differ, because the holder identity is `HOSTNAME`.
 
-The repo has no RBAC manifest. This Role is an example derived from the comment in `LeaseLeaderService.cs`:
+A complete example (ServiceAccount, Role, RoleBinding) is in [deploy/examples/leader-rbac.yaml](../deploy/examples/leader-rbac.yaml). The Role, derived from the comment in `LeaseLeaderService.cs`:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -33,7 +33,13 @@ rules:
 
 ## Build
 
-Not documented yet. The project file is `JellyMesh.Leader.csproj`; the build and packaging steps are on the doc TODO list in [CONTRIBUTING](../CONTRIBUTING.md#doc-todo-list).
+Build with the .NET 10 SDK from the repository root:
+
+```bash
+dotnet build -c Release leader/JellyMesh.Leader.csproj
+```
+
+The plugin assembly is `leader/bin/Release/net10.0/JellyMesh.Leader.dll` (build run on 2026-09-30: 0 warnings, 0 errors). The JellyMesh image carries it under `/opt/jellymesh/plugins`, and `image/install-plugins.sh` copies it into Jellyfin's plugin directory (see [image](../image/README.md)).
 
 ## Configure
 
@@ -54,7 +60,7 @@ The election loop ticks every max(1, `JELLYMESH_LEASE_SECONDS` / 5) seconds, whi
 
 ## Test
 
-The directory has no tests. Adding them is on the doc TODO list in [CONTRIBUTING](../CONTRIBUTING.md#doc-todo-list).
+The directory has no tests. Check the role through the log line described in [Run or use](#run-or-use).
 
 ## Limitations
 

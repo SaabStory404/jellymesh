@@ -12,7 +12,7 @@ A patch overlay for Jellyfin 12.1 that fixes N+1 (one query per row) and slow qu
 | Dolby Vision 7 -> 8.1 patches (13, 17, 18, 19) | Production (2026-09-29), opt-in, off by default [^prod] |
 | Shared transcode directory (03, 16) | Implemented, opt-in, off by default. Lab-verified (16) |
 
-[^prod]: Production is reported by the maintainer: DV 7 -> 8.1 is deployed and plays as Dolby Vision on an Android TV (SHIELD), tested repeatedly. [engineering/bughunt.md](../docs/engineering/bughunt.md) still marks 13 and 18 as MIXED evidence. AVR Dolby Digital Plus passthrough: Not measured.
+[^prod]: Production is reported by the maintainer: DV 7 -> 8.1 is deployed and plays as Dolby Vision on an Android TV (SHIELD), tested repeatedly. [engineering/bughunt.md](../docs/engineering/bughunt.md) still marks 13 and 18 as MIXED evidence. The EAC3 track from patch 19 passes through from the SHIELD to an AV receiver as Dolby Digital Plus (maintainer report, 2026-09-30).
 
 ## What it does
 
@@ -51,7 +51,7 @@ Per node: live sessions ("now playing", remote control), client capabilities, an
 
 ### Bughunt series 00-19
 
-`bughunt/NN-*.patch` apply on top of `jellyfin-12.1-perf.patch`, in numeric order. Patches with a flag in the Opt-in column are off unless the flag is set; the others apply unconditionally. Patch 14 is described in `image/Containerfile.jm7`; its per-patch write-up is Not documented yet (doc TODO in [CONTRIBUTING.md](../CONTRIBUTING.md)).
+`bughunt/NN-*.patch` apply on top of `jellyfin-12.1-perf.patch`, in numeric order. Patches with a flag in the Opt-in column are off unless the flag is set; the others apply unconditionally. Patch 14 wraps the user-data change notification in `UserDataChangeNotifier` so a database failure during the send is logged ("Error sending user data change notifications") instead of crashing the process; it is tested in `UserDataChangeNotifierTests` and shipped in `image/Containerfile.jm7`.
 
 > **Warning:** set `JELLYMESH_DOVI_P7_TO_81=1` only where the transcode pool is in the ffmpeg path. Without the shim, stock ffmpeg copies raw profile 7 while the playlist advertises 8.1 (source: patch 13 analysis in [engineering/bughunt.md](../docs/engineering/bughunt.md), known issue 5).
 
@@ -168,7 +168,7 @@ The patched Jellyfin test suites cover the integrated tree (perf patch plus the 
 | `Jellyfin.Server.Tests` |
 | `Jellyfin.Providers.Tests` |
 
-Per-run counts and per-patch tests are in [engineering/bughunt.md](../docs/engineering/bughunt.md); some rows there are marked MIXED, meaning part of the claim is not measured. Test command: Not documented yet (doc TODO in [CONTRIBUTING.md](../CONTRIBUTING.md)).
+Per-run counts and per-patch tests are in [engineering/bughunt.md](../docs/engineering/bughunt.md); some rows there are marked MIXED, meaning part of the claim is not measured. The test projects live in the patched Jellyfin tree that `build.sh` clones into `JF_SRC`; run one with, for example, `dotnet test -c Release "${JF_SRC:-$HOME/.cache/jellymesh-vendor/jellyfin-src}/tests/Jellyfin.Server.Implementations.Tests"`.
 
 Response parity between two builds is checked with `galera/tools/parity_ab.py <url-a> <url-b>`.
 
@@ -221,7 +221,7 @@ Method: 2 Jellyfins on a 3-node Galera cluster, 9 users, 20% writes, 30 s per ce
 
 | Measurement | Result | Clients | Source |
 |---|---|---|---|
-| Write on node A visible on node B, `JELLYFIN_SHARED_DB=1` | First poll, 8 of 8 trials, about 40 ms including the poll. The poll interval used in that test is Not documented yet; the code default is 250 ms | n/a | [RESULTS.md](../docs/RESULTS.md#one-store-versus-a-redis-response-cache-tier), One store versus a Redis tier |
+| Write on node A visible on node B, `JELLYFIN_SHARED_DB=1` | First poll, 8 of 8 trials, about 40 ms including the poll. The test did not record its poll interval; the code default is 250 ms (`JELLYFIN_SHARED_INVALIDATION_POLL_MS`, patch 15) | n/a | [RESULTS.md](../docs/RESULTS.md#one-store-versus-a-redis-response-cache-tier), One store versus a Redis tier |
 | Same, default per-node caches | Still stale after 65 s | n/a | same |
 | Throughput, `JELLYFIN_SHARED_DB=1` on Galera | 90.7 / 112.0 req/s | 8 / 32 | same |
 | Throughput, default per-node caches (incoherent) | 81.2 / 104.7 req/s | 8 / 32 | same |
@@ -235,7 +235,7 @@ Method: 2 Jellyfins on a 3-node Galera cluster, 9 users, 20% writes, 30 s per ce
 - Per-node state stays per node (see [Shared-database mode](#shared-database-mode)). Client-to-node affinity is only partly addressed by patch 16.
 - At 1 client SQLite is faster than Galera (44.8 vs 27.6 req/s, patched; [RESULTS.md](../docs/RESULTS.md#concurrent-load), Concurrent load); the shared cluster is faster under load.
 - The perf patch and patches 07 and 08 change plugin-facing interfaces (see [Interface changes for plugin authors](#interface-changes-for-plugin-authors)).
-- Dolby Vision conversion needs the transcode pool in the ffmpeg path. AVR Dolby Digital Plus passthrough: Not measured.
+- Dolby Vision conversion needs the transcode pool in the ffmpeg path.
 - Statement counts for patch 08 (3N -> 3) come from unit tests; a live-lab count is listed as a follow-up in the engineering log.
 
 ## Related docs
