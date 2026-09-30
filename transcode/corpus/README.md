@@ -1,6 +1,6 @@
 # ffmpeg command corpus (P0, 2026-09-26)
 
-Golden inputs for the `ir` crate: every command line here must parse. Until P1 lands, renders are compared with the spike's Python translation, which serves as the parity oracle.
+Golden inputs for the `ir` crate: every command line in here has to parse. Until P1 lands, renders are compared against the spike's Python translation, which is the parity oracle.
 
 | File | Source | Commands | Shape |
 |---|---|---|---|
@@ -10,7 +10,7 @@ Golden inputs for the `ir` crate: every command line here must parse. Until P1 l
 
 Format: `<log kind>\t<full command line>`. Paths reference the lab titles and prod media.
 
-Shapes seen (MEASURED from these files):
+Shapes that actually turn up in these files:
 - `-filter_complex` overlay for image (PGS) subtitle burn-in, and `subtitles=` for text burn-in;
 - `crop` and `pad`;
 - `-readrate` and `-readrate_catchup` on copy/remux;
@@ -19,4 +19,4 @@ Shapes seen (MEASURED from these files):
 
 Known gaps:
 - **Seek variant:** `StartTimeTicks` on master.m3u8 returns HTTP 400. Failover restarts already produce `-ss` commands.
-- **Shared-scratch race:** one stream-copy session of Sample B hit it intermittently. Jellyfin served a segment while the file was still growing (`Content-Length mismatch 8404992 of 8388608`); it did not reproduce in 6 more sessions. The native agent writes segments via a temp name and an atomic rename (P1).
+- **Shared-scratch race:** one stream-copy session of Sample B hit it intermittently. Jellyfin served a segment while the file was still growing (`Content-Length mismatch 8404992 of 8388608`), and it didn't reproduce in 6 more sessions. The native agent writes segments via a temp name and an atomic rename (P1).

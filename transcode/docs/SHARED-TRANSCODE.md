@@ -1,7 +1,8 @@
 # Shared transcode directory across Jellyfin replicas
 
-Status: implemented behind `JELLYMESH_SHARED_TRANSCODE_DIR=1` (Jellyfin, bughunt patch 16) and an
-additive protocol field (pool). Off by default; with the flag unset both sides behave exactly as before.
+This sits behind `JELLYMESH_SHARED_TRANSCODE_DIR=1` on Jellyfin (bughunt patch 16) plus an additive
+protocol field on the pool side. It's off by default, and with the flag unset both sides behave
+exactly as they did before.
 
 ## Goal
 
@@ -16,7 +17,7 @@ each replica had its own subdirectory and a failover meant a fresh transcode on 
 |---|---|---|
 | The pool agent fenced (killed) a job the moment its shim's connection closed, so the job died with the replica that started it | `agent/job.rs` | **Detach**: a job whose shim sent a keepalive path keeps running without its shim |
 | The lease (`<stem>.tcpool.lock`) was heartbeated only by the shim, so it went stale with the replica | shim `lease.rs` | the agent heartbeats it too, from job start |
-| Progress pings are per node: the owner's kill timer fired while the client pinged the other replica (MEASURED in jm-lab, BUGHUNT follow-up 1) | `TranscodeManager` | pings and segment requests on **any** replica touch a shared session keepalive; the owner's kill timer re-arms while it is fresh |
+| Progress pings are per node: the owner's kill timer fired while the client pinged the other replica (watched it happen in jm-lab, BUGHUNT follow-up 1) | `TranscodeManager` | pings and segment requests on **any** replica touch a shared session keepalive; the owner's kill timer re-arms while it is fresh |
 | A seek on the non-owner waited 15 s for a segment the other writer would never produce, then started a second ffmpeg that could only `follow()` the lease forever | `DynamicHlsController` (patch 03), shim `follow()` | seek detection against the other writer's edge (Jellyfin's own restart gap); the new shim **takes the output over** |
 | Session-derived output names are identical on both replicas, so the old owner's cleanup could delete the new writer's segments | `DeletePartialStreamFiles` | skip when a fresh lease on the output is held by another host |
 | Startup wipe of the transcode dir | `DeleteEncodedMediaCache` | already scoped (6 h cutoff) under `JELLYFIN_SHARED_DB=1`; now also under the shared-dir flag |
@@ -83,9 +84,9 @@ no owner, so the agent does the same, once a second, against the viewer's positi
 - **Output edge**: the segment ffmpeg last announced opening on stderr
   (`Opening '<stem>N.ts.tmp' for writing`, info level, once per segment): N-1 is complete. Not
   the playlist: with Jellyfin's `-hls_playlist_type vod` ffmpeg writes it only when the encode
-  ends (MEASURED in jm-lab and with ffmpeg 8.1; the first lab run of this throttle found no
-  playlist at all mid-stream). Not a directory scan: an earlier writer's segments of the same
-  output may still be there.
+  ends, which I checked in jm-lab and against ffmpeg 8.1 — the first lab run of this throttle
+  found no playlist at all mid-stream. Not a directory scan either: an earlier writer's segments
+  of the same output may still be there.
 - **Decision** (`tcpool_ir::shared::orphan_throttle`): lead = (edge - position) x `-hls_time`.
   Pause above `TC_ORPHAN_LEAD_MAX_SECS` (60 s; `0` = never throttle), resume below
   `TC_ORPHAN_LEAD_RESUME_SECS` (30 s). The gap between the two keeps it from flapping every segment.
@@ -103,9 +104,9 @@ no owner, so the agent does the same, once a second, against the viewer's positi
 ## Cross-replica keepalive (the kill-timer blocker)
 
 - `PlaystateController`'s progress handlers call `PingTranscodingJob` directly before the
-  PlaybackProgress event fans out: a throwing subscriber earlier in the chain (MEASURED in jm-lab:
-  the Playback Reporting plugin, for a session the replica never saw start) otherwise stops the
-  transcode manager's handler from running, which is exactly the failed-over case.
+  PlaybackProgress event fans out: a throwing subscriber earlier in the chain otherwise stops the
+  transcode manager's handler from running, which is exactly the failed-over case. In jm-lab the
+  subscriber that threw was the Playback Reporting plugin, for a session the replica never saw start.
 - `PingTranscodingJob` (progress/ping, any replica) touches the keepalive **before** the local job
   lookup, preserving the paused state when the ping does not say (`/Sessions/Playing/Ping`).
 - `GetDynamicSegment` (any replica) touches it on every segment request.
@@ -155,7 +156,7 @@ replica serves them. Segments:
   no job for that output and never runs the per-job delete for it.
 - Cost of a detached job: the agent throttles it (see "Throttling a detached job"), so it runs
   at most ~60 s of video ahead of its viewer, like an owned job under Jellyfin's throttler. Before
-  that (the jm7 draft) it ran unthrottled: MEASURED in jm-lab, each orphan wrote 287-315 segments
+  that (the jm7 draft) it ran unthrottled, and in jm-lab each orphan wrote 287-315 segments
   (~15 min of video) in the ~2.5 min between detach and expiry. A paused job still counts its
   units in the agent's admission (it is still a running job), but it no longer uses the encoder.
   `EnableSegmentDeletion` never runs on it (no owner job).
@@ -164,7 +165,7 @@ replica serves them. Segments:
   takeover unanswered -> follow after 8 s). An old shim against a new agent never sends a keepalive
   (fence-on-loss, unchanged). Roll agents first, then Jellyfin.
 
-## Lab proof (jm-lab, 2026-09-28, MEASURED)
+## Lab proof (jm-lab, 2026-09-28)
 
 Setup: both `jm-jf` replicas on one transcode dir (`/transcodes/jm-st` on the NFS scratch), patch 14
 overlay + new shim, one NVENC agent built from this branch (`jm-st-agent`, plaintext, lab only).

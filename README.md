@@ -6,19 +6,19 @@ Run several Jellyfin 12.1 servers on one shared MySQL/Galera database, with a GP
 [![transcode](https://github.com/SaabStory404/jellymesh/actions/workflows/transcode.yml/badge.svg)](.github/workflows/transcode.yml)
 [![tcpool images](https://github.com/SaabStory404/jellymesh/actions/workflows/transcode-images.yml/badge.svg)](.github/workflows/transcode-images.yml)
 
-**Status:** Implemented, Lab-verified. Dolby Vision 7 -> 8.1 is Production: the maintainer reports it is deployed and plays as Dolby Vision on the maintainer's cluster (2026-09-29). The maintainer runs the whole stack on one home k3s cluster ([docs/operations.md](docs/operations.md)). Label definitions are in [Status and limitations](#status-and-limitations).
+I run the whole stack on one home k3s cluster ([docs/operations.md](docs/operations.md)). The Dolby Vision 7 -> 8.1 path is the piece I'd call production: it's deployed and has been playing as Dolby Vision since 2026-09-29. Everything else is code I've exercised in a lab, and [Status and limitations](#status-and-limitations) says which is which.
 
 **Who this is for and what it needs:**
 
 - You run Jellyfin and want more than one server behind one address, sharing one database.
-- The shared database is MySQL 8.4 or Percona XtraDB Cluster; the Leader plugin and the Traefik failover route assume Kubernetes (k3s in the maintainer's setup).
-- The transcode pool needs GPU nodes (Intel QSV or NVIDIA NVENC) or CPU workers. An example Traefik failover route is in [deploy/examples/traefik-failover.yaml](deploy/examples/traefik-failover.yaml); [docs/operations.md](docs/operations.md#traefik-activepassive-failover) explains it.
+- The shared database is MySQL 8.4 or Percona XtraDB Cluster. The Leader plugin and the Traefik failover route assume Kubernetes, k3s in my case.
+- The transcode pool needs GPU nodes (Intel QSV or NVIDIA NVENC) or CPU workers. There's an example Traefik failover route in [deploy/examples/traefik-failover.yaml](deploy/examples/traefik-failover.yaml), explained in [docs/operations.md](docs/operations.md#traefik-activepassive-failover).
 
 ## Why
 
 Stock Jellyfin assumes one process over one SQLite file. Running a second server runs into three problems: SQLite allows one writer, some queries perform well only on SQLite, and per-process caches go stale when another server writes.
 
-JellyMesh addresses each of them, so any server can answer any request and the database is the only shared state. Terms such as Galera (synchronous multi-primary MySQL replication), N+1 (one query per row of a first query), and Lease (a Kubernetes object used for leader election) are defined in the [glossary](docs/architecture.md#glossary).
+JellyMesh addresses each of them, so any server can answer any request and the database is the only shared state. If a term here is unfamiliar, [Galera](docs/architecture.md#glossary) and the rest are in the glossary.
 
 ## Where each part lives
 
@@ -32,27 +32,27 @@ JellyMesh addresses each of them, so any server can answer any request and the d
 
 ## What exists
 
-| Feature | What it does | Status | Docs |
+| Feature | What it does | Where it stands | Docs |
 |---|---|---|---|
-| Shared database provider | Runs Jellyfin 12.1 on MySQL 8.4 or Percona XtraDB Cluster | Implemented | [galera/README.md](galera/README.md) |
-| `jellyfin-dbmigrate` | Lossless SQLite <-> MySQL migration in either direction, with a row-by-row verifier | Implemented | [galera/README.md](galera/README.md) |
-| Query patches | Fix N+1 query shapes in people, lyrics, and dedupe, and add a Resume sort key MySQL can plan | Implemented | [jellyfin-perf/README.md](jellyfin-perf/README.md) |
-| `JELLYFIN_SHARED_DB=1` | Retries user-data writes and reads user data and login sessions from the database | Implemented | [jellyfin-perf/README.md](jellyfin-perf/README.md) |
-| Leader plugin | Runs scheduled tasks once, cluster-wide, using a Kubernetes Lease; outside Kubernetes the node is the leader | Implemented | [docs/operations.md](docs/operations.md) |
-| Traefik active/passive failover | Lab route: primary `jm-jf-0`, fallback `jm-jf-1` (n=1 drill) | Lab-verified | [docs/architecture.md](docs/architecture.md#failover-behavior) |
-| GPU transcode pool | `tcpool-shim` replaces ffmpeg; one agent per GPU (Intel QSV, NVIDIA NVENC) plus CPU spill; gRPC with mTLS; command allowlist | Implemented | [transcode/README.md](transcode/README.md) |
-| Shared transcode directory | Replicas and agents share one scratch directory so a transcode survives replica loss (3-session lab proof, plaintext gRPC, one NVENC agent) | Implemented, opt-in, off by default | [docs/operations.md](docs/operations.md) |
-| Dolby Vision 7 -> 8.1 | Converts dual-layer profile 7 sources to profile 8.1 during HLS playback; enable with `JELLYMESH_DOVI_P7_TO_81=1` | Production (2026-09-29), opt-in | [docs/dolby-vision.md](docs/dolby-vision.md) |
-| TrueHD to EAC3 5.1 | Makes audio playable in the Android TV app on the Dolby Vision path | Implemented | [docs/dolby-vision.md](docs/dolby-vision.md) |
-| Published image | `ghcr.io/saabstory404/jellymesh-jellyfin`, built manually with podman | Implemented | [docs/operations.md](docs/operations.md) |
+| Shared database provider | Runs Jellyfin 12.1 on MySQL 8.4 or Percona XtraDB Cluster | in the repo | [galera/README.md](galera/README.md) |
+| `jellyfin-dbmigrate` | Lossless SQLite <-> MySQL migration in either direction, with a row-by-row verifier | in the repo | [galera/README.md](galera/README.md) |
+| Query patches | Fix N+1 query shapes in people, lyrics, and dedupe, and add a Resume sort key MySQL can plan | in the repo | [jellyfin-perf/README.md](jellyfin-perf/README.md) |
+| `JELLYFIN_SHARED_DB=1` | Retries user-data writes and reads user data and login sessions from the database | in the repo | [jellyfin-perf/README.md](jellyfin-perf/README.md) |
+| Leader plugin | Runs scheduled tasks once, cluster-wide, using a Kubernetes Lease; outside Kubernetes the node is the leader | in the repo | [docs/operations.md](docs/operations.md) |
+| Traefik active/passive failover | Lab route: primary `jm-jf-0`, fallback `jm-jf-1`, drilled once | lab only | [docs/architecture.md](docs/architecture.md#failover-behavior) |
+| GPU transcode pool | `tcpool-shim` replaces ffmpeg; one agent per GPU (Intel QSV, NVIDIA NVENC) plus CPU spill; gRPC with mTLS; command allowlist | in the repo | [transcode/README.md](transcode/README.md) |
+| Shared transcode directory | Replicas and agents share one scratch directory so a transcode survives replica loss; proved in the lab with 3 sessions, plaintext gRPC and one NVENC agent | in the repo, opt-in, off by default | [docs/operations.md](docs/operations.md) |
+| Dolby Vision 7 -> 8.1 | Converts dual-layer profile 7 sources to profile 8.1 during HLS playback; enable with `JELLYMESH_DOVI_P7_TO_81=1` | running on my cluster since 2026-09-29, opt-in | [docs/dolby-vision.md](docs/dolby-vision.md) |
+| TrueHD to EAC3 5.1 | Makes audio playable in the Android TV app on the Dolby Vision path | in the repo | [docs/dolby-vision.md](docs/dolby-vision.md) |
+| Published image | `ghcr.io/saabstory404/jellymesh-jellyfin`, built manually with podman | in the repo | [docs/operations.md](docs/operations.md) |
 
 ## Dolby Vision profile 7 -> 8.1, live
 
-JellyMesh converts dual-layer Dolby Vision profile 7 sources to single-layer profile 8.1 during HLS playback, for clients that decode single-layer Dolby Vision. The maintainer reports it is deployed and plays as Dolby Vision on the SHIELD Android TV app, tested repeatedly (Production, 2026-09-29).
+JellyMesh converts dual-layer Dolby Vision profile 7 sources to single-layer profile 8.1 during HLS playback, for clients that decode single-layer Dolby Vision. It's deployed on my cluster and has been playing as Dolby Vision in the SHIELD Android TV app since 2026-09-29, and I've retested it plenty of times since.
 
-The Jellyfin patches decide when to convert. The transcode agent rewrites the in-band RPU (per-frame Dolby Vision metadata) to profile 8.1 and drops the enhancement layer. The HLS job uses fMP4 segments, so the init segment carries a `dvvC` box, which is the signal the app uses to show Dolby Vision.
+The Jellyfin patches decide when to convert. The transcode agent rewrites the in-band RPU (the per-frame Dolby Vision metadata) to profile 8.1 and drops the enhancement layer. The HLS job uses fMP4 segments, so the init segment carries a `dvvC` box, which is the signal the app uses to show Dolby Vision.
 
-TrueHD or MLP audio with 6 or more channels is encoded to EAC3 5.1 at 640 kb/s when the client lists `eac3`, otherwise to AAC. The EAC3 track passes through from the SHIELD to an AV receiver as Dolby Digital Plus (maintainer report, 2026-09-30).
+TrueHD or MLP audio with 6 or more channels is encoded to EAC3 5.1 at 640 kb/s when the client lists `eac3`, otherwise to AAC. On 2026-09-30 I watched that EAC3 track pass through from the SHIELD to an AV receiver as Dolby Digital Plus.
 
 Limits:
 
@@ -85,36 +85,36 @@ flowchart LR
   A -.- S
 ```
 
-Solid lines are the primary path; dotted lines are the fallback route or opt-in paths. The scratch directory is shared across replicas only with `JELLYMESH_SHARED_TRANSCODE_DIR=1`; the NFS scratch itself is an agent-side PVC (`15-scratch.yaml` in [docs/operations.md](docs/operations.md)).
+Solid lines are the primary path; dotted lines are the fallback route or opt-in paths. The scratch directory is shared across replicas only with `JELLYMESH_SHARED_TRANSCODE_DIR=1`, and the NFS scratch itself is an agent-side PVC (`15-scratch.yaml` in [docs/operations.md](docs/operations.md)).
 
-Each replica runs the Galera provider, the jellyfin-perf patches, the Leader plugin, and `tcpool-shim`. The shim is inert until `TC_WORKERS_DNS` or `TC_WORKERS` is set. Which replica uses QSV and which uses NVENC is deployment-specific and not shipped here. More detail: [docs/architecture.md](docs/architecture.md).
+Each replica runs the Galera provider, the jellyfin-perf patches, the Leader plugin, and `tcpool-shim`. The shim does nothing until `TC_WORKERS_DNS` or `TC_WORKERS` is set. Which replica gets QSV and which gets NVENC is up to you; this repo doesn't decide it. More detail: [docs/architecture.md](docs/architecture.md).
 
 ## Measured results
 
-All rows come from one 12-core workstation with every node on it (n=1 per cell), so treat them as lab numbers. Method and full tables: [docs/RESULTS.md](docs/RESULTS.md).
+Every number below came from one 12-core workstation with every node running on it, and each cell is a single run. They're lab numbers, not a benchmark. Method and full tables: [docs/RESULTS.md](docs/RESULTS.md).
 
-| Result | Value | Context | Source |
+| Result | Value | Context | Full table |
 |---|---|---|---|
-| Throughput, 2 Jellyfin on 3-node Galera | 120.2 req/s vs 55.4 req/s stock SQLite | 32 clients, 9 users, 20% writes, 30 s per cell; patched SQLite reached 93.6 req/s at 32 clients | [docs/RESULTS.md](docs/RESULTS.md#concurrent-load), Concurrent load |
-| Throughput at 1 client | SQLite wins: 44.8 vs 27.6 req/s | Patched SQLite vs patched Galera with 1 Jellyfin, 30 s per cell | [docs/RESULTS.md](docs/RESULTS.md#concurrent-load), Concurrent load |
-| Database node killed under load | 204 requests, 0 failed, longest gap 2.9 s | SIGKILL of one Galera node, `FailOver` connection list, 3-node cluster, lab drill | [docs/RESULTS.md](docs/RESULTS.md#failure-drills), Failure drills |
-| Cross-node coherence | Write on node A visible on node B at the first poll in 8 of 8 trials (about 40 ms); token from node B accepted on node C 150 ms later and refused on both after logout | 2 Jellyfins with `JELLYFIN_SHARED_DB=1` on the 3-node cluster | [docs/RESULTS.md](docs/RESULTS.md#one-store-versus-a-redis-response-cache-tier), One store versus a Redis tier and [Failure drills](docs/RESULTS.md#failure-drills) |
+| Throughput, 2 Jellyfin on 3-node Galera | 120.2 req/s vs 55.4 req/s stock SQLite | 32 clients, 9 users, 20% writes, 30 s per cell; patched SQLite reached 93.6 req/s at 32 clients | [Concurrent load](docs/RESULTS.md#concurrent-load) |
+| Throughput at 1 client | SQLite wins: 44.8 vs 27.6 req/s | Patched SQLite vs patched Galera with 1 Jellyfin, 30 s per cell | [Concurrent load](docs/RESULTS.md#concurrent-load) |
+| Database node killed under load | 204 requests, 0 failed, longest gap 2.9 s | SIGKILL of one Galera node, `FailOver` connection list, 3-node cluster, lab drill | [Failure drills](docs/RESULTS.md#failure-drills) |
+| Cross-node coherence | Write on node A visible on node B at the first poll in 8 of 8 trials (about 40 ms); token from node B accepted on node C 150 ms later and refused on both after logout | 2 Jellyfins with `JELLYFIN_SHARED_DB=1` on the 3-node cluster | [One store versus a Redis tier](docs/RESULTS.md#one-store-versus-a-redis-response-cache-tier) and [Failure drills](docs/RESULTS.md#failure-drills) |
 | `/Persons` (100 items) | 103 -> 4 SQL statements | Galera, counted from `performance_schema` | [jellyfin-perf/README.md](jellyfin-perf/README.md) |
 | Audio grid (200 items) | 207 -> 8 SQL statements | Galera, counted from `performance_schema` | [jellyfin-perf/README.md](jellyfin-perf/README.md) |
 
-The library is a real 19,259-item library ([docs/RESULTS.md](docs/RESULTS.md#test-bed-and-limits), Test bed and limits). Response parity with stock is a sampled check of 14 calls; Resume and NextUp were empty and are not covered ([docs/RESULTS.md](docs/RESULTS.md#parity), Parity).
+The library behind those runs is a real one, 19,259 items ([test bed and limits](docs/RESULTS.md#test-bed-and-limits)). Response parity with stock is a sampled check of 14 calls; Resume and NextUp came back empty, so they aren't covered ([parity](docs/RESULTS.md#parity)).
 
 ## Quickstart
 
-Prerequisites: podman. The lab runs every node as a podman container and sets no memory limits; the memory the three database nodes need was not measured.
+You need podman. The lab runs every node as a podman container and sets no memory limits, and I never measured how much memory the three database nodes actually want.
 
-Pull the image. This runs nothing by itself; deployment is covered in [docs/operations.md](docs/operations.md).
+Pull the image. This runs nothing by itself; deployment is in [docs/operations.md](docs/operations.md).
 
 ```bash
 podman pull ghcr.io/saabstory404/jellymesh-jellyfin:12.1-jm8.4
 ```
 
-Run the lab. Start a three-node Galera cluster and a Jellyfin node from the repo root. `jf-galera.sh up` needs a prepared config directory (`JG_SRC`) and arguments that these commands omit, so the block below will not start a working server without them. The full tutorial is [docs/getting-started.md](docs/getting-started.md).
+Run the lab from the repo root: three Galera nodes, then a Jellyfin node. Don't expect a working server out of the block below. `jf-galera.sh up` wants a prepared config directory (`JG_SRC`) and arguments these lines omit, and this repo doesn't build one for you. [docs/getting-started.md](docs/getting-started.md) is the full tutorial.
 
 ```bash
 galera/lab/galera-lab.sh boot
@@ -137,22 +137,19 @@ galera/lab/jf-galera.sh up
 | See what is planned | [docs/ROADMAP.md](docs/ROADMAP.md) |
 | Read engineering logs | [docs/README.md](docs/README.md#engineering-records) |
 
+The full index of pages is [docs/README.md](docs/README.md). If you've found a vulnerability, don't open an issue: [SECURITY.md](SECURITY.md) has the private reporting route. What changed under each image tag is in [CHANGELOG.md](CHANGELOG.md).
+
 ## Status and limitations
 
-| Label | Meaning | Examples |
-|---|---|---|
-| Implemented | Code is in the repo | Galera provider, jellyfin-perf patches, Leader plugin, transcode pool |
-| Production | Deployed on the maintainer's cluster, as reported by the maintainer | Dolby Vision 7 -> 8.1 (2026-09-29) |
-| Lab-verified | Measured in a lab only | Traefik failover, shared transcode directory (2026-09-28), benchmarks |
-| Planned | Not implemented, see [docs/ROADMAP.md](docs/ROADMAP.md) | Sticky failover, plugin compatibility layer, playback observability, `hvcE` Dolby Vision sources |
+Most of what's here is code in the repo that I've run myself: the Galera provider, the jellyfin-perf patches, the Leader plugin, and the transcode pool. The Dolby Vision 7 -> 8.1 conversion is the one piece deployed on my cluster, playing as Dolby Vision since 2026-09-29. The Traefik failover, the shared transcode directory (2026-09-28), and every benchmark on this page have only been run in my lab. Sticky failover, a plugin compatibility layer, playback observability, and `hvcE` Dolby Vision sources aren't built at all yet; they're in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 Known gaps:
 
 - Live-session state (now playing, remote control), client capabilities, and running transcodes stay per server ([docs/troubleshooting.md](docs/troubleshooting.md)).
-- Plugins that keep their own SQLite files (for example Playback Reporting) are not shared-database safe.
+- Plugins that keep their own SQLite files (Playback Reporting, for example) are not shared-database safe.
 - Intro Skipper, Playback Reporting, and Kodi Sync Queue are blocked on the fallback server ([docs/operations.md](docs/operations.md), [docs/ROADMAP.md](docs/ROADMAP.md)).
-- Sticky failover is planned: today a viewer who failed over returns to the primary when it is healthy, which costs two ffmpeg restarts ([docs/architecture.md](docs/architecture.md#failover-behavior)). Direct play needs a client that retries with a Range request.
-- The Leader plugin takes effect only on Kubernetes, and leader failover time is not measured.
+- Failover isn't sticky yet: a viewer who failed over goes back to the primary once it's healthy, which costs two ffmpeg restarts ([docs/architecture.md](docs/architecture.md#failover-behavior)). Direct play needs a client that retries with a Range request.
+- The Leader plugin only takes effect on Kubernetes, and I haven't measured how long a leader failover takes.
 - The Galera provider depends on unmerged community Pomelo pull request #2047 (Pomelo is the MySQL provider for Entity Framework Core) plus a JellyMesh patch.
 - The provider does not back up or restore through Jellyfin's own hooks. Back up the cluster yourself ([galera/README.md](galera/README.md)).
 
@@ -166,9 +163,3 @@ Known gaps:
 | Pomelo patch | Applies to [Pomelo.EntityFrameworkCore.MySql](https://github.com/PomeloFoundation/Pomelo.EntityFrameworkCore.MySql) (MIT), built from community EF Core 10 pull request #2047 | [galera/README.md](galera/README.md) |
 
 JellyMesh is not reviewed or endorsed by the Jellyfin project and is not affiliated with it. Jellyfin and related names and marks belong to their respective owners and are used here only to describe compatibility.
-
-## Related docs
-
-- [docs/README.md](docs/README.md)
-- [SECURITY.md](SECURITY.md)
-- [CHANGELOG.md](CHANGELOG.md)

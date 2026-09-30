@@ -1,15 +1,15 @@
 # tcpool deployment contract
 
-What the transcode pool publishes and what it needs from whoever runs Jellyfin. Written for the
-JellyMesh session (PR #155): everything below is settled on this side, so JellyMesh can build
-against it without reading the Rust.
+What the transcode pool publishes and what it needs from whoever runs Jellyfin. Everything below is
+settled on the pool side, so the JellyMesh side (PR #155) can build against it without reading the
+Rust.
 
-Status 2026-09-27: nothing here is applied to the cluster and no image has been pushed. Manifests
-live in `k8s/`. The Jellyfin-side snippets (`k8s/jellyfin-patch.md`) are deployment-specific and
-not shipped here; the tables below state what the Jellyfin pod must provide.
+As of 2026-09-27 nothing here is applied to the cluster and no image has been pushed. The manifests
+live in `k8s/`. The Jellyfin-side snippets (`k8s/jellyfin-patch.md`) are up to you and aren't
+shipped here; the tables below state what the Jellyfin pod must provide.
 
-Update 2026-09-29: Dolby Vision 7 -> 8.1, which the agent performs, is in production (maintainer
-report); see `docs/dolby-vision.md`.
+Dolby Vision 7 -> 8.1, which the agent performs, has been in production since 2026-09-29; see
+`docs/dolby-vision.md`.
 
 ## Images
 
@@ -24,8 +24,8 @@ that diff lie about what is running. Build both locally with `deploy/build-image
 **Base image must match Jellyfin's.** The agent spawns jellyfin-ffmpeg rather than linking libav*,
 and Jellyfin emits filter graphs specific to its own fork. The pin above matches the planned
 `ghcr.io/saabstory404/jellymesh-jellyfin:12.1-jm3` (itself `FROM` hotio `release-12.1`). Bump the
-two together. **OPEN:** prod Jellyfin today is still `release-12.0`, and the plan's "the shim refuses
-a major ffmpeg mismatch" is not implemented — the digest pin is the only guard.
+two together. Still open: prod Jellyfin today is still `release-12.0`, and the plan's "the shim
+refuses a major ffmpeg mismatch" is not implemented — the digest pin is the only guard.
 
 ## Ports
 
@@ -52,7 +52,7 @@ to a worker that is shutting down.
 | `TC_NAME` | `qsv-$(NODE_NAME)` etc. | what the shim logs. `NODE_NAME` must be defined earlier in the env list for `$(...)` to expand |
 | `NODE_NAME` | `fieldRef: spec.nodeName` | |
 | `TC_CAPACITY` | Arc `14`, P4 `6`, CPU `3` | resolution-weighted units, a hard admission ceiling. **Must be set**: with neither this nor `TC_MAX_JOBS` the agent defaults to 1000 units, i.e. unbounded |
-| `TC_WEIGHT_4K` | Arc `2.3`, P4 `2`, CPU `3` | MEASURED on the cards; the CPU value is an estimate |
+| `TC_WEIGHT_4K` | Arc `2.3`, P4 `2`, CPU `3` | measured on the cards; the CPU value is an estimate |
 | `TC_FFMPEG` | `/usr/lib/jellyfin-ffmpeg/ffmpeg` | image default |
 | `TC_HEALTH_PORT` | `9902` | |
 | `TC_METRICS_PORT` | `9903` | agent metrics, see Ports |
@@ -129,8 +129,8 @@ The two Jellyfin data hostPaths use `type: Directory`, not `DirectoryOrCreate`: 
 should fail the pod visibly rather than have the kubelet plant a `root:root` directory inside prod
 Jellyfin's own config tree, which Jellyfin (uid 1000) could then never write subtitles into. This
 means **both GPU nodes need `/srv/appdata/media/jellyfin/data/data/{subtitles,attachments}` to
-exist**. INHERITED, not checked: the placer moves Jellyfin between the tower and the dl380, so that
-config path is presumably present (or shared) on both - verify before the first apply.
+exist**. I haven't checked that myself: the placer moves Jellyfin between the tower and the dl380,
+so that config path is presumably present (or shared) on both - verify before the first apply.
 
 `storageClassName: ""` on both the PV and the PVC is required, not cosmetic: the cluster has two
 StorageClasses both marked default, so an unqualified RWX claim binds non-deterministically.
@@ -159,8 +159,8 @@ Details: `transcode/docs/SHARED-TRANSCODE.md`.
 2. **Leave the root's ownership alone.** It is `root:media` (gid 1000) mode `1777`, with
    `.jellyfin-transcode` owned `root:root 0644`, on purpose. Jellyfin runs as uid 1000 and cannot
    delete that marker, so its startup wipe throws, the exception is swallowed, `File.Exists` stays
-   true, and the racy marker re-create path — which returned HTTP 500 to two viewers starting at
-   once, MEASURED twice — never fires.
+   true, and the racy marker re-create path — which I watched return HTTP 500 to two viewers
+   starting at once, twice — never fires.
 
 ## Dolby Vision 7 -> 8.1 (P5, wired on `dv81-wire`)
 
