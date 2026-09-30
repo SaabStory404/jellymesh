@@ -1,0 +1,88 @@
+# Example: Traefik active/passive failover for two JellyMesh replicas.
+#
+# Shape and values come from the lab drill in docs/engineering/direct-play-failover.md:
+# a 2-replica StatefulSet `jm-jf`, a `failover` TraefikService `jm-failover` (primary jm-jf-0,
+# fallback jm-jf-1, fail over on 502-504), and a ServersTransport `jm-fast-dial` with a 500 ms
+# dial timeout. Namespace, host, TLS secret and port are placeholders: replace them.
+#
+# Requires Traefik v3 with the Kubernetes CRD provider. See docs/operations.md
+# ("Traefik active/passive failover") for measured behavior and limits.
+---
+# One Service per pod, so Traefik can address the primary and the fallback separately.
+apiVersion: v1
+kind: Service
+metadata:
+  name: jm-jf-0
+  namespace: jellymesh
+spec:
+  selector:
+    statefulset.kubernetes.io/pod-name: jm-jf-0
+  ports:
+    - name: http
+      port: 8096
+      targetPort: 8096
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jm-jf-1
+  namespace: jellymesh
+spec:
+  selector:
+    statefulset.kubernetes.io/pod-name: jm-jf-1
+  ports:
+    - name: http
+      port: 8096
+      targetPort: 8096
+---
+# Fail fast when a replica is down: a 500 ms dial timeout instead of Traefik's default.
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: jm-fast-dial
+  namespace: jellymesh
+spec:
+  forwardingTimeouts:
+    dialTimeout: 500ms
+---
+apiVersion: traefik.io/v1alpha1
+kind: TraefikService
+metadata:
+  name: jm-failover
+  namespace: jellymesh
+spec:
+  failover:
+    service:
+      name: jm-jf-0
+      port: 8096
+      serversTransport: jm-fast-dial
+      # Health-check-based failover needs a health check on the main service.
+      # Interval and timeout are example values, not measured in the lab.
+      healthCheck:
+        path: /health
+        interval: 5s
+        timeout: 2s
+    fallback:
+      name: jm-jf-1
+      port: 8096
+      serversTransport: jm-fast-dial
+    errors:
+      status:
+        - "502-504"
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: jellyfin
+  namespace: jellymesh
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`jellyfin.example.com`)
+      kind: Rule
+      services:
+        - name: jm-failover
+          kind: TraefikService
+  tls:
+    secretName: jellyfin-example-tls

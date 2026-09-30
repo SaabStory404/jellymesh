@@ -1,5 +1,5 @@
 //! The two ffmpeg command lines of a DV7 -> 8.1 remux, derived from Jellyfin's own argv
-//! (`transcode/docs/PLAN.md` P5). Pure: argv in, argv out.
+//! (`docs/engineering/transcode-plan.md` P5). Pure: argv in, argv out.
 //!
 //! - **ffmpeg#1 (demux)**: Jellyfin's input options (so `-ss`, `-t`, `-noaccurate_seek`, probe
 //!   limits all apply exactly as in the plain remux) + `-map 0:v:0 -c:v copy` into MPEG-TS on

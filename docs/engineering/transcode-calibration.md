@@ -1,6 +1,8 @@
+> Status: calibration record. The "Recommendation (first pass ...)" table is superseded by the "P5 applied" section below. Raw data files stay in `transcode/calibration/`; file names below such as `2026-09-26-p0.csv` are relative to that directory.
+
 # Transcode pool calibration — P0, 2026-09-26/27
 
-First calibration pass for `transcode/docs/PLAN.md` §4 (quality) and §5 (startup
+First calibration pass for `docs/engineering/transcode-plan.md` §4 (quality) and §5 (startup
 latency). Everything here is **MEASURED** in the `tc-lab` namespace on this cluster; nothing is
 inherited from the plan. Raw rows: `2026-09-26-p0.csv` (one row per encode).
 
@@ -149,8 +151,6 @@ which is P4's measurement, not P0's.
 | Arc A380 | hevc | same + `-look_ahead_depth 40 -b_strategy 1` | medium | `adaptive_i`/`adaptive_b` are silently dropped, so do not bother |
 | Tesla P4 | h264 | keep a quality target but make it fill the cap: `-rc vbr -cq 23 -b:v 0.95*cap -maxrate cap -bufsize 2*cap -tune hq -multipass fullres -spatial-aq 1 -temporal-aq 1 -b_ref_mode middle` | p5 | plain VBR lost 1.3 VMAF vs today's `-cq`; the hybrid is the P5 experiment |
 | Tesla P4 | hevc | same minus `-temporal-aq`/`-b_ref_mode` (rejected on Pascal) | p5 | |
-
-<!--QUALITY-->
 
 ## P5 applied: calibrated rate control in `render()` (2026-09-27)
 

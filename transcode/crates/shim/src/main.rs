@@ -936,7 +936,7 @@ fn trickplay_frame_count(args: &[String]) -> usize {
 ///   the shim exits `BATCH_PARTIAL_FAILURE_EXIT` and does NOT touch the output. Jellyfin throws
 ///   `FfmpegException`, deletes the temp dir and retries on the next scheduled trickplay task or
 ///   library scan -- the "retryable failure" PLAN §3.3 describes. Resuming from the high-water
-///   mark instead of retrying whole is a documented P4 follow-up (docs/PLAN.md §10), not
+///   mark instead of retrying whole is a documented P4 follow-up (docs/engineering/transcode-plan.md §10), not
 ///   implemented here.
 fn batch_pool_failure(args: &[String], reason: &str) -> Outcome {
     let has_frame =

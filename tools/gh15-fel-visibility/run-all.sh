@@ -3,7 +3,7 @@
 # ffmpeg/ffprobe at /usr/lib/jellyfin-ffmpeg/, avoids apt entirely -- MEASURED this
 # node's egress stalls specifically inside a fresh debian:bookworm-slim container's
 # apt-get, while wget/curl from the jm6 image and plain host egress both work fine;
-# see gh-15-notes.md). Fetches dovi_tool via wget (GitHub egress confirmed working).
+# see docs/engineering/gh15-fel-visibility.md). Fetches dovi_tool via wget (GitHub egress confirmed working).
 #
 # Bright-window timestamps for iron-man and raiders are hardcoded (MEASURED this
 # session via find_bright.sh: iron-man t=2555, raiders t=2491) to save the ~15-20 min

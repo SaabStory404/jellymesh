@@ -520,7 +520,7 @@ async fn a_dv7_source_without_in_band_rpu_falls_back_to_the_plain_remux() {
     // this client was only ever told "8.1 or HDR10", and the source's real elementary stream has
     // no in-band RPU to serve as a genuine 8.1 -- so the output must carry no DOVI record at all
     // (neither the source's stale profile-7 tag nor a fabricated profile 8), and no RPU NAL. Also
-    // no fabricated-config-record warning (the `dovi_rpu`-bsf failure mode PLAN.md warns about on
+    // no fabricated-config-record warning (the `dovi_rpu`-bsf failure mode docs/engineering/transcode-plan.md warns about on
     // an `hvcE` source with no in-band RPU -- `add_dv_removal_bsf` doesn't use that bsf, but this
     // is cheap, real regression coverage that removal, not fabrication, happened).
     assert!(!stderr.contains("Generating one"), "{stderr}");
@@ -575,7 +575,7 @@ async fn a_non_dv_source_falls_back_as_not_p7() {
         1
     );
     assert!(out.join("init.mp4").exists());
-    // This source has no Dolby Vision configuration record at all (PLAN.md's "(b)" warning:
+    // This source has no Dolby Vision configuration record at all (docs/engineering/transcode-plan.md's "(b)" warning:
     // `dovi_rpu`-bsf on a stream with no config record can fabricate one, "Generating one, but
     // results may be invalid"). `strip=1` must not trigger that -- it removes rather than reads.
     assert!(

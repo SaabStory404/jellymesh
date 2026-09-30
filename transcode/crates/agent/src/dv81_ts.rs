@@ -1,4 +1,4 @@
-//! Streaming MPEG-TS rewriter for the DV7 -> 8.1 pipeline (`transcode/docs/PLAN.md` P5).
+//! Streaming MPEG-TS rewriter for the DV7 -> 8.1 pipeline (`docs/engineering/transcode-plan.md` P5).
 //!
 //! ffmpeg#1 stream-copies the source's video track into MPEG-TS on stdout. TS is the transport
 //! because it carries HEVC as Annex-B (what `dv81::convert_access_unit` works on) *with* each

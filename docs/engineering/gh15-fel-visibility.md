@@ -1,3 +1,5 @@
+> Status: investigation report for issue #15. The scripts and per-title result files it names (`residual.sh`, `find_bright.sh`, `analyze.sh`, `*.json`) live in `tools/gh15-fel-visibility/`.
+
 # Issue #15: DV7 FEL enhancement-layer visibility on bright content
 
 ## What the issue claims vs what was found
@@ -9,7 +11,7 @@ reconstruction as reference) on 3-4 bright DV7 FEL titles."
 MEASURED this session: no artifact for that prior measurement exists anywhere
 retrievable -- not in `mcp__homelab__kb_search` (terms: vs-nlq, FEL reconstruction, DV7,
 dovi_tool, "VMAF 99.88"), not in `jellymesh-handoff/HANDOFF.md`, `SHORTCUTS.md`,
-`BUGHUNT-STATUS.md`, not in `jellymesh/transcode/docs/PLAN.md` or `docs/BUGHUNT.md`.
+`BUGHUNT-STATUS.md`, not in `docs/engineering/transcode-plan.md` or `docs/engineering/bughunt.md`.
 `SHORTCUTS.md` row 161 explicitly lists "DV7 playback via dovi_tool one-file trial" as
 "not started (open decision)" as of the 2026-09-27 handoff. The only dovi_tool work done
 was profile 7->8.1 *conversion* (BL-only, EL discarded via `-m 2 convert --discard`),
@@ -164,7 +166,7 @@ highlight pixels).
 the first 20 frames of Iron Man's EL clip averaged ~29.8 mean|residual| (10-bit), but
 the full-clip (970-frame) result reported here is 10.51 -- lower, not higher, so this
 doesn't inflate Iron Man's headline number, but the discrepancy itself was never
-explained. Either the opening ~1s of that clip is genuinely higher-residual than the
+explained. Either the opening ~1s of that clip is higher-residual than the
 rest, or the leading GOP after the `-ss ... -c copy` cut decoded oddly (ffmpeg logged
 "PPS changed between slices" / "Skipping invalid undecodable NALU" warnings on EL
 streams across all 4 titles' clip cuts, not just Iron Man). The intermediates were

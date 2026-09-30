@@ -1,108 +1,249 @@
-# JellyMesh Galera provider + SQLite ⇄ Galera migration
+# JellyMesh Galera provider and jellyfin-dbmigrate
 
-Run Jellyfin 12.1 on MySQL 8 / Percona XtraDB Cluster (Galera): every node keeps the whole
-database in memory, any node can write, commits are certified cluster-wide.
+A Jellyfin 12.1 database provider plugin for MySQL 8.4 and Percona XtraDB Cluster (PXC), so several Jellyfin servers can share one database. It ships with `jellyfin-dbmigrate`, a tool that moves a Jellyfin database between SQLite and that provider in either direction and verifies the result.
 
-- `Jellyfin.Database.Providers.Galera/` — the provider plugin (`DatabaseType=PLUGIN_PROVIDER`).
-- `Jellyfin.DbMigrate/` — `jellyfin-dbmigrate`, moves a Jellyfin database between SQLite and
-  Galera in **either direction** and verifies it.
-- `pomelo/` — the MySQL EF Core provider underneath: Pomelo from the unmerged EF Core 10 PR
-  (#2047, pinned sha) plus `jellymesh-pomelo.patch`; `build.sh` builds it into
-  `~/.cache/jellymesh-vendor/pomelo` (the csproj's `PomeloBin`).
-- `tools/` — `ddl_audit.py` (truncation / index checks on generated DDL), `digest_profile.sh`
-  (statements + server time per API call), `slow_sql.py` (full SQL + EXPLAIN ANALYZE of the
-  slowest statements of one call).
-- `lab/galera-lab.sh` — Percona XtraDB Cluster nodes on podman (`rejoin n` after a crash);
-  `lab/jf-galera.sh` — Jellyfin nodes on it; `lab/galera_drill.py` — consistency, failover and
-  write-conflict drills.
+## Status
 
-## Switching a server between SQLite and Galera
+**Status:** Implemented; Lab-verified. Production deployment of the provider is deployment-specific and not recorded here.
 
-Stop Jellyfin first. Then:
+| Part | Status | Qualifier |
+|---|---|---|
+| Provider plugin (`Jellyfin.Database.Providers.Galera`) | Implemented | Code is in the repo. |
+| Provider behavior on a real library (migration, drills, parity) | Lab-verified | Single workstation, all nodes in podman containers; results measured 2026-09-26. See [measurements](../docs/engineering/galera-provider.md). |
+| `jellyfin-dbmigrate` (`model`, `copy`, `verify`) | Implemented | Round trip verified in the lab. |
+| Pomelo build with `jellymesh-pomelo.patch` | Implemented | Depends on an unmerged community pull request. |
+| Lab scripts and analysis tools | Implemented | Lab use only. |
+
+## What it does
+
+[Galera](../docs/architecture.md#glossary) is a synchronous multi-primary replication layer for MySQL: every node holds a full copy of the database and a commit is certified cluster-wide before it returns. PXC is Percona's MySQL distribution with Galera built in. The provider lets several Jellyfin servers share one such database instead of each keeping its own SQLite file.
+
+Jellyfin loads the provider through `database.xml` with `DatabaseType=PLUGIN_PROVIDER`. The plugin name is `JellyMesh Galera`, the plugin directory is `JellyMesh Galera_1.0.0.0`, and the provider registers itself in code under the key `Jellyfin-Galera`.
+
+The provider is built on EF Core (Microsoft's object-relational mapper, which Jellyfin uses) and Pomelo (the community MySQL driver for EF Core). Behavior below is From code reading of `GaleraDatabaseProvider.cs`, `GaleraDatabaseCreator.cs`, and `GaleraModel.cs`.
+
+### Connection and logging
+
+| Area | Behavior |
+|---|---|
+| Connection | Requires `CustomProviderOptions/ConnectionString`; otherwise throws `InvalidOperationException`. |
+| Server version | Fixed `MySqlServerVersion` of 8.4.0, so no connection is opened to detect the version at startup. |
+| Password | If `JELLYMESH_DB_PASSWORD` is non-empty, it replaces the `Password` in the connection string. This keeps the password out of `database.xml`, which ends up in config backups. |
+| Logging | The connection string is logged with the password masked as `*****`. |
+| Warnings | The provider ignores EF Core's `NonTransactionalMigrationOperationWarning` and `MultipleCollectionIncludeWarning`. |
+
+### Model rules
+
+| Area | Behavior |
+|---|---|
+| String collation | Every string column uses `utf8mb4_bin`. |
+| Indexed strings, keys | When Jellyfin leaves the length unset, strings in a primary key or unique index become `varchar(512)` (`ItemValues.Value` gets 700). |
+| Indexed strings, other | When Jellyfin leaves the length unset, other indexed unbounded strings become `longtext`. An index that contains a `longtext` column gets a prefix length of min(255, (3072 - fixed bytes) / 4 / text column count). |
+| Collections | The provider sets `EnablePrimitiveCollectionsSupport`, so queries over captured `Guid[]` and list parameters translate. The model's own list columns (for example `KeyframeTicks`, a `List<long>`) keep explicit JSON converters and are stored as JSON arrays in `longtext`, the same format SQLite uses. |
+| Floating point | `float` and `float?` map to `DOUBLE`, because MySQL `FLOAT` read over the text protocol loses digits. |
+| Time | `DateTime` and `DateTime?` map to `BIGINT` ticks and are read back as UTC. |
+| Model hook | The rules run as a model-finalizing convention, because `JellyfinDbContext` calls the provider's `OnModelCreating` before its own configuration. |
+
+### Hooks and maintenance
+
+| Area | Behavior |
+|---|---|
+| Health probe | `GaleraDatabaseCreator` replaces Pomelo's creator so `CanConnect` runs `SELECT 1` on the context's pooled connection (1.00 new connection per `/health` probe without it; measured in the lab, n=1). `Exists`, `Create`, and migrations are unchanged. |
+| Backup and restore | The provider's backup and restore hooks are no-ops. `MigrationBackupFast` takes no backup and logs a warning; `RestoreBackupFast` logs a Critical "cannot restore" message; `DeleteBackup` and `RunShutdownTask` do nothing. |
+| Collation hook | Jellyfin calls `MigrationBackupFast` before it runs migrations. The hook runs `ALTER DATABASE ... CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`. |
+| Optimization | The scheduled optimization runs `ANALYZE TABLE` on every mapped table. |
+| Purge | `PurgeDatabase` deletes table contents with `FOREIGN_KEY_CHECKS=0` on a connection it opens explicitly, because `ConnectionReset=false` would leave the setting on the pooled session. It re-enables the checks in a `finally` block, clears the connection pool if re-enabling fails, and runs the `SET` statements even when no tables are given. |
+
+## Requirements
+
+| Item | Version | Source |
+|---|---|---|
+| Jellyfin | 12.1 | `Jellyfin.Database.Implementations` 12.1.0 and `Jellyfin.Common` 12.1.0 in the provider csproj |
+| .NET | 10 (`net10.0`) | provider and tool csproj files |
+| EF Core | 10.0.11 | provider csproj |
+| MySqlConnector | 2.5.0 | provider csproj |
+| MySQL or PXC | 8.4 | The server version is hard-coded to 8.4.0; only PXC 8.4 (`percona/percona-xtradb-cluster:8.4`) was run in the lab. |
+| Pomelo.EntityFrameworkCore.MySql | Community EF Core 10 PR #2047 at a pinned commit, plus `pomelo/jellymesh-pomelo.patch` | `pomelo/build.sh` |
+| Container runtime | podman, for the lab scripts and for extracting the SQLite provider DLL | `lab/*.sh` |
+
+Production MySQL or PXC server settings (grants, sizing, backup) are deployment-specific and not shipped here. The server configuration in the repository is the lab configuration generated by `lab/galera-lab.sh`.
+
+## Build
+
+Build order is Pomelo, then the provider, then the tool. The repo has no single build script for the .NET projects. Steps 1 and 2 were run on 2026-09-30 with the .NET 10 SDK: both builds succeed with 0 errors, and the provider assembly is `galera/Jellyfin.Database.Providers.Galera/bin/Release/net10.0/Jellyfin.Database.Providers.Galera.dll`. The tool builds as `jellyfin-dbmigrate` (`AssemblyName` and `OutputType Exe` in its csproj) into `galera/Jellyfin.DbMigrate/bin/Release/net10.0/`.
+
+1. Build Pomelo. The script clones the pinned commit, applies the patch, and writes the output plus a `SOURCE` file.
+2. Build the provider. The csproj reads the Pomelo DLL from `$(PomeloBin)`, default `$(HOME)/.cache/jellymesh-vendor/pomelo`. Assemblies the Jellyfin host already supplies are excluded from the output unless you set `JmDesign=true` (needed for `dotnet ef migrations add`).
+3. Build the migration tool. It needs `Jellyfin.Database.Providers.Sqlite.dll` from the Jellyfin 12.1 image, which is not on NuGet. The csproj reads it from `$(JellyfinBin)`, default `$(HOME)/.cache/jellymesh-vendor`. It also references the provider project, so step 1 must have run.
 
 ```bash
-# SQLite -> Galera (database created with utf8mb4 / utf8mb4_bin)
-jellyfin-dbmigrate copy   --from sqlite:/config/data/data/jellyfin.db \
-                          --to "galera:Server=db;Database=jellyfin;Uid=jellyfin;Pwd=...;SslMode=..."
-jellyfin-dbmigrate verify --from sqlite:/config/data/data/jellyfin.db --to "galera:..."
-# install the plugin into /config/data/plugins/JellyMesh Galera_1.0.0.0/ and write database.xml:
-#   DatabaseType=PLUGIN_PROVIDER, PluginName="JellyMesh Galera",
-#   PluginAssembly=Jellyfin.Database.Providers.Galera.dll, ConnectionString=...
-
-# Galera -> SQLite (back out)
-jellyfin-dbmigrate copy   --from "galera:..." --to sqlite:/config/data/data/jellyfin.db.new
-jellyfin-dbmigrate verify --from "galera:..." --to sqlite:/config/data/data/jellyfin.db.new
-# move it into place and delete database.xml (Jellyfin defaults to SQLite)
+galera/pomelo/build.sh
+dotnet build -c Release galera/Jellyfin.Database.Providers.Galera
+podman cp <container>:/usr/lib/jellyfin/bin/Jellyfin.Database.Providers.Sqlite.dll ~/.cache/jellymesh-vendor/
+dotnet build -c Release galera/Jellyfin.DbMigrate
 ```
 
-`copy` creates the target schema with the target provider's own migrations, copies every table
-in foreign-key order with its original keys (auto-increment counters follow), clears rows the
-migrations seeded, and carries Jellyfin's code-migration history. `verify` compares every column
-of every row by primary key.
+The `<container>` placeholder is a running Jellyfin 12.1 container; the DLL path comes from the csproj comment. `pomelo/build.sh` reads these variables:
 
-## Results on a real library (MEASURED 2026-09-26)
+- `POMELO_SRC`: clone directory, default `$HOME/.cache/jellymesh-vendor/pomelo-src`.
+- `POMELO_OUT`: output directory, default `$HOME/.cache/jellymesh-vendor/pomelo`.
 
-19,259 items, 308,330 rows, 31 tables:
+The script pins commit `14a6e2897e6f7d16272c687e3ff17265eae38fe4` of the `upgrade/10.0.0` branch of `sufficit/Pomelo.EntityFrameworkCore.MySql`, which carries EF Core 10 support (PR #2047). It builds with `-p:NuGetAudit=false` because a transitive build-time package has an advisory that the build treats as an error; that package is not in the output.
 
-| Step | Time | Verify |
-|---|---|---|
-| SQLite → Galera (1 PXC node, podman) | 38.8 s (Oracle provider), 39.9 s (Pomelo) | every row and column identical |
-| SQLite → Galera (3-node cluster) | 46.2 s | identical; node 3 has every row |
-| Galera → new SQLite | 28.2 s | round trip identical to the original |
+The published `jellymesh-jellyfin` image ships the provider under `/opt/jellymesh/plugins/JellyMesh Galera_1.0.0.0/` and the tool self-contained at `/opt/jellymesh/jellyfin-dbmigrate` (with `libe_sqlite3.so`). See the [images section of the operations guide](../docs/operations.md#images).
 
-Jellyfin 12.1 on the 3-node cluster, p50 ms over 30 runs (`spikes/jellymesh/bench.py`), next to
-the SQLite numbers from `spikes/jellymesh/README.md`:
+### What `jellymesh-pomelo.patch` changes
 
-| Call | SQLite | Galera (Pomelo + patch) | what is left |
-|---|---|---|---|
-| home: UserViews | 23 | 94 | Jellyfin N+1 (chapters/extras per view) |
-| grid: Movies 100 | 61 | 61 | — (was 568 before the IN rewrite) |
-| grid: Audio 200 | 134 | 633 | `DISTINCT` over whole rows incl. the `Data` blob + 200 N+1 stream reads |
-| search 'the' | 39 (72 results) | 76 (72 results) | |
-| detail: series episodes | — | 12 | |
-| people: 100 | 58 | 590 | lower-name dedupe `NOT EXISTS` runs as a per-row range scan (339 ms; the hash antijoin plan is 33 ms) + 100 N+1 person reads |
+Source: `pomelo/build.sh` comments and the patch. Timings are lab measurements on the real library, n=1; the full table is in [measurements](../docs/engineering/galera-provider.md#provider-history).
 
-Server time dominates the slow ones (`digest_profile.sh`: Movies grid was 603 of 630 ms inside
-MySQL), so round trips are not the problem there; the two remaining outliers are Jellyfin query
-shapes MySQL plans badly and are fixed in Jellyfin itself (docs/jellyfin-n1-hotspots.md), not in
-the provider.
-
-Drills (`lab/galera_drill.py`, MEASURED):
-
-| Drill | Result |
+| Change | Why |
 |---|---|
-| played on A, read row on another Galera node | present when A's 200 returns (synchronous) |
-| …read through Jellyfin B's API | **stale after 65 s**: B's in-process UserData cache is never told. A shared database still needs the JellyMesh cache-invalidation plugin |
-| SIGKILL B's Galera node under load (FailOver list) | 204 requests, **0 failed**, longest gap 2.9 s; node back and Synced 7 s after restart (IST) |
-| SIGKILL the primary in single-writer mode | 206 requests, 0 failed, 2.9 s gap; the bootstrap node must come back as a joiner (`rejoin`) |
-| 200 concurrent writes to one UserData row, A and B on **different** Galera nodes | **69 × HTTP 500** (35%): Galera certification conflicts (`Deadlock found`), Jellyfin does not retry |
-| same, both Jellyfins on the **same** Galera node | 200 × 200, 0 conflicts |
+| `MySqlTypeMappingPostprocessor` type-maps `JSON_TABLE()` over a collection parameter | Jellyfin binds id lists as `EF.Parameter(list)`; without this `/UserViews` fails with "does not have a type mapping assigned". |
+| `MySqlJsonTableExpression.WithAlias` and `Clone` keep the path and `COLUMNS` clause | Alias renaming returned a plain table function and produced a `JSON_TABLE(@p2) AS p0` syntax error on `/Items`. |
+| Float and double literals carry an exponent (`100E0`) | `100` is an integer literal to MySQL, so search scoring came back `BIGINT` and `GetFloat()` threw. |
+| Non-correlated `IN (subquery)` is emitted as `IN (SELECT * FROM (subquery) AS jm_inN)` | MySQL re-ran UNION and GROUP BY subqueries once per outer row. Server time of the movie grid COUNT statement went from 286 ms to 5.9 ms. |
+| `JSON_TABLE()` `COLUMNS` declare charset and collation | Guid columns use `ascii` like the `char(36)` keys; strings use the `Pomelo.EntityFrameworkCore.MySql.JsonTableStringCollation` AppContext value, which the provider sets to `utf8mb4_bin`. Undeclared they are `latin1`, so id lists could not use primary keys (`/UserViews` server time 63 ms to 8 ms). |
 
-So Galera is run **single-writer**: every Jellyfin lists the nodes in the same order
-(`Server=db1,db2,db3;LoadBalance=FailOver`), the others are synchronous hot standbys. Multi-writer
-would need retries around every Jellyfin transaction, which the provider cannot add (a retrying EF
-execution strategy rejects Jellyfin's own `BeginTransaction` calls).
+## Configure
 
-## What the provider had to fix (all MEASURED)
+Write `database.xml` in the Jellyfin config directory. This is the lab configuration produced by `lab/jf-galera.sh`, with every key it sets:
 
-| Problem | Symptom | Fix |
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<DatabaseConfigurationOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <DatabaseType>PLUGIN_PROVIDER</DatabaseType>
+  <LockingBehavior>NoLock</LockingBehavior>
+  <CustomProviderOptions>
+    <PluginName>JellyMesh Galera</PluginName>
+    <PluginAssembly>Jellyfin.Database.Providers.Galera.dll</PluginAssembly>
+    <ConnectionString>Server=gl-db1;Database=jellyfin;Uid=jellyfin;Pwd=jellyfin;SslMode=Disabled;AllowPublicKeyRetrieval=true;LoadBalance=FailOver</ConnectionString>
+  </CustomProviderOptions>
+</DatabaseConfigurationOptions>
+```
+
+The credentials, `SslMode=Disabled`, and `AllowPublicKeyRetrieval=true` are lab values. Use TLS and a Kubernetes Secret or similar in any real deployment, and supply the password through `JELLYMESH_DB_PASSWORD`. For a node list, write `Server=db1,db2,db3;LoadBalance=FailOver`: MySqlConnector connects to the first reachable node and moves on when it dies. Every Jellyfin should list the nodes in the same order.
+
+Create the MySQL database and user before you start Jellyfin. The lab does this with `lab/galera-lab.sh db`, which creates database `jellyfin` with `utf8mb4` and `utf8mb4_bin`. `jellyfin-dbmigrate` never calls `MigrationBackupFast`, so the tool does not set the database default collation; that default comes from however the database was created.
+
+The full option and environment variable reference is in [docs/configuration.md](../docs/configuration.md).
+
+## Use
+
+### jellyfin-dbmigrate
+
+Stop Jellyfin before running the tool. A database spec is `sqlite:<path>` or `galera:<connection string>`. If `JELLYMESH_DB_PASSWORD` is set, it overrides the `Pwd` in a `galera:` spec, as it does for Jellyfin.
+
+| Mode | Command shape | Behavior |
 |---|---|---|
-| Oracle's provider (MySql.EntityFrameworkCore 10.0.9) turns indexed strings into `varchar(255)` | real `Path` values are 264 chars → truncation | key/unique strings `varchar(512)` (`ItemValues.Value` 700); other indexed strings `longtext` + prefix indexes |
-| Oracle's SQL generator ignores `IndexPrefixLength` and column collations | invalid indexes on longtext; case-insensitive default collation | moved to Pomelo, which emits both; database default `utf8mb4_bin` set before migrations |
-| Oracle's provider cannot translate or bind collection `Contains` | `/UserViews` 500 (`@p.Contains(u.ItemId)` untranslatable; NRE binding a `Guid[]`) | moved to Pomelo + `EnablePrimitiveCollectionsSupport` |
-| Pomelo PR build: `JSON_TABLE` over a parameter never type-mapped | `/UserViews` 500 (`'@p' … does not have a type mapping`); Jellyfin binds id lists as `EF.Parameter(list)` | patch: `MySqlTypeMappingPostprocessor` |
-| Pomelo PR build: renamed `JSON_TABLE` lost its path/COLUMNS | `/Items` 500 (`JSON_TABLE(@p2) AS p0` syntax error) | patch: `WithAlias`/`Clone` overrides |
-| Pomelo float literals `100` are integers to MySQL | search 500 (`Unable to cast Int64 to Single`) | patch: literals carry an exponent (`100E0`) |
-| MySQL runs UNION / nested-GROUP-BY `IN (subquery)` once per outer row | Movies grid 568 ms (COUNT: 19,259 dependent executions) | patch: non-correlated `IN (SELECT * FROM (…) AS jm_inN)` → 61 ms |
-| Temp tables over whole `BaseItems` rows spill at the 16 MB default | Audio grid: 2 on-disk temp tables | `tmp_table_size=256M` in the node cnf (−60 ms) |
-| No primitive-collection support | `KeyframeData.KeyframeTicks` written as `System.Collections.Generic.List\`1[System.Int64]` | JSON converter, same format as SQLite |
-| MySQL `FLOAT` read over the text protocol | `AverageFrameRate` 23.976025 → 23.976 | floats stored as `DOUBLE` |
-| `DateTime` precision | MySQL `datetime(6)` keeps µs; Jellyfin hashes `DateModified.Ticks` into image tags and chapter image file names, so every image tag changed after a migration (MEASURED, parity_ab.py) | DateTime stored as BIGINT ticks; verify compares exact ticks; SQLite and Galera API responses now byte-identical |
-| PXC `pxc_strict_mode=ENFORCING` | rejects `GET_LOCK`, used by EF's migration lock | lab runs `PERMISSIVE`; migrations from one node |
-| JellyfinDbContext calls the provider's `OnModelCreating` before its own configuration | model rules had no effect | rules run as a model-finalizing convention |
+| `model` | `jellyfin-dbmigrate model --from <db>` | Lists tables, row counts, and shadow properties, and marks shared-CLR-type tables (`SHARED-CLR`) and tables with derived types. |
+| `copy` | `jellyfin-dbmigrate copy --from <db> --to <db>` | Copies the source into the target (steps below). |
+| `verify` | `jellyfin-dbmigrate verify --from <db> --to <db>` | Compares every non-shadow property of every row by primary key, and also counts rows that exist only in the target. DateTime compares by ticks, floats and doubles by round-trip (`R`) format, `byte[]` as hex, Guid in `D` format. |
 
-Risk: the provider depends on an unmerged community PR (pinned in `pomelo/build.sh`) plus our
-patch; upstream Pomelo has no EF Core 10 release.
+Exit codes are 0 on success, 1 when `verify` finds differences, and 2 on a usage error (all from `Program.cs`).
 
-Also: Galera does not replicate named locks, so `GET_LOCK` cannot elect a cluster leader — use a
-lease row or a Kubernetes Lease.
+`copy` deletes ALL existing rows in every non-empty target table before it copies, whether or not the rows came from migrations. Point it at an empty or disposable database. It works in this order:
+
+1. Runs the target provider's migrations.
+2. Disables foreign key checks.
+3. Deletes all rows in each target table that has any.
+4. Copies every table in foreign-key order in batches of 1000, with original keys (auto-increment counters follow).
+5. Copies code-migration history rows (four-part `ProductVersion`) from `__EFMigrationsHistory`.
+6. Re-enables foreign key checks and prints total rows and seconds.
+
+Do not pass `--probe`. `Program.cs` reads it as `Arg("--probe") is not null`, which returns the token after the flag, so `--probe` as the last argument is ignored and a full `copy` runs.
+
+### Migration flow
+
+```mermaid
+flowchart LR
+    A[Stop Jellyfin] --> B[Create empty target database]
+    B --> C[copy --from source --to target]
+    C --> D[verify --from source --to target]
+    D -->|exit 0| E[Install plugin and write database.xml]
+    D -->|exit 1| F[Fix cause, recreate empty target, copy again]
+    E --> G[Start Jellyfin]
+```
+
+### SQLite to Galera
+
+The commands below use the tool path from the published image. If you built the tool yourself, use `galera/Jellyfin.DbMigrate/bin/Release/net10.0/jellyfin-dbmigrate` instead. Run them in a shell with the config directory mounted at `/config`.
+
+1. Stop Jellyfin.
+2. Create an empty MySQL database and user. `galera/lab/galera-lab.sh db` runs `CREATE DATABASE IF NOT EXISTS jellyfin CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`, creates user `jellyfin`, and grants it `ALL` on `jellyfin.*`; use the same character set and collation with your own user and password.
+3. Copy the data. The target must be empty:
+
+    ```bash
+    /opt/jellymesh/jellyfin-dbmigrate copy --from sqlite:/config/data/data/jellyfin.db --to "galera:Server=gl-db1;Database=jellyfin;Uid=jellyfin;Pwd=jellyfin;SslMode=Disabled;AllowPublicKeyRetrieval=true"
+    ```
+
+4. Verify it:
+
+    ```bash
+    /opt/jellymesh/jellyfin-dbmigrate verify --from sqlite:/config/data/data/jellyfin.db --to "galera:Server=gl-db1;Database=jellyfin;Uid=jellyfin;Pwd=jellyfin;SslMode=Disabled;AllowPublicKeyRetrieval=true"
+    ```
+
+5. Put the provider build output in `/config/data/plugins/JellyMesh Galera_1.0.0.0/` (the image ships it at `/opt/jellymesh/plugins/JellyMesh Galera_1.0.0.0/`) and write `database.xml` as shown under Configure.
+6. Start Jellyfin.
+
+The connection string is the lab value from Configure; replace it for real use.
+
+### Galera to SQLite (back out)
+
+1. Stop Jellyfin.
+2. Copy into a new, empty SQLite file and verify it. The empty-target rule applies here too: do not point `--to` at a populated database.
+
+    ```bash
+    /opt/jellymesh/jellyfin-dbmigrate copy --from "galera:Server=gl-db1;Database=jellyfin;Uid=jellyfin;Pwd=jellyfin;SslMode=Disabled;AllowPublicKeyRetrieval=true" --to sqlite:/config/data/data/jellyfin.db.new
+    /opt/jellymesh/jellyfin-dbmigrate verify --from "galera:Server=gl-db1;Database=jellyfin;Uid=jellyfin;Pwd=jellyfin;SslMode=Disabled;AllowPublicKeyRetrieval=true" --to sqlite:/config/data/data/jellyfin.db.new
+    ```
+
+3. Move `jellyfin.db.new` into place as `jellyfin.db` and delete `database.xml`. Jellyfin defaults to SQLite.
+
+Keep the previous SQLite file until you are satisfied. The provider's backup and restore hooks are no-ops, so take a cluster backup yourself. Timings for these steps are in [measurements](../docs/engineering/galera-provider.md#migration-timings).
+
+## Test
+
+```bash
+dotnet test -c Release galera/Jellyfin.Database.Providers.Galera.Tests
+```
+
+Build and test this project in Release; the Debug analyzer set does not match. From code reading, the suite has 12 test methods in three files, which run as 20 test cases because the two `[Theory]` methods carry 10 `InlineData` rows.
+
+| File | Covers |
+|---|---|
+| `GaleraDatabaseCreatorTests.cs` | The provider replaces the database creator; `CanConnect` returns false with no server; a cancelled `CanConnect` throws; a lab test that 20 `CanConnect` calls reuse one pooled connection. |
+| `PurgeDatabaseTests.cs` | Purge deletes with checks off and restores them; restores them when a delete fails; discards the connection when restoring fails; only toggles checks with no tables; a lab test that a pooled session keeps checks on. |
+| `RedactPasswordTests.cs` | The password never appears in the logged connection string, including quoted values containing `;`; a string without a password is left alone. |
+
+Tests with `_Lab_` in the name run only when the environment variable `JELLYMESH_TEST_DB` holds a connection string to a MySQL or Galera database; without it they return immediately and pass. The parity, drill, and migration checks are scripts, not part of `dotnet test`; see [lab scripts and tools](../docs/engineering/galera-provider.md#lab-scripts).
+
+## Limitations
+
+| Limitation | Detail |
+|---|---|
+| Unmerged Pomelo dependency | The provider depends on community PR #2047 (pinned in `pomelo/build.sh`) plus `jellymesh-pomelo.patch`. Upstream Pomelo has no EF Core 10 release. |
+| Backup and restore | The provider's backup and restore hooks are no-ops. Back up the cluster yourself. |
+| Monitoring | No `mysqld` or wsrep metrics exporter is provided. |
+| Jellyfin upgrades | The provider builds against `Jellyfin.Database.Implementations` 12.1.0. Rebuild it after a Jellyfin upgrade. |
+| MySQL version | The server version is hard-coded to 8.4.0; only PXC 8.4 was run in the lab. |
+| Cross-node caches | Stock Jellyfin keeps per-process caches. `JELLYFIN_SHARED_DB=1` and patch 15 in [jellyfin-perf](../jellyfin-perf/README.md) handle this, not the provider. |
+| Query rewriting | The provider adds no query interceptors. The `IN (subquery)` rewrite lives in the patched Pomelo build. |
+| Multi-writer | Stock Jellyfin returns HTTP 500 on Galera certification conflicts; run single-writer, or use the patched build. See [measurements](../docs/engineering/galera-provider.md#single-writer-or-multi-writer). |
+
+## Related docs
+
+- [Architecture and glossary](../docs/architecture.md)
+- [Configuration reference](../docs/configuration.md)
+- [Operations guide](../docs/operations.md)
+- [Troubleshooting](../docs/troubleshooting.md)
+- [Results](../docs/RESULTS.md)
+- [Measurements, lab scripts, and provider history](../docs/engineering/galera-provider.md)
+- [Roadmap](../docs/ROADMAP.md)
+- [jellyfin-perf](../jellyfin-perf/README.md)
+- [Leader plugin](../leader/README.md)
+- [Jellyfin N+1 hotspots](../docs/engineering/jellyfin-n1-hotspots.md)
+- [Contributing](../CONTRIBUTING.md)
+
+## License
+
+GPL-2.0, as Jellyfin; see [the repository license](../LICENSE). The patched Pomelo build (`pomelo/`) applies to `Pomelo.EntityFrameworkCore.MySql`, which is MIT licensed; the MIT attribution stays with that project.

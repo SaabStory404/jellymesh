@@ -1,6 +1,6 @@
 {
   "title": "top-gun-maverick",
-  "method": "fel_nlq_residual_ffmpeg_lutyuv (residual = EL - nlq_offset via ffprobe/lutyuv/signalstats filtergraphs, 10-bit native tv-range scale; mean|residual| only; NOT a full vs-nlq curve reconstruction; see gh-15-notes.md)",
+  "method": "fel_nlq_residual_ffmpeg_lutyuv (residual = EL - nlq_offset via ffprobe/lutyuv/signalstats filtergraphs, 10-bit native tv-range scale; mean|residual| only; NOT a full vs-nlq curve reconstruction; see docs/engineering/gh15-fel-visibility.md)",
   "nlq_offset_10bit": 512,
   "deadzone_threshold_10bit": 0,
   "highlight_threshold_10bit_code": 600,

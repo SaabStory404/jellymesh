@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Galera lab: Percona XtraDB Cluster 8.4 nodes on a podman network.
-#   galera-lab.sh boot            first node (bootstraps the cluster) -> host port 13306
+#   galera-lab.sh boot            first node (bootstraps the cluster) -> host port 13301
 #   galera-lab.sh join <n>        node n (2, 3, ...) joins via node 1  -> host port 1330<n>
+#   galera-lab.sh rejoin <n>      restart node n after a crash
 #   galera-lab.sh db              create database jellyfin (utf8mb4_bin) + user
 #   galera-lab.sh status          wsrep cluster size / state per node
 #   galera-lab.sh down            remove nodes AND their data volumes
@@ -98,5 +99,5 @@ case "${1:-}" in
   down)
     for c in $(podman ps -a --format '{{.Names}}' | grep '^gl-db' || true); do podman rm -f -v "$c" >/dev/null; podman volume rm -f "$c-data" >/dev/null 2>&1 || true; done
     ;;
-  *) echo "usage: $0 boot|join <n>|db|status|down" >&2; exit 2 ;;
+  *) echo "usage: $0 boot|join <n>|rejoin <n>|db|status|down" >&2; exit 2 ;;
 esac
