@@ -17,7 +17,7 @@
 #     5.9 ms server time).
 #   - JSON_TABLE() COLUMNS declare charset/collation (Guid: ascii like the char(36) keys; strings:
 #     the AppContext "…JsonTableStringCollation" value, which the Galera provider sets to
-#     utf8mb4_bin). Undeclared they are latin1, so id lists could not use primary keys:
+#     utf8mb4_0900_bin). Undeclared they are latin1, so id lists could not use primary keys:
 #     /UserViews server time 63 -> 8 ms, batched person load 274 ms -> PK lookups.
 set -euo pipefail
 REPO=https://github.com/sufficit/Pomelo.EntityFrameworkCore.MySql.git

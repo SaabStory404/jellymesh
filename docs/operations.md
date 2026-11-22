@@ -59,14 +59,14 @@ The plugin install step, the pool images (`tcpool-agent`, `tcpool-shim`), and `t
 ### Server requirements
 
 - MySQL 8.4 or Percona XtraDB Cluster 8.4. The provider pins `MySqlServerVersion` 8.4.0 in code and does not auto-detect. Only PXC 8.4 was run in the lab.
-- The database must exist (`galera/README.md`). The provider runs `ALTER DATABASE ... utf8mb4 / utf8mb4_bin` from `MigrationBackupFast`, which Jellyfin calls before it runs migrations, and creates every string column as `utf8mb4_bin`.
+- The database must exist (`galera/README.md`). The provider runs `ALTER DATABASE ... utf8mb4 / utf8mb4_0900_bin` from `MigrationBackupFast`, which Jellyfin calls before it runs migrations, and creates every string column as `utf8mb4_0900_bin`.
 - `jellyfin-dbmigrate copy` does not create the database or set its collation.
 
 The lab script `galera/lab/galera-lab.sh db` creates the database and a user with all privileges on it. The privilege grant is a lab choice, not a documented requirement. The password is a placeholder:
 
 ```bash
 podman exec gl-db1 mysql -uroot -p"$ROOTPW" -e "
-  CREATE DATABASE IF NOT EXISTS jellyfin CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+  CREATE DATABASE IF NOT EXISTS jellyfin CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin;
   CREATE USER IF NOT EXISTS 'jellyfin'@'%' IDENTIFIED BY 'jellyfin';
   GRANT ALL ON jellyfin.* TO 'jellyfin'@'%';"
 ```

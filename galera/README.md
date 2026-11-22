@@ -36,7 +36,7 @@ The provider is built on EF Core (Microsoft's object-relational mapper, which Je
 
 | Area | Behavior |
 |---|---|
-| String collation | Every string column uses `utf8mb4_bin`. |
+| String collation | Every string column uses `utf8mb4_0900_bin`: binary and NO PAD, like SQLite's BINARY, so case and trailing spaces are significant. Databases created before migration `NoPadStringCollation` used `utf8mb4_bin` (PAD SPACE); that migration converts them. |
 | Indexed strings, keys | When Jellyfin leaves the length unset, strings in a primary key or unique index become `varchar(512)` (`ItemValues.Value` gets 700). |
 | Indexed strings, other | When Jellyfin leaves the length unset, other indexed unbounded strings become `longtext`. An index that contains a `longtext` column gets a prefix length of min(255, (3072 - fixed bytes) / 4 / text column count). |
 | Collections | The provider sets `EnablePrimitiveCollectionsSupport`, so queries over captured `Guid[]` and list parameters translate. The model's own list columns (for example `KeyframeTicks`, a `List<long>`) keep explicit JSON converters and are stored as JSON arrays in `longtext`, the same format SQLite uses. |
@@ -50,7 +50,7 @@ The provider is built on EF Core (Microsoft's object-relational mapper, which Je
 |---|---|
 | Health probe | `GaleraDatabaseCreator` replaces Pomelo's creator so `CanConnect` runs `SELECT 1` on the context's pooled connection (1.00 new connection per `/health` probe without it; measured in the lab, n=1). `Exists`, `Create`, and migrations are unchanged. |
 | Backup and restore | The provider's backup and restore hooks are no-ops. `MigrationBackupFast` takes no backup and logs a warning; `RestoreBackupFast` logs a Critical "cannot restore" message; `DeleteBackup` and `RunShutdownTask` do nothing. |
-| Collation hook | Jellyfin calls `MigrationBackupFast` before it runs migrations. The hook runs `ALTER DATABASE ... CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`. |
+| Collation hook | Jellyfin calls `MigrationBackupFast` before it runs migrations. The hook runs `ALTER DATABASE ... CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`. |
 | Optimization | The scheduled optimization runs `ANALYZE TABLE` on every mapped table. |
 | Purge | `PurgeDatabase` deletes table contents with `FOREIGN_KEY_CHECKS=0` on a connection it opens explicitly, because `ConnectionReset=false` would leave the setting on the pooled session. It re-enables the checks in a `finally` block, clears the connection pool if re-enabling fails, and runs the `SET` statements even when no tables are given. |
 
@@ -102,7 +102,7 @@ Source: `pomelo/build.sh` comments and the patch. Timings are lab measurements o
 | `MySqlJsonTableExpression.WithAlias` and `Clone` keep the path and `COLUMNS` clause | Alias renaming returned a plain table function and produced a `JSON_TABLE(@p2) AS p0` syntax error on `/Items`. |
 | Float and double literals carry an exponent (`100E0`) | `100` is an integer literal to MySQL, so search scoring came back `BIGINT` and `GetFloat()` threw. |
 | Non-correlated `IN (subquery)` is emitted as `IN (SELECT * FROM (subquery) AS jm_inN)` | MySQL re-ran UNION and GROUP BY subqueries once per outer row. Server time of the movie grid COUNT statement went from 286 ms to 5.9 ms. |
-| `JSON_TABLE()` `COLUMNS` declare charset and collation | Guid columns use `ascii` like the `char(36)` keys; strings use the `Pomelo.EntityFrameworkCore.MySql.JsonTableStringCollation` AppContext value, which the provider sets to `utf8mb4_bin`. Undeclared they are `latin1`, so id lists could not use primary keys (`/UserViews` server time 63 ms to 8 ms). |
+| `JSON_TABLE()` `COLUMNS` declare charset and collation | Guid columns use `ascii` like the `char(36)` keys; strings use the `Pomelo.EntityFrameworkCore.MySql.JsonTableStringCollation` AppContext value, which the provider sets to `utf8mb4_0900_bin`. Undeclared they are `latin1`, so id lists could not use primary keys (`/UserViews` server time 63 ms to 8 ms). |
 
 ## Configure
 
@@ -123,7 +123,7 @@ Write `database.xml` in the Jellyfin config directory. This is the lab configura
 
 The credentials, `SslMode=Disabled`, and `AllowPublicKeyRetrieval=true` are lab values. Use TLS and a Kubernetes Secret or similar in any real deployment, and supply the password through `JELLYMESH_DB_PASSWORD`. For a node list, write `Server=db1,db2,db3;LoadBalance=FailOver`: MySqlConnector connects to the first reachable node and moves on when it dies. Every Jellyfin should list the nodes in the same order.
 
-Create the MySQL database and user before you start Jellyfin. The lab does this with `lab/galera-lab.sh db`, which creates database `jellyfin` with `utf8mb4` and `utf8mb4_bin`. `jellyfin-dbmigrate` never calls `MigrationBackupFast`, so the tool does not set the database default collation; that default comes from however the database was created.
+Create the MySQL database and user before you start Jellyfin. The lab does this with `lab/galera-lab.sh db`, which creates database `jellyfin` with `utf8mb4` and `utf8mb4_0900_bin`. `jellyfin-dbmigrate` never calls `MigrationBackupFast`, so the tool does not set the database default collation; that default comes from however the database was created.
 
 The full option and environment variable reference is in [docs/configuration.md](../docs/configuration.md).
 
@@ -169,7 +169,7 @@ flowchart LR
 The commands below use the tool path from the published image. If you built the tool yourself, use `galera/Jellyfin.DbMigrate/bin/Release/net10.0/jellyfin-dbmigrate` instead. Run them in a shell with the config directory mounted at `/config`.
 
 1. Stop Jellyfin.
-2. Create an empty MySQL database and user. `galera/lab/galera-lab.sh db` runs `CREATE DATABASE IF NOT EXISTS jellyfin CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`, creates user `jellyfin`, and grants it `ALL` on `jellyfin.*`; use the same character set and collation with your own user and password.
+2. Create an empty MySQL database and user. `galera/lab/galera-lab.sh db` runs `CREATE DATABASE IF NOT EXISTS jellyfin CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`, creates user `jellyfin`, and grants it `ALL` on `jellyfin.*`; use the same character set and collation with your own user and password.
 3. Copy the data. The target must be empty:
 
     ```bash
@@ -207,15 +207,17 @@ Keep the previous SQLite file until you are satisfied. The provider's backup and
 dotnet test -c Release galera/Jellyfin.Database.Providers.Galera.Tests
 ```
 
-Build and test this project in Release; the Debug analyzer set does not match. From code reading, the suite has 12 test methods in three files, which run as 20 test cases because the two `[Theory]` methods carry 10 `InlineData` rows.
+Build and test this project in Release; the Debug analyzer set does not match. The suite has 16 test methods in five files, which run as 24 test cases because the two `[Theory]` methods carry 10 `InlineData` rows (MEASURED: `dotnet test` reports 24).
 
 | File | Covers |
 |---|---|
 | `GaleraDatabaseCreatorTests.cs` | The provider replaces the database creator; `CanConnect` returns false with no server; a cancelled `CanConnect` throws; a lab test that 20 `CanConnect` calls reuse one pooled connection. |
 | `PurgeDatabaseTests.cs` | Purge deletes with checks off and restores them; restores them when a delete fails; discards the connection when restoring fails; only toggles checks with no tables; a lab test that a pooled session keeps checks on. |
 | `RedactPasswordTests.cs` | The password never appears in the logged connection string, including quoted values containing `;`; a string without a password is left alone. |
+| `CollationTests.cs` | The model matches the migration snapshot (EF refuses to migrate otherwise); every string column uses the convention collation; a lab test that the collation is NO PAD and a unique index keeps `'x'`, `'x '` and `'X'` apart. |
+| `NoPadMigrationTests.cs` | Lab only, needs `JELLYMESH_TEST_EMPTY_DB` (an empty, disposable database): `InitialCreate` reproduces the trailing-space duplicate-key failure, `NoPadStringCollation` converts every column up and back down, and afterwards both values insert and a `JSON_TABLE` list filter runs without a collation clash. |
 
-Tests with `_Lab_` in the name run only when the environment variable `JELLYMESH_TEST_DB` holds a connection string to a MySQL or Galera database; without it they return immediately and pass. The parity, drill, and migration checks are scripts, not part of `dotnet test`; see [lab scripts and tools](../docs/engineering/galera-provider.md#lab-scripts).
+Tests with `_Lab_` in the name run only when the environment variable `JELLYMESH_TEST_DB` (or, for `NoPadMigrationTests`, `JELLYMESH_TEST_EMPTY_DB`) holds a connection string to a MySQL or Galera database; without it they return immediately and pass. The parity, drill, and migration checks are scripts, not part of `dotnet test`; see [lab scripts and tools](../docs/engineering/galera-provider.md#lab-scripts).
 
 ## Limitations
 

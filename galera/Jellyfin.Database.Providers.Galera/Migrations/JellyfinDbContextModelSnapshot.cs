@@ -63,7 +63,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("ItemId")
                         .HasMaxLength(256)
                         .HasColumnType("varchar(256)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int>("LogSeverity")
                         .HasColumnType("int");
@@ -72,12 +72,12 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(512)
                         .HasColumnType("varchar(512)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Overview")
                         .HasMaxLength(512)
                         .HasColumnType("varchar(512)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<uint>("RowVersion")
                         .IsConcurrencyToken()
@@ -86,13 +86,13 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("ShortOverview")
                         .HasMaxLength(512)
                         .HasColumnType("varchar(512)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Type")
                         .IsRequired()
                         .HasMaxLength(256)
                         .HasColumnType("varchar(256)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<Guid>("UserId")
                         .HasColumnType("char(36)");
@@ -129,23 +129,23 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("Codec")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("CodecTag")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Comment")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Filename")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("MimeType")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.HasKey("ItemId", "Index");
 
@@ -160,15 +160,15 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("Album")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("AlbumArtists")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Artists")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int?>("Audio")
                         .HasColumnType("int");
@@ -178,7 +178,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("CleanName")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<double?>("CommunityRating")
                         .HasColumnType("double");
@@ -188,11 +188,11 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("CustomRating")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Data")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<long?>("DateCreated")
                         .HasColumnType("bigint");
@@ -214,30 +214,30 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("EpisodeTitle")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("ExternalId")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("ExternalSeriesId")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("ExternalServiceId")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int?>("ExtraType")
                         .HasColumnType("int");
 
                     b.Property<string>("ForcedSortName")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Genres")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int?>("Height")
                         .HasColumnType("int");
@@ -277,30 +277,30 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("MediaType")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Name")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<double?>("NormalizationGain")
                         .HasColumnType("double");
 
                     b.Property<string>("OfficialRating")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("OriginalLanguage")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("OriginalTitle")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Overview")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<Guid?>("OwnerId")
                         .HasColumnType("char(36)");
@@ -313,29 +313,29 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("Path")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("PreferredMetadataCountryCode")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("PreferredMetadataLanguage")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<long?>("PremiereDate")
                         .HasColumnType("bigint");
 
                     b.Property<string>("PresentationUniqueKey")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<Guid?>("PrimaryVersionId")
                         .HasColumnType("char(36)");
 
                     b.Property<string>("ProductionLocations")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int?>("ProductionYear")
                         .HasColumnType("int");
@@ -348,44 +348,44 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("SeasonName")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<Guid?>("SeriesId")
                         .HasColumnType("char(36)");
 
                     b.Property<string>("SeriesName")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("SeriesPresentationUniqueKey")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("ShowId")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<long?>("Size")
                         .HasColumnType("bigint");
 
                     b.Property<string>("SortName")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<long?>("StartDate")
                         .HasColumnType("bigint");
 
                     b.Property<string>("Studios")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Tagline")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Tags")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<Guid?>("TopParentId")
                         .HasColumnType("char(36)");
@@ -396,11 +396,11 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("Type")
                         .IsRequired()
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("UnratedType")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int?>("Width")
                         .HasColumnType("int");
@@ -521,7 +521,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("Path")
                         .IsRequired()
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int>("Width")
                         .HasColumnType("int");
@@ -556,12 +556,12 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("ProviderId")
                         .HasMaxLength(512)
                         .HasColumnType("varchar(512)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("ProviderValue")
                         .IsRequired()
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.HasKey("ItemId", "ProviderId");
 
@@ -599,11 +599,11 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("ImagePath")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Name")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<long>("StartPositionTicks")
                         .HasColumnType("bigint");
@@ -625,7 +625,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(32)
                         .HasColumnType("varchar(32)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<Guid>("ItemId")
                         .HasColumnType("char(36)");
@@ -634,14 +634,14 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(512)
                         .HasColumnType("varchar(512)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<Guid>("UserId")
                         .HasColumnType("char(36)");
 
                     b.Property<string>("Value")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.HasKey("Id");
 
@@ -666,12 +666,12 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(32)
                         .HasColumnType("varchar(32)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("DashboardTheme")
                         .HasMaxLength(32)
                         .HasColumnType("varchar(32)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<bool>("EnableNextVideoInfoOverlay")
                         .HasColumnType("tinyint(1)");
@@ -700,7 +700,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("TvHome")
                         .HasMaxLength(32)
                         .HasColumnType("varchar(32)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<Guid>("UserId")
                         .HasColumnType("char(36)");
@@ -752,7 +752,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(512)
                         .HasColumnType("varchar(512)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<Guid?>("UserId")
                         .HasColumnType("char(36)");
@@ -777,7 +777,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(32)
                         .HasColumnType("varchar(32)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int?>("IndexBy")
                         .HasColumnType("int");
@@ -795,7 +795,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(64)
                         .HasColumnType("varchar(64)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int>("SortOrder")
                         .HasColumnType("int");
@@ -822,7 +822,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("CleanValue")
                         .IsRequired()
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int>("Type")
                         .HasColumnType("int");
@@ -831,7 +831,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(700)
                         .HasColumnType("varchar(700)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.HasKey("ItemValueId");
 
@@ -913,7 +913,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("SegmentProviderId")
                         .IsRequired()
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<long>("StartTicks")
                         .HasColumnType("bigint");
@@ -936,7 +936,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("AspectRatio")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<double?>("AverageFrameRate")
                         .HasColumnType("double");
@@ -952,38 +952,38 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("ChannelLayout")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int?>("Channels")
                         .HasColumnType("int");
 
                     b.Property<string>("Codec")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("CodecTag")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("CodecTimeBase")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("ColorPrimaries")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("ColorSpace")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("ColorTransfer")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Comment")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int?>("DvBlSignalCompatibilityId")
                         .HasColumnType("int");
@@ -1035,30 +1035,30 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("KeyFrames")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Language")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<double?>("Level")
                         .HasColumnType("double");
 
                     b.Property<string>("NalLengthSize")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Path")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("PixelFormat")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Profile")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<double?>("RealFrameRate")
                         .HasColumnType("double");
@@ -1080,11 +1080,11 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("TimeBase")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Title")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int?>("Width")
                         .HasColumnType("int");
@@ -1106,11 +1106,11 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("Name")
                         .IsRequired()
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("PersonType")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.HasKey("Id");
 
@@ -1131,7 +1131,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("Role")
                         .HasMaxLength(512)
                         .HasColumnType("varchar(512)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int?>("ListOrder")
                         .HasColumnType("int");
@@ -1201,7 +1201,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(65535)
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.HasKey("Id");
 
@@ -1223,7 +1223,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(512)
                         .HasColumnType("varchar(512)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<long>("DateCreated")
                         .HasColumnType("bigint");
@@ -1235,7 +1235,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(64)
                         .HasColumnType("varchar(64)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.HasKey("Id");
 
@@ -1256,19 +1256,19 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("AccessToken")
                         .IsRequired()
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("AppName")
                         .IsRequired()
                         .HasMaxLength(64)
                         .HasColumnType("varchar(64)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("AppVersion")
                         .IsRequired()
                         .HasMaxLength(32)
                         .HasColumnType("varchar(32)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<long>("DateCreated")
                         .HasColumnType("bigint");
@@ -1283,13 +1283,13 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(256)
                         .HasColumnType("varchar(256)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("DeviceName")
                         .IsRequired()
                         .HasMaxLength(64)
                         .HasColumnType("varchar(64)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<bool>("IsActive")
                         .HasColumnType("tinyint(1)");
@@ -1319,13 +1319,13 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
 
                     b.Property<string>("CustomName")
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("DeviceId")
                         .IsRequired()
                         .HasMaxLength(512)
                         .HasColumnType("varchar(512)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.HasKey("Id");
 
@@ -1375,18 +1375,18 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("AudioLanguagePreference")
                         .HasMaxLength(255)
                         .HasColumnType("varchar(255)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("AuthenticationProviderId")
                         .IsRequired()
                         .HasMaxLength(255)
                         .HasColumnType("varchar(255)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("CastReceiverId")
                         .HasMaxLength(32)
                         .HasColumnType("varchar(32)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<bool>("DisplayCollectionsView")
                         .HasColumnType("tinyint(1)");
@@ -1440,18 +1440,18 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(255)
                         .HasColumnType("varchar(255)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("Password")
                         .HasMaxLength(65535)
                         .HasColumnType("longtext")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<string>("PasswordResetProviderId")
                         .IsRequired()
                         .HasMaxLength(255)
                         .HasColumnType("varchar(255)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<bool>("PlayDefaultAudioTrack")
                         .HasColumnType("tinyint(1)");
@@ -1472,7 +1472,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("SubtitleLanguagePreference")
                         .HasMaxLength(255)
                         .HasColumnType("varchar(255)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int>("SubtitleMode")
                         .HasColumnType("int");
@@ -1484,7 +1484,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                         .IsRequired()
                         .HasMaxLength(255)
                         .HasColumnType("varchar(255)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.HasKey("Id");
 
@@ -1508,7 +1508,7 @@ namespace Jellyfin.Database.Providers.Galera.Migrations
                     b.Property<string>("CustomDataKey")
                         .HasMaxLength(512)
                         .HasColumnType("varchar(512)")
-                        .UseCollation("utf8mb4_bin");
+                        .UseCollation("utf8mb4_0900_bin");
 
                     b.Property<int?>("AudioStreamIndex")
                         .HasColumnType("int");

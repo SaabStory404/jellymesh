@@ -3,7 +3,7 @@
 #   galera-lab.sh boot            first node (bootstraps the cluster) -> host port 13301
 #   galera-lab.sh join <n>        node n (2, 3, ...) joins via node 1  -> host port 1330<n>
 #   galera-lab.sh rejoin <n>      restart node n after a crash
-#   galera-lab.sh db              create database jellyfin (utf8mb4_bin) + user
+#   galera-lab.sh db              create database jellyfin (utf8mb4_0900_bin) + user
 #   galera-lab.sh status          wsrep cluster size / state per node
 #   galera-lab.sh down            remove nodes AND their data volumes
 set -euo pipefail
@@ -85,7 +85,7 @@ case "${1:-}" in
     ;;
   db)
     podman exec gl-db1 mysql -uroot -p"$ROOTPW" -e "
-      CREATE DATABASE IF NOT EXISTS jellyfin CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+      CREATE DATABASE IF NOT EXISTS jellyfin CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin;
       CREATE USER IF NOT EXISTS 'jellyfin'@'%' IDENTIFIED BY 'jellyfin';
       GRANT ALL ON jellyfin.* TO 'jellyfin'@'%';"
     ;;
