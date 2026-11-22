@@ -23,8 +23,9 @@ namespace Jellyfin.Database.Providers.Galera;
 /// <item>Every other indexed string stays unbounded (longtext); its index gets a prefix length
 /// (the provider's IndexPrefixLength), the text columns of one index sharing what is left of the
 /// 3072 bytes after its fixed-width columns. No value is ever truncated.</item>
-/// <item>Binary collation on every string column, like SQLite's default, so case-only differences
-/// stay distinct.</item>
+/// <item>Binary NO PAD collation on every string column, like SQLite's default BINARY, so case-only
+/// and trailing-space differences stay distinct. utf8mb4_bin is PAD SPACE ('a' = 'a ') and broke
+/// unique indexes that SQLite accepts (migration NoPadStringCollation).</item>
 /// <item>DateTime stored as BIGINT ticks, read back as UTC (as Jellyfin's SQLite provider does).
 /// MySQL DATETIME(6) keeps microseconds, but Jellyfin derives identities from full ticks: image
 /// cache tags hash DateModified.Ticks and chapter image file names embed it (PathManager), so
@@ -35,8 +36,8 @@ namespace Jellyfin.Database.Providers.Galera;
 /// </remarks>
 internal sealed class GaleraModelConvention : IModelFinalizingConvention
 {
-    /// <summary>Collation for every string column.</summary>
-    public const string Collation = "utf8mb4_bin";
+    /// <summary>Collation for every string column: binary and NO PAD (SQLite BINARY semantics).</summary>
+    public const string Collation = "utf8mb4_0900_bin";
 
     /// <summary>Default length for strings in primary keys and unique indexes.</summary>
     public const int KeyStringLength = 512;

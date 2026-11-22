@@ -108,7 +108,7 @@ Model rules (`GaleraModel.cs`):
 
 | Rule | Value |
 |---|---|
-| String collation | `utf8mb4_bin` on every string column |
+| String collation | `utf8mb4_0900_bin` on every string column |
 | Strings in a primary key or unique index | `varchar(512)`; `ItemValues.Value` uses 700 |
 | Other indexed unbounded strings | `longtext` with an index prefix of at most 255 characters |
 | Primitive collections | JSON arrays in `longtext` |

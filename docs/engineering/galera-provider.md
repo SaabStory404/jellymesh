@@ -73,7 +73,7 @@ PXC 8.4 nodes (`docker.io/percona/percona-xtradb-cluster:8.4`) on the podman net
 | `boot` | Starts node 1, which bootstraps the cluster. |
 | `join <n>` | Starts node n (2, 3, ...) and joins it through node 1. |
 | `rejoin <n>` | Restarts node n after a crash. Needed after the bootstrap node dies. |
-| `db` | Creates database `jellyfin` (`utf8mb4` / `utf8mb4_bin`) and user `jellyfin` / `jellyfin`. |
+| `db` | Creates database `jellyfin` (`utf8mb4` / `utf8mb4_0900_bin`) and user `jellyfin` / `jellyfin`. |
 | `status` | Prints wsrep (Galera write-set replication) cluster size and state per node. |
 | `down` | Removes the nodes and their data volumes. |
 
@@ -148,6 +148,7 @@ This table records problems met while building the provider and how each was fix
 | Pomelo PR build: `JSON_TABLE` over a parameter was never type-mapped | `/UserViews` 500 (`'@p' ... does not have a type mapping`); Jellyfin binds id lists as `EF.Parameter(list)` | Patch: `MySqlTypeMappingPostprocessor` |
 | Pomelo PR build: a renamed `JSON_TABLE` lost its path and `COLUMNS` | `/Items` 500 (`JSON_TABLE(@p2) AS p0` syntax error) | Patch: `WithAlias` and `Clone` overrides |
 | Pomelo float literals `100` are integers to MySQL | Search returned 500 (`Unable to cast Int64 to Single`) | Patch: literals carry an exponent (`100E0`) |
+| `utf8mb4_bin` is PAD SPACE (trailing spaces ignored in comparisons); SQLite's BINARY is not | A tag differing from an existing one only by a trailing space hit `Duplicate entry ... for key 'ItemValues.IX_ItemValues_Type_Value'`; the failed SaveChanges left the item with no metadata (production, 2026-11-22) | Every string column and the `JSON_TABLE` collation moved to `utf8mb4_0900_bin` (binary, NO PAD); migration `NoPadStringCollation` rebuilds each table once |
 | MySQL runs UNION and nested GROUP BY `IN (subquery)` once per outer row | Movies grid 568 ms end to end (COUNT: 19,259 dependent executions) | Patch: non-correlated `IN (SELECT * FROM (...) AS jm_inN)`, giving 61 ms end to end. The COUNT statement alone went from 286 ms to 5.9 ms server time (source: `galera/pomelo/build.sh`). |
 | Temporary tables over whole `BaseItems` rows spill at the 16 MB default | Audio grid: 2 on-disk temporary tables | `tmp_table_size=256M` in the node configuration (60 ms less) |
 | No primitive-collection support | `KeyframeData.KeyframeTicks` was written as `System.Collections.Generic.List`1[System.Int64]` | JSON converter, same format as SQLite |

@@ -129,7 +129,7 @@ galera/lab/galera-lab.sh status
 |---|---|
 | `boot` | Creates the network, starts `gl-db1` as the bootstrap node, waits until it reports `Synced` |
 | `join <n>` | Starts `gl-db<n>` as a joiner of `gl-db1` and waits for `Synced` |
-| `db` | Creates database `jellyfin` (`utf8mb4` / `utf8mb4_bin`) and user `jellyfin` |
+| `db` | Creates database `jellyfin` (`utf8mb4` / `utf8mb4_0900_bin`) and user `jellyfin` |
 | `status` | Prints `wsrep_cluster_size`, `wsrep_local_state_comment` and `wsrep_ready` for each running node |
 | `rejoin <n>` | Removes node `n` (keeping its data volume) and restarts it as a joiner of a live node |
 | `down` | Removes all `gl-db*` containers and their data volumes |
@@ -148,7 +148,7 @@ The nodes also start with `--innodb-buffer-pool-size=768M --max-connections=500`
 `jf-galera.sh up` deletes the copied SQLite file and points Jellyfin at Galera, and its readiness poll uses the lab API key. The database therefore has to hold the prepared library before the nodes start. `jellyfin-dbmigrate` copies a SQLite Jellyfin database into Galera and verifies the copy.
 
 > [!WARNING]
-> `copy` never calls the provider's `MigrationBackupFast`, so it does not set the database default collation (`galera-lab.sh db` in Step 4 creates the database with `utf8mb4_bin`). It deletes all rows in every non-empty target table, so the target must be empty or disposable. It needs the provider project, so build Pomelo (Step 1) first. For non-lab use, the published `jellymesh-jellyfin` image ships the provider under `/opt/jellymesh/plugins/JellyMesh Galera_1.0.0.0/` and a self-contained `/opt/jellymesh/jellyfin-dbmigrate` (`galera/README.md`, [operations.md](operations.md)).
+> `copy` never calls the provider's `MigrationBackupFast`, so it does not set the database default collation (`galera-lab.sh db` in Step 4 creates the database with `utf8mb4_0900_bin`). It deletes all rows in every non-empty target table, so the target must be empty or disposable. It needs the provider project, so build Pomelo (Step 1) first. For non-lab use, the published `jellymesh-jellyfin` image ships the provider under `/opt/jellymesh/plugins/JellyMesh Galera_1.0.0.0/` and a self-contained `/opt/jellymesh/jellyfin-dbmigrate` (`galera/README.md`, [operations.md](operations.md)).
 
 First, get the SQLite provider assembly from the Jellyfin 12.1 image. It is not on NuGet, and the migration tool references it from `$(JellyfinBin)`, which defaults to `~/.cache/jellymesh-vendor`. The csproj comment gives the `podman cp` form. The `podman create` and `podman rm` lines are this page's wrapper around it, and the image is the `JG_IMG` default:
 
@@ -294,7 +294,7 @@ A `<db>` is `sqlite:<path>` or `galera:<connection string>`. To back out, copy i
 | SQLite to 3-node Galera, 19,259 items, 308,330 rows, 31 tables | 46.2 s, verify identical | `docs/engineering/galera-provider.md`, 2026-09-26, single workstation |
 | Galera to new SQLite, same library | 28.2 s, round trip identical | `docs/engineering/galera-provider.md`, same setup |
 
-On this provider, Jellyfin's pre-migration backup only sets the database collation to `utf8mb4_bin` and takes no backup, and restore logs a critical message and restores nothing. Back up and restore the cluster yourself (from code reading, `GaleraDatabaseProvider.cs`).
+On this provider, Jellyfin's pre-migration backup only sets the database collation to `utf8mb4_0900_bin` and takes no backup, and restore logs a critical message and restores nothing. Back up and restore the cluster yourself (from code reading, `GaleraDatabaseProvider.cs`).
 
 ## Clean up
 

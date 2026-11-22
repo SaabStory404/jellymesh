@@ -44,7 +44,7 @@ public sealed partial class GaleraDatabaseProvider : IJellyfinDatabaseProvider
         }
 
         _logger.LogInformation("Galera provider: {Server}", RedactPassword(connectionString));
-        // String lists bound as JSON_TABLE() compare against utf8mb4_bin columns (GaleraModelConvention).
+        // String lists bound as JSON_TABLE() compare against utf8mb4_0900_bin columns (GaleraModelConvention).
         AppContext.SetData("Pomelo.EntityFrameworkCore.MySql.JsonTableStringCollation", GaleraModelConvention.Collation);
 
         // Fixed server version: AutoDetect would open a connection at startup on every context.
@@ -98,7 +98,7 @@ public sealed partial class GaleraDatabaseProvider : IJellyfinDatabaseProvider
     /// Jellyfin asks for a backup before every migration run. A Galera cluster is backed up by its
     /// operator (xtrabackup), not by one Jellyfin node, so this only records a key.
     /// It is also the one hook that runs before migrations, so it sets the database default to
-    /// utf8mb4_bin: Oracle's SQL generator drops per-column collations (MEASURED, 10.0.9), and
+    /// utf8mb4_0900_bin: Oracle's SQL generator drops per-column collations (MEASURED, 10.0.9), and
     /// tables created afterwards inherit the database default instead.
     /// </remarks>
     public async Task<string> MigrationBackupFast(CancellationToken cancellationToken)

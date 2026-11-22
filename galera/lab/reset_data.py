@@ -37,7 +37,7 @@ for n in sq:
     sh("podman", "unshare", "chown", "1000:1000", f"{d}/jellyfin.db")
 if ga:
     sh("podman", "exec", container, "mysql", "-uroot", "-plabroot", "-e",
-       "DROP DATABASE IF EXISTS jellyfin; CREATE DATABASE jellyfin CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;")
+       "DROP DATABASE IF EXISTS jellyfin; CREATE DATABASE jellyfin CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin;")
     conn = f"galera:Server=127.0.0.1;Port={port};Database=jellyfin;Uid=jellyfin;Pwd=jellyfin;SslMode=Disabled;AllowPublicKeyRetrieval=true"
     r = sh(a.dbmigrate, "copy", "--from", f"sqlite:{a.db}", "--to", conn)
     print(r.stdout.strip().splitlines()[-1])
